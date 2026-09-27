@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#101512">
+  <meta name="description" content="ROVER 高速驾驶模拟：手机上的手动驾驶与 AI 指令物理模拟。">
+  <title>ROVER — 高速驾驶模拟</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23101512'/%3E%3Cpath d='M8 23V9h10a5 5 0 0 1 0 10H8m9-1 7 5' fill='none' stroke='%23d3fa76' stroke-width='3'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/physics.js" defer></script>
+  <script src="/simulator.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="#" aria-label="ROVER 控制台"><span class="brand-symbol">r<span>↗</span></span><span>ROVER<span class="brand-caption">让探索触手可及</span></span></a>
+      <div class="header-actions"><span class="demo-badge">物理模拟</span><button class="icon-button" id="device-button" aria-label="设备与连接信息"><i data-icon="settings"></i></button></div>
+    </header>
+    <main>
+      <div class="page-heading"><div><div class="eyebrow">HIGHWAY / REAL-TIME PHYSICS</div><h1>高速驾驶模拟<span class="heading-dot">.</span></h1></div><div class="vehicle-id"><span class="status-dot" id="connection-dot"></span><span>ROVER–01<small id="connection-label">模拟连接正常</small></span></div></div>
+      <div class="workspace">
+        <section class="vision-column" aria-label="小车画面与状态">
+          <div class="camera-panel" id="camera-panel">
+            <div class="camera-top"><div class="camera-title"><i data-icon="camera"></i><span id="view-title">高速公路 · 驾驶视角</span></div><div class="camera-actions"><button class="view-switch" id="view-switch" aria-label="切换到行驶轨迹"><i data-icon="route"></i><span>轨迹</span></button><button class="camera-icon" id="expand-button" aria-label="放大画面"><i data-icon="expand"></i></button></div></div>
+            <div class="camera-viewport" id="camera-viewport">
+              <canvas class="camera-canvas" id="camera-canvas" aria-label="随小车位置和朝向实时渲染的三维模拟驾驶画面" role="img"></canvas><div class="camera-error" id="camera-error" hidden>模拟画面暂不可用，请刷新页面重试。</div>
+              <div class="camera-shade"></div>
+              <div class="video-badges"><span class="live-badge"><span></span>实时模拟画面</span><span class="camera-live-clock mono" id="camera-live-clock">00:00.0</span><span class="resolution" id="frame-rate">— FPS</span></div>
+              <div class="braking-hud" id="braking-hud" hidden><span id="braking-hud-label">正在制动</span><strong id="braking-hud-distance">0.0 m</strong><small>自踩下刹车起</small></div>
+              <div class="camera-caption"><span class="camera-mode" id="camera-mode">手动控制</span><strong id="camera-status">准备就绪，开始探索</strong><span class="camera-coordinates"><span id="position-text">X 0.00 · Y 0.00 m</span><span id="heading-text">000° N</span></span></div>
+              <div class="map-view" id="map-view" hidden><svg id="route-map" viewBox="0 0 640 360" role="img" aria-label="小车本次模拟行驶轨迹"><defs><pattern id="small-grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M 32 0 L 0 0 0 32" fill="none" stroke="#26372d" stroke-width="0.8"/></pattern><pattern id="large-grid" width="160" height="160" patternUnits="userSpaceOnUse"><rect width="160" height="160" fill="url(#small-grid)"/><path d="M 160 0 L 0 0 0 160" fill="none" stroke="#354b3a" stroke-width="1"/></pattern></defs><rect width="640" height="360" fill="#141f19"/><rect width="640" height="360" fill="url(#large-grid)"/><g id="map-origin" transform="translate(320 260)"><circle r="5" fill="#b9c6be"/><text x="12" y="23" fill="#8b9a90" font-size="14">起点</text></g><polyline id="route-trail" points="320,180" fill="none" stroke="#d3fa76" stroke-width="2.5" stroke-linejoin="round"/><g id="map-rover" transform="translate(320 180)"><circle r="25" fill="#d3fa76" opacity=".07"/><circle r="15" fill="#d3fa76" opacity=".12"/><path d="M0 -11 8 9 0 5 -8 9Z" fill="#d3fa76"/></g><text x="24" y="334" fill="#a5b4aa" font-size="13">最近 480 m 行驶轨迹</text><text x="602" y="34" fill="#d3fa76" font-size="14">N ↑</text></svg><div class="map-label">本次行驶 <strong id="map-distance">0.00 m</strong></div></div>
+              <div class="camera-offline" id="camera-offline" hidden><i data-icon="wifi-off"></i><strong>模拟连接已断开</strong><span>重新连接后继续驾驶</span></div>
+            </div>
+            <div class="camera-footer"><span><span class="tiny-dot"></span>演示环境 · 高速公路 · 三车道</span><span class="mono" id="session-clock">00:00</span></div>
+          </div>
+          <div class="telemetry highway-metrics" aria-label="实时物理模拟数据">
+            <div class="metric"><span><i data-icon="gauge"></i>当前速度</span><div><strong id="speed-value">0.0</strong><small>m/s</small></div><small class="metric-note" id="speed-kmh">0 km/h</small></div>
+            <div class="metric"><span><i data-icon="route"></i>预计急刹</span><div><strong id="predicted-brake">0.0</strong><small>m</small></div><small class="metric-note">直线 · 不含反应距离</small></div>
+            <div class="metric"><span><i data-icon="stop"></i><span id="actual-brake-label">上次制动</span></span><div><strong id="actual-brake">—</strong><small>m</small></div><small class="metric-note" id="brake-result-label">停车后保留实测结果</small></div>
+          </div>
+          <div class="telemetry-live" aria-label="实时车辆状态"><span>里程 <strong id="odometer-live">0.0 m</strong></span><span>加速度 <strong id="acceleration-live">0.00 m/s²</strong></span><span>朝向 <strong id="heading-live">0°</strong></span></div>
+          <div class="session-strip"><div class="session-icon"><i data-icon="route"></i></div><div><span>本次探索</span><strong><span id="distance-value">0.00</span><small> m</small></strong></div><button id="log-button">操作记录<i data-icon="chevron-right"></i></button></div>
+          <p class="demo-note"><i data-icon="info"></i>本地物理模拟 · 未连接真实车辆</p>
+        </section>
+        <section class="control-panel" aria-label="驾驶控制">
+          <div class="mode-tabs" role="tablist" aria-label="控制方式"><button class="mode-tab active" id="manual-tab" role="tab" aria-selected="true" aria-controls="manual-panel"><i data-icon="gamepad"></i>手动驾驶</button><button class="mode-tab" id="ai-tab" role="tab" aria-selected="false" aria-controls="ai-panel" tabindex="-1"><i data-icon="sparkles"></i>AI 助手<span class="tab-tag">BETA</span></button></div>
+          <div id="manual-panel" role="tabpanel" aria-labelledby="manual-tab">
+            <div class="control-heading"><span>油门与方向</span><span class="subtle">松开油门滑行 · 刹车减速</span></div>
+            <div class="highway-steering" role="group" aria-label="方向盘"><button class="steer-button" data-drive="left" aria-label="按住向左转向"><i data-icon="chevron-left"></i></button><div><span id="steering-indicator"><i data-icon="gamepad"></i></span><small id="steering-angle">0.0°</small></div><button class="steer-button" data-drive="right" aria-label="按住向右转向"><i data-icon="chevron-right"></i></button></div>
+            <div class="pedals"><button class="pedal accelerator" data-drive="throttle" aria-label="按住油门加速"><i data-icon="arrow-up"></i><span>油门<small>按住加速</small></span></button><button class="pedal brake-pedal" data-drive="brake" aria-label="按住刹车减速"><i data-icon="stop"></i><span>刹车<small>按住减速</small></span></button></div>
+            <div class="speed-control"><div><label for="speed-slider">目标速度</label><span><strong id="speed-limit-label">30</strong> m/s</span></div><input type="range" id="speed-slider" min="1" max="100" step="1" value="30" aria-label="目标速度，最高100米每秒"><div class="range-labels"><span id="target-kmh">108 km/h</span><span>上限 100 m/s · 360 km/h</span></div></div>
+            <div class="road-settings"><span>路面附着</span><div role="group" aria-label="路面状态"><button class="selected" id="dry-road" aria-pressed="true">干燥</button><button id="wet-road" aria-pressed="false">湿滑</button></div><span id="grip-value">μ 0.85</span></div>
+            <button class="normal-brake-button" id="normal-stop"><i data-icon="stop"></i>常规制动至停止</button>
+            <button class="ai-shortcut" id="ai-shortcut"><span class="shortcut-icon"><i data-icon="sparkles"></i></span><span>让 AI 完成一次制动测试<small>加速至目标速度，再测量刹车距离</small></span><i data-icon="arrow-up-right"></i></button>
+          </div>
+          <div id="ai-panel" role="tabpanel" aria-labelledby="ai-tab" hidden>
+            <div class="ai-intro"><span class="ai-orb"><i data-icon="sparkles"></i></span><h2>测试车辆的物理表现</h2><p>先查看计划，AI 会按物理模型加速和制动。</p></div>
+            <div class="suggestions"><button data-command="加速到30米每秒然后刹车"><i data-icon="gauge"></i>30 m/s 测试</button><button data-command="加速到100米每秒然后刹车"><i data-icon="gauge"></i>100 m/s 测试</button><button data-command="前进200米"><i data-icon="route"></i>前进 200 米</button><button data-command="刹车停止"><i data-icon="stop"></i>刹车停止</button></div>
+            <form id="command-form"><label class="sr-only" for="command-input">给小车的指令</label><div class="command-composer"><textarea id="command-input" rows="2" maxlength="120" placeholder="例如：加速到 50 米每秒，然后刹车"></textarea><div class="composer-footer"><span>本地指令演示</span><button type="submit" id="send-command" aria-label="解析指令"><i data-icon="arrow-up"></i></button></div></div></form>
+            <div class="ai-feedback" id="ai-feedback" role="status" aria-live="polite">支持制动测试、定距前进和刹车停止，速度上限 100 m/s。</div>
+            <div class="task-card" id="task-card" hidden><div class="task-title"><span><i data-icon="route"></i>行动计划</span><span id="task-badge">待确认</span></div><ol id="task-steps"></ol><div class="task-progress"><span id="task-progress-fill"></span></div><button class="primary-button" id="task-action"><i data-icon="play"></i><span>开始执行</span></button></div>
+          </div>
+        </section>
+      </div>
+    </main>
+    <footer class="safety-bar"><div class="safety-inner"><div class="safety-state"><span class="safety-symbol" id="safety-symbol"><i data-icon="shield"></i></span><span><strong id="safety-title">小车已就绪</strong><small id="safety-description">手动控制 · 等待指令</small></span></div><button class="emergency-button" id="emergency-stop"><i data-icon="octagon"></i><span>紧急制动</span></button><button class="reset-button" id="reset-estop" hidden><i data-icon="refresh"></i>解除制动锁定</button></div></footer>
+  </div>
+  <dialog class="sheet" id="device-dialog"><div class="sheet-header"><h2>车辆与物理模型</h2><button class="icon-button" data-close="device-dialog" aria-label="关闭设备信息"><i data-icon="x"></i></button></div><div class="device-identity"><span class="device-mark"><i data-icon="gamepad"></i></span><div><strong>ROVER–01</strong><span>高速制动实验车</span></div><span class="demo-badge">简化车辆模型</span></div><dl class="device-details"><div><dt>连接状态</dt><dd id="device-status">模拟连接正常</dd></div><div><dt>速度上限</dt><dd>100 m/s · 360 km/h</dd></div><div><dt>质量 / 轴距</dt><dd>1,400 kg / 2.7 m</dd></div><div><dt>路面摩擦系数</dt><dd id="device-grip">0.85</dd></div><div><dt>驱动峰值功率</dt><dd>650 kW</dd></div><div><dt>画面帧率</dt><dd id="device-fps">测量中</dd></div><div><dt>本地往返延迟</dt><dd id="device-rtt">测量中</dd></div><div><dt>模拟电量 / 功率</dt><dd id="device-power">86.0% / 0.0 kW</dd></div></dl><p class="sheet-note">平直道路上的简化车辆模型，包含空气阻力、滚动阻力、轮胎附着和转向。预计急刹距离按当前速度、路面和全力直线制动计算，不包含驾驶者反应距离。松开油门后滑行，踩刹车后仍有前进距离。</p><button class="secondary-button" id="toggle-connection">断开模拟连接</button><button class="text-button" id="reset-session">重置模拟（回到起点）</button></dialog>
+  <dialog class="sheet" id="log-dialog"><div class="sheet-header"><h2>操作记录</h2><button class="icon-button" data-close="log-dialog" aria-label="关闭操作记录"><i data-icon="x"></i></button></div><p class="sheet-note">本次会话的操作记录，刷新页面后清空。</p><ol class="activity-log" id="activity-log"></ol></dialog>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>
