@@ -1,0 +1,11 @@
+import http from 'node:http';
+import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { resolve, extname, sep } from 'node:path';
+import { networkInterfaces } from 'node:os';
+const root=fileURLToPath(new URL('./dist/',import.meta.url));
+const port=Number(process.env.PORT || 4317);
+const types={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.jpg':'image/jpeg','.png':'image/png','.svg':'image/svg+xml'};
+const server=http.createServer(async(req,res)=>{try{if(!['GET','HEAD'].includes(req.method)){res.writeHead(405);res.end();return;}const path=decodeURIComponent(new URL(req.url,'http://localhost').pathname);const file=resolve(root,'.'+(path==='/'?'/index.html':path));if(!file.startsWith(root.endsWith(sep)?root:root+sep)){res.writeHead(403);res.end();return;}const body=await readFile(file);res.writeHead(200,{'Content-Type':types[extname(file)]||'application/octet-stream','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(req.method==='HEAD'?undefined:body);}catch{res.writeHead(404,{'Content-Type':'text/plain; charset=utf-8'});res.end('页面不存在');}});
+server.on('error',error=>{console.error(error.message);process.exitCode=1;});
+server.listen(port,'0.0.0.0',()=>{console.log(`ROVER local preview: http://localhost:${port}`);for(const [name,items] of Object.entries(networkInterfaces())){if(!/^(en|eth|wlan)/.test(name))continue;for(const item of items||[]){if(item.family==='IPv4'&&!item.internal)console.log(`Same Wi-Fi preview: http://${item.address}:${port}`);}}});

@@ -1,0 +1,11 @@
+.DS_Store
+.openai/
+.codex/
+.agents/
+node_modules/
+.env
+.env.*
+!.env.example
+*.log
+# Previous static camera image; the live simulator does not use it.
+/dist/assets/camera.jpg
