@@ -190,6 +190,124 @@ test('cornering and braking share finite tyre grip, so cornering lengthens a sto
   }
 });
 
+test('guardrails are opt-in and glancing contact keeps driving without applying brakes', () => {
+  for (const side of [-1, 1]) {
+    const initial = { x: side * (c.guardrailX - 0.1), heading: side * 15, speed: 30 };
+    const free = Object.assign(createState(), initial);
+    const guided = Object.assign(createState(), initial);
+    runFor(free, {}, 0.3);
+    runFor(guided, { guardrails: true }, 0.3);
+    assert.ok(Math.abs(free.x) > c.guardrailX);
+    assert.equal(free.wallContact, null);
+    assert.equal(guided.x, side * c.guardrailX);
+    assert.equal(guided.wallContact, side < 0 ? 'left' : 'right');
+    assert.equal(guided.wallContactCount, 1);
+    assert.ok(guided.speed > 29 && guided.speed < free.speed);
+    assert.ok(guided.y > 8);
+    assert.equal(guided.heading, 0);
+    assert.equal(guided.brakeForce, 0);
+    assert.equal(guided.braking, false);
+    assert.equal(guided.lastBrakeDistance, null);
+  }
+});
+
+test('an impact cannot add speed or cross the rail, including perpendicular approaches', () => {
+  for (const heading of [15, 90, 165, 195, 270, 345]) {
+    const side = Math.sin(heading * Math.PI / 180) > 0 ? 1 : -1;
+    const initial = { x: side * (c.guardrailX - 0.01), heading, speed: 100 };
+    const free = Object.assign(createState(), initial);
+    const guided = Object.assign(createState(), initial);
+    step(free, { throttle: 1 }, c.maxSubstep);
+    step(guided, { throttle: 1, guardrails: true }, c.maxSubstep);
+    assert.ok(Math.abs(guided.x) <= c.guardrailX);
+    assert.ok(guided.speed <= free.speed && guided.speed > 93);
+    assert.ok(guided.distance <= free.distance);
+    assert.ok(Math.hypot(guided.x - initial.x, guided.y) <= guided.distance + 1e-9);
+    assert.equal(guided.brakeForce, 0);
+    assert.equal(guided.wallContactCount, 1);
+  }
+});
+
+test('sustained scraping adds mild continuous resistance without repeated impact penalties', () => {
+  const free = Object.assign(createState(), { speed: 30 });
+  const guided = Object.assign(createState(), { x: c.guardrailX, speed: 30 });
+  runFor(free, {}, 3);
+  runFor(guided, { guardrails: true, steering: 0.2 }, 3);
+  assert.equal(guided.x, c.guardrailX);
+  assert.equal(guided.wallContactCount, 1);
+  assert.equal(guided.wallContact, 'right');
+  assert.ok(guided.speed > 27, 'scraping must not repeatedly multiply away the speed');
+  assert.ok(free.speed - guided.speed > 1 && free.speed - guided.speed < 1.3);
+  assert.equal(guided.brakeForce, 0);
+  assert.equal(guided.braking, false);
+  assert.ok(guided.distance > 80);
+});
+
+test('steering inward releases either rail and contact can be established again', () => {
+  for (const side of [-1, 1]) {
+    const state = Object.assign(createState(), { x: side * c.guardrailX, speed: 30 });
+    runFor(state, { guardrails: true }, 0.1);
+    assert.equal(state.wallContactCount, 1);
+    runFor(state, { guardrails: true, steering: -side }, 0.5);
+    assert.equal(state.wallContact, null);
+    assert.ok(side * state.x < c.guardrailX - 0.5);
+    assert.ok(state.speed > 29);
+    runFor(state, { guardrails: true, steering: side }, 3.5);
+    assert.ok(Math.abs(state.x) <= c.guardrailX);
+    assert.ok(state.wallContactCount > 1);
+    assert.equal(state.braking, false);
+  }
+});
+
+test('a curved substep detects rail contact even when its unconstrained endpoint is inside', () => {
+  const initial = { x: c.guardrailX - 0.000001, heading: 0.05, speed: 10, steer: -c.maxSteer };
+  const free = Object.assign(createState(), initial);
+  const guided = Object.assign(createState(), initial);
+  step(free, { steering: -1 }, c.maxSubstep);
+  step(guided, { steering: -1, guardrails: true }, c.maxSubstep);
+  assert.ok(free.x < c.guardrailX);
+  assert.equal(guided.wallContactCount, 1);
+  assert.equal(guided.wallContact, null, 'inward steering releases immediately after the touch');
+  assert.ok(guided.x < c.guardrailX);
+  assert.ok(guided.speed <= free.speed);
+});
+
+test('rail-guided odometry and brake measurements count only accepted travel', () => {
+  const state = Object.assign(createState(), { x: c.guardrailX - 0.05, heading: 90, speed: 30 });
+  step(state, { guardrails: true, brake: 1 }, c.maxSubstep);
+  assert.equal(state.x, c.guardrailX);
+  assert.ok(Math.abs(state.distance - (0.05 + Math.abs(state.y))) < 1e-9);
+  assert.equal(state.brakeDistance, state.distance);
+  assert.ok(state.brakeForce > 0, 'only the explicit brake input applies brakes');
+  runFor(state, { guardrails: true, brake: 1 }, 10);
+  assert.equal(state.speed, 0);
+  assert.equal(state.lastBrakeDistance, state.distance);
+  assert.ok(Math.abs(state.distance - (0.05 + Math.abs(state.y))) < 1e-8);
+  assert.ok(state.lastBrakeTime > 0 && state.lastBrakeTime < 4);
+  const stoppedDistance = state.distance;
+  runFor(state, { guardrails: true, brake: 1 }, 1);
+  assert.equal(state.distance, stoppedDistance);
+});
+
+test('rail entry, continuous scraping, and release are stable at 10, 60, and 144 Hz', () => {
+  const simulate = dt => {
+    const state = Object.assign(createState(), { x: 2, heading: 15, speed: 50 });
+    runFor(state, { guardrails: true, steering: 0.3 }, 4, dt);
+    runFor(state, { guardrails: true, steering: -0.5 }, 2, dt);
+    return state;
+  };
+  const coarse = simulate(0.1);
+  for (const dt of [1 / 60, 1 / 144]) {
+    const state = simulate(dt);
+    assert.ok(Math.abs(state.speed - coarse.speed) < 0.01);
+    assert.ok(Math.abs(state.distance - coarse.distance) < 0.01);
+    assert.ok(Math.hypot(state.x - coarse.x, state.y - coarse.y) < 0.02);
+    assert.equal(state.wallContactCount, coarse.wallContactCount);
+    assert.equal(state.wallContact, coarse.wallContact);
+    assert.equal(state.brakeForce, 0);
+  }
+});
+
 test('bounded randomized inputs keep all state values finite and velocity nonnegative', () => {
   const state = createState();
   let seed = 7919;
