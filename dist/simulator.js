@@ -1,6 +1,6 @@
-/* Meter-scale, continuous highway renderer. Pose x/y maps to world X/Z;
-   heading is clockwise from +Z. Every repeated feature has a 400 m period,
-   so rebasing the render origin never changes the vehicle's world position. */
+/* Meter-scale highway renderer. Pose x/y maps to world X/Z; heading is
+   clockwise from +Z. Static scenery repeats every 400 m; traffic and speed
+   signs keep absolute positions and are rebased by the same render origin. */
 (() => {
   'use strict';
 
@@ -57,9 +57,12 @@
     'W':['10001','10001','10001','10101','10101','10101','01010'],
     'Y':['10001','10001','01010','00100','00100','00100','00100'],
     '0':['01110','10001','10011','10101','11001','10001','01110'],
-    '6':['01110','10000','10000','11110','10001','10001','01110']
+    '1':['010','110','010','010','010','010','111'],
+    '2':['01110','10001','00001','00010','00100','01000','11111'],
+    '6':['01110','10000','10000','11110','10001','10001','01110'],
+    '8':['01110','10001','10001','01110','10001','10001','01110']
   };
-  function lettering(target, text, centerX, bottom, z, height) {
+  function lettering(target, text, centerX, bottom, z, height, color = COLORS.white) {
     const pixel = height / 7;
     const width = [...text].reduce((sum, character) => sum + (FONT[character]?.[0].length || 3) + 1, -1) * pixel;
     let left = centerX - width / 2;
@@ -68,7 +71,7 @@
       if (glyph) glyph.forEach((row, r) => [...row].forEach((value, c) => {
         if (value === '1') {
           const x = left + c * pixel, y = bottom + (6 - r) * pixel;
-          polygon(target, [[x,y,z],[x+pixel*.94,y,z],[x+pixel*.94,y+pixel*.94,z],[x,y+pixel*.94,z]], COLORS.white);
+          polygon(target, [[x,y,z],[x+pixel*.94,y,z],[x+pixel*.94,y+pixel*.94,z],[x,y+pixel*.94,z]], color);
         }
       }));
       left += ((glyph?.[0].length || 3) + 1) * pixel;
@@ -110,6 +113,7 @@
       ground(target,-27.625,-16.375,z,z+50,.003,COLORS.road,1,1);
       for (const x of [-27.625,-16.375]) ground(target,x-.08,x+.08,z,z+50,.012,COLORS.paint,2);
       for (const x of [-7.4,7.4,-14.6,-29.4]) {
+        box(target,x,0,z+25,.34,.37,50,COLORS.steelDark);
         box(target,x,.62,z+25,.13,.23,50,COLORS.steel);
         box(target,x,.6,z+25,.14,.045,50,COLORS.steelDark);
       }
@@ -146,6 +150,104 @@
     return target;
   }
   const highway = buildHighway();
+
+  const vehicleTemplates = new Map();
+  function buildVehicleTemplate(vehicle, detail) {
+    const key = `${vehicle.kind}-${vehicle.color}-${detail}`;
+    if (vehicleTemplates.has(key)) return vehicleTemplates.get(key);
+    const target = mesh(), truck = vehicle.kind === 'truck';
+    const body = rgb(vehicle.color), glass = rgb('#264454'), tyres = rgb('#20292c');
+    const metal = rgb('#a0adb0'), lamps = rgb('#fff0ba'), tail = rgb('#e74637');
+    // Local +Z is the nose. The complete template is turned 180 degrees for
+    // opposing traffic, including windscreens, cab, lamps and wheel positions.
+    ground(target,-vehicle.width*.57,vehicle.width*.57,-vehicle.length*.52,vehicle.length*.52,.023,rgb('#384245'),2);
+    if (truck) {
+      box(target,0,.46,0,2.12,.4,8.2,tyres);
+      box(target,0,.87,-1.05,2.35,2.34,6.2,body);
+      box(target,0,.75,3,2.23,1.84,2.24,body);
+      box(target,0,1.63,4.125,1.96,.65,.022,glass);
+      box(target,0,.9,4.15,1.15,.3,.025,tyres);
+      for (const side of [-1,1]) {
+        box(target,side*1.12,1.66,3.24,.022,.59,1.22,glass);
+        box(target,side*.88,.9,4.16,.39,.2,.025,lamps);
+        box(target,side*.91,.9,-4.16,.29,.23,.025,tail);
+      }
+      if (detail) {
+        for (const x of [-.91,0,.91]) box(target,x,.92,-4.165,.038,2.17,.02,metal);
+        box(target,0,.81,-4.18,2.31,.075,.03,metal);
+        box(target,0,.59,4.18,2.19,.18,.06,metal);
+        for (const side of [-1,1]) box(target,side*1.26,1.92,3.81,.18,.32,.13,tyres);
+      }
+    } else {
+      box(target,0,.39,0,1.85,.49,4.5,body);
+      box(target,0,.84,1.64,1.8,.11,1.16,body);
+      // A tapered roof and sloping windows give cars a readable silhouette.
+      polygon(target,[[-.88,.86,-1.27],[.88,.86,-1.27],[.7,1.46,-.75],[-.7,1.46,-.75]],glass);
+      polygon(target,[[.88,.86,1.11],[-.88,.86,1.11],[-.7,1.46,.51],[.7,1.46,.51]],glass);
+      polygon(target,[[-.7,1.46,-.75],[.7,1.46,-.75],[.7,1.46,.51],[-.7,1.46,.51]],body,3,0,1.08);
+      for (const side of [-1,1]) {
+        polygon(target,[[side*.88,.9,-1.16],[side*.88,.9,1.02],[side*.71,1.43,.48],[side*.71,1.43,-.71]],glass,3,0,side < 0 ? .8 : 1);
+        box(target,side*.65,.63,2.261,.42,.16,.025,lamps);
+        box(target,side*.65,.63,-2.261,.43,.17,.025,tail);
+        if (detail) {
+          polygon(target,[[side*.889,.88,-.14],[side*.889,.88,-.02],[side*.712,1.445,-.02],[side*.712,1.445,-.14]],body);
+          box(target,side*.98,.98,.68,.16,.12,.26,body);
+        }
+      }
+      if (detail) {
+        box(target,0,.46,2.27,1.72,.09,.04,metal);
+        box(target,0,.46,-2.27,1.72,.09,.04,metal);
+        box(target,0,.62,-2.282,.4,.14,.02,COLORS.white);
+        box(target,0,.61,2.281,.64,.18,.02,tyres);
+      }
+    }
+    const axles = truck ? [-2.95,-1.75,2.83] : [-1.4,1.38];
+    const wheelRadius = truck ? .44 : .32;
+    for (const z of axles) for (const side of [-1,1]) {
+      const x = side*(vehicle.width/2-.065);
+      box(target,x,.08,z,.21,wheelRadius*2,.67+(truck ? .18 : 0),tyres);
+      if (detail) box(target,x+side*.111,.22,z,.014,wheelRadius*.9,wheelRadius*.9,metal);
+    }
+    vehicleTemplates.set(key,target);
+    return target;
+  }
+  function disc(target,x,y,z,radius,color) {
+    const points = [];
+    for (let i=0;i<24;i++) { const angle = i*Math.PI/12; points.push([x+Math.cos(angle)*radius,y+Math.sin(angle)*radius,z]); }
+    polygon(target,points,color);
+  }
+  function speedSign(target,sign,origin) {
+    const x = 8.5, z = sign.y-origin;
+    box(target,x,0,z,.12,3.6,.12,COLORS.steel);
+    disc(target,x,3.55,z+.012,.88,COLORS.steelDark);
+    disc(target,x,3.55,z-.02,.88,rgb('#d4493f'));
+    disc(target,x,3.55,z-.028,.71,COLORS.white);
+    lettering(target,String(sign.limitKmh),x,3.28,z-.035,.55,rgb('#26363b'));
+  }
+  function buildTraffic(pose,origin,stats) {
+    const target = mesh(), sin = Math.sin(pose.heading*Math.PI/180), cos = Math.cos(pose.heading*Math.PI/180);
+    stats.visibleTraffic = 0;
+    for (const vehicle of pose.traffic || []) {
+      if (![vehicle.x,vehicle.y].every(Number.isFinite)) continue;
+      const dx = vehicle.x-pose.x, dz = vehicle.y-pose.y;
+      const depth = dx*sin+dz*cos, side = dx*cos-dz*sin;
+      const margin = vehicle.length || 8;
+      if (depth+margin < NEAR || depth-margin > ROAD.far || Math.abs(side) > Math.max(12,depth*1.4)+margin) continue;
+      stats.visibleTraffic++;
+      const template = buildVehicleTemplate(vehicle,depth < 260);
+      const direction = vehicle.direction < 0 ? -1 : 1, z = vehicle.y-origin;
+      for (const face of template.faces) {
+        const points = face.points.map(p => [vehicle.x+p[0]*direction,p[1],z+p[2]*direction]);
+        polygon(target,points,face.color,face.layer,face.material);
+      }
+      if (vehicle.braking && depth < 130) {
+        for (const side of [-1,1]) box(target,vehicle.x+side*vehicle.width*.34,.62,z-direction*(vehicle.length/2+.022),.4,.21,.024,rgb('#ff7155'));
+      }
+    }
+    const signs = pose.roadSigns || window.RoverTraffic?.signsAround(pose.y) || [];
+    for (const sign of signs) speedSign(target,sign,origin);
+    return target;
+  }
 
   // No road length limit: guardrails are the only collision boundaries.
   function canOccupy(x, y, radius = .9) {
@@ -203,11 +305,11 @@
   }
 
   function createCamera(canvas) {
-    let gl = null, context = null, program = null, staticBuffer = null, guideBuffer = null, skyBuffer = null;
+    let gl = null, context = null, program = null, staticBuffer = null, guideBuffer = null, trafficBuffer = null, skyBuffer = null;
     let width = 0, height = 0, frames = 0, totalFrames = 0, frameStart = performance.now(), disposed = false;
     let locations;
     const shaders = [];
-    const stats = { backend: '', fps: 0, frames: 0, worldOrigin: 0, cameraHeight: ROAD.cameraHeight, brakeClipped: false, brakeDistance: 0 };
+    const stats = { backend: '', fps: 0, frames: 0, worldOrigin: 0, cameraHeight: ROAD.cameraHeight, brakeClipped: false, brakeDistance: 0, visibleTraffic: 0 };
     try { gl = canvas.getContext('webgl',{alpha:false,antialias:true,preserveDrawingBuffer:true,powerPreference:'low-power'}); } catch {}
     if (gl) {
       const compile = (type,source) => {
@@ -261,6 +363,7 @@
       for (const key of ['position','color','material']) gl.enableVertexAttribArray(locations[key]);
       staticBuffer = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,staticBuffer); gl.bufferData(gl.ARRAY_BUFFER,highway.data,gl.STATIC_DRAW);
       guideBuffer = gl.createBuffer();
+      trafficBuffer = gl.createBuffer();
       skyBuffer = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,skyBuffer);
       gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,0,0,0,0,0,3,-1,0,0,0,0,0,-1,3,0,0,0,0,0]),gl.STATIC_DRAW);
       gl.disable(gl.CULL_FACE); gl.clearColor(.79,.86,.86,1);
@@ -295,13 +398,13 @@
       }
       return clipped;
     }
-    function softwareDraw(pose, localY, guide) {
+    function softwareDraw(pose, localY, guide, traffic) {
       const angle = pose.heading*Math.PI/180, sin = Math.sin(angle), cos = Math.cos(angle), focal = height*FOCAL/2;
       const sky = context.createLinearGradient(0,0,0,height*.59);
       sky.addColorStop(0,pose.wet ? '#73a1b7' : '#5ca6d4'); sky.addColorStop(1,'#d4e3e0');
       context.fillStyle = sky; context.fillRect(0,0,width,height);
       const projected = [];
-      for (const face of [...highway.faces,...guide.faces]) {
+      for (const face of [...highway.faces,...guide.faces,...traffic.faces]) {
         const centerDepth = (face.x-pose.x)*sin+(face.z-localY)*cos;
         if (centerDepth+face.radius < NEAR || centerDepth-face.radius > ROAD.far) continue;
         let points = face.points.map(([x,y,z]) => { const dx = x-pose.x, dz = z-localY; return [dx*cos-dz*sin,y-ROAD.cameraHeight,dx*sin+dz*cos]; });
@@ -338,6 +441,7 @@
         const origin = Math.floor(pose.y/ROAD.repeat)*ROAD.repeat, localY = pose.y-origin;
         stats.worldOrigin = origin;
         const guide = buildBrakingGuide(pose,origin,stats);
+        const traffic = buildTraffic(pose,origin,stats);
         if (gl) {
           gl.useProgram(program); gl.uniform2f(locations.size,width,height); gl.uniform1f(locations.wet,pose.wet ? 1 : 0);
           gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
@@ -350,7 +454,11 @@
             bind(guideBuffer); gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(guide.vertices),gl.DYNAMIC_DRAW);
             gl.drawArrays(gl.TRIANGLES,0,guide.vertices.length/7);
           }
-        } else softwareDraw(pose,localY,guide);
+          if (traffic.vertices.length) {
+            bind(trafficBuffer); gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(traffic.vertices),gl.DYNAMIC_DRAW);
+            gl.drawArrays(gl.TRIANGLES,0,traffic.vertices.length/7);
+          }
+        } else softwareDraw(pose,localY,guide,traffic);
         frames++; totalFrames++;
         if (now-frameStart >= 1000) { stats.fps = Math.round(frames*1000/(now-frameStart)); frameStart = now; frames = 0; }
         stats.frames = totalFrames;
@@ -360,7 +468,7 @@
       dispose() {
         disposed = true; observer?.disconnect(); window.removeEventListener('resize',resize);
         canvas.removeEventListener('webglcontextlost',lost); canvas.removeEventListener('webglcontextrestored',restored);
-        if (gl) { for (const buffer of [staticBuffer,guideBuffer,skyBuffer]) gl.deleteBuffer(buffer); for (const shader of shaders) gl.deleteShader(shader); gl.deleteProgram(program); }
+        if (gl) { for (const buffer of [staticBuffer,guideBuffer,trafficBuffer,skyBuffer]) gl.deleteBuffer(buffer); for (const shader of shaders) gl.deleteShader(shader); gl.deleteProgram(program); }
       }
     };
   }
