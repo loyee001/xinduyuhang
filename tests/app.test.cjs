@@ -125,13 +125,17 @@ function loadApp() {
       now += seconds * 1000;
       app.render();
     },
-    key(type, code, repeat = false) {
+    key(type, code, repeat = false, target = document.body) {
       const event = {
-        code, key: code, target: document.body, repeat, defaultPrevented: false,
+        code, key: code === 'Space' ? ' ' : code, target, repeat, defaultPrevented: false,
         preventDefault() { this.defaultPrevented = true; }
       };
+      target['on' + type]?.(event);
       for (const callback of listeners.get(type) || []) callback(event);
       return event;
+    },
+    dispatch(name) {
+      for (const callback of listeners.get(name) || []) callback({ type: name });
     },
     setTarget(value) {
       const slider = ui('speed-slider');
@@ -614,4 +618,234 @@ test('cancelling a lane change after stopping partway still requires a physical 
   driver.key('keydown', 'KeyW');
   advanceUntil(driver, () => !app.state.laneChanging);
   assert.ok(Math.abs(app.car.x) <= 0.08 && headingError(app.car) <= 0.6);
+});
+
+function adviceVehicle(lane, y, speed, id) {
+  return { id, lane, x: [-3.75, 0, 3.75][lane], y, previousY: y, direction: 1,
+    heading: 0, speed, cruiseFactor: speed / (120 / 3.6), length: 4.5, width: 1.85,
+    height: 1.5, kind: 'car', color: '#657778', braking: false };
+}
+
+// A slower leader makes a change useful; a car alongside blocks the other
+// adjacent lane. These are actual traffic objects, not a mocked advice result.
+function setAdviceTraffic(driver, direction = 'left', lane = 1) {
+  const { app } = driver;
+  Object.assign(app.car, { x: [-3.75, 0, 3.75][lane], heading: 0, steer: 0, speed: 25, gear: 'forward' });
+  app.state.laneTarget = lane;
+  app.world.vehicles = [adviceVehicle(lane, app.car.y + 90, 15, 901)];
+  const blocked = lane + (direction === 'left' ? 1 : -1);
+  if (blocked >= 0 && blocked <= 2) app.world.vehicles.push(adviceVehicle(blocked, app.car.y, 25, 902));
+  app.render();
+}
+
+test('live lane advice reads traffic and renders gaps without operating the vehicle', () => {
+  const driver = loadApp(), { app, ui } = driver;
+  setAdviceTraffic(driver);
+  const before = JSON.stringify({ car: app.car, input: app.state.lastInput, vehicles: app.world.vehicles });
+  for (let i = 0; i < 5; i++) {
+    app.render();
+    const advice = app.readState().laneRecommendation;
+    assert.equal(advice.status, 'recommend');
+    assert.equal(advice.direction, 'left');
+    assert.equal(advice.targetLane, 0);
+  }
+  assert.equal(JSON.stringify({ car: app.car, input: app.state.lastInput, vehicles: app.world.vehicles }), before);
+  assert.equal(app.state.laneTarget, 1);
+  assert.equal(app.state.laneChanging, false);
+  assert.equal(app.state.controls.size, 0);
+  assert.equal(ui('lane-advice').dataset.status, 'recommend');
+  assert.match(ui('lane-advice-title').textContent, /推荐向左/);
+  assert.equal(ui('lane-advice-accept').disabled, false);
+  assert.equal(ui('lane-advice-live').textContent, ui('lane-advice-title').textContent);
+  assert.equal(ui('advice-lane-0').classList.contains('recommended'), true);
+  assert.equal(ui('advice-lane-1').classList.contains('current'), true);
+  assert.equal(ui('advice-lane-2').classList.contains('blocked'), true);
+  for (let lane = 0; lane < 3; lane++) {
+    assert.match(ui('advice-gap-' + lane).textContent, /前 .+ · 后 .+/);
+    assert.doesNotMatch(ui('advice-gap-' + lane).textContent, /NaN|Infinity/);
+    assert.ok(ui('advice-status-' + lane).textContent);
+  }
+  driver.advance(0.2);
+  assert.equal(app.car.x, 0);
+  assert.equal(app.state.laneChanging, false);
+  assert.equal(app.state.lastInput.throttle, 0);
+  assert.equal(app.state.lastInput.brake, 0);
+});
+
+test('accepting either recommendation starts one physical adjacent change and requires a new decision afterward', () => {
+  for (const [direction, target, x] of [['left', 0, -3.75], ['right', 2, 3.75]]) {
+    const driver = loadApp(), { app, ui } = driver;
+    setAdviceTraffic(driver, direction);
+    ui('ai-tab').onclick();
+    assert.equal(app.readState().laneRecommendation.direction, direction);
+    assert.equal(ui('lane-advice-accept').onclick(), true);
+    assert.equal(app.state.mode, 'manual');
+    assert.equal(app.state.laneTarget, target);
+    assert.equal(app.state.laneChanging, true);
+    assert.equal(app.car.x, 0, 'acceptance queues real steering instead of moving the car instantly');
+    assert.equal(app.car.speed, 25);
+    assert.equal(app.state.controls.size, 0, 'accepting advice must not apply the throttle');
+    assert.equal(ui('lane-advice-accept').disabled, true);
+    assert.equal(ui('lane-advice-accept').onclick(), false);
+    assert.equal(app.state.laneTarget, target, 'a repeated click must not queue another lane');
+    app.world.vehicles = [];
+    advanceUntil(driver, () => !app.state.laneChanging);
+    assert.ok(Math.abs(app.car.x - x) <= 0.08);
+    assert.ok(headingError(app.car) <= 0.6);
+    assert.equal(app.state.estop, false);
+    assert.ok(app.state.adviceCooldownUntil > app.car.elapsedTime + 4.9);
+    assert.equal(app.state.lastInput.throttle, 0);
+  }
+});
+
+test('Enter and Space accept focused lane advice without braking or repeating after completion', () => {
+  for (const [code, direction, target] of [['Enter', 'left', 0], ['Space', 'right', 2]]) {
+    const driver = loadApp(), { app, ui } = driver;
+    setAdviceTraffic(driver, direction);
+    const button = ui('lane-advice-accept');
+    const event = driver.key('keydown', code, false, button);
+    assert.equal(event.defaultPrevented, true, 'the focused button must suppress native duplicate clicks and global shortcuts');
+    assert.equal(app.state.laneTarget, target);
+    assert.equal(app.state.laneChanging, true);
+    assert.equal(app.car.x, 0);
+    assertNoAutomaticBrake(app);
+    driver.key('keydown', code, true, button);
+    assert.equal(app.state.laneTarget, target);
+    assertNoAutomaticBrake(app);
+    app.world.vehicles = [];
+    advanceUntil(driver, () => !app.state.laneChanging);
+    driver.advance(5.1);
+    // A newly available opposite recommendation must still require a fresh
+    // press even if the original key remains held through the entire change.
+    setAdviceTraffic(driver, direction === 'left' ? 'right' : 'left', target);
+    assert.equal(app.state.laneAdvice.status, 'recommend');
+    assert.equal(app.state.laneAdvice.targetLane, 1);
+    assert.equal(button.disabled, false);
+    const repeated = driver.key('keydown', code, true, button);
+    assert.equal(repeated.defaultPrevented, true);
+    assert.equal(app.state.laneTarget, target);
+    assert.equal(app.state.laneChanging, false);
+    assertNoAutomaticBrake(app);
+    driver.key('keyup', code, false, button);
+    driver.key('keydown', code, false, button);
+    assert.equal(app.state.laneTarget, 1);
+    assert.equal(app.state.laneChanging, true);
+    assertNoAutomaticBrake(app);
+  }
+});
+
+test('traffic changing between the shown suggestion and its click cannot silently choose another lane', () => {
+  const driver = loadApp(), { app, ui } = driver;
+  setAdviceTraffic(driver, 'left');
+  assert.equal(app.state.laneAdvice.targetLane, 0);
+  // The last rendered direction stays left, but a new car now blocks it and
+  // the right lane clears before the next frame renders.
+  app.world.vehicles = [adviceVehicle(1, 90, 15, 911), adviceVehicle(0, 0, 25, 912)];
+  assert.equal(app.readState().laneRecommendation.targetLane, 2);
+  assert.equal(app.state.laneAdvice.targetLane, 0);
+  assert.equal(ui('lane-advice-accept').onclick(), false);
+  assert.equal(app.state.laneTarget, 1);
+  assert.equal(app.state.laneChanging, false);
+  assert.equal(app.car.x, 0);
+  assert.equal(app.state.laneAdvice.targetLane, 2);
+  assert.match(ui('lane-advice-title').textContent, /推荐向右/);
+  assert.match(ui('toast').textContent, /路况已变化/);
+  assert.equal(ui('lane-advice-accept').onclick(), true, 'a separate click may accept the refreshed right recommendation');
+  assert.equal(app.state.laneTarget, 2);
+});
+
+test('a newly dangerous departure rejects stale advice even when the recommended lane stays clear', () => {
+  const driver = loadApp(), { app, ui } = driver;
+  setAdviceTraffic(driver, 'left');
+  assert.equal(app.state.laneAdvice.targetLane, 0);
+  const leader = app.world.vehicles.find(vehicle => vehicle.lane === 1);
+  leader.y = leader.previousY = app.car.y + 8;
+  const fresh = app.readState().laneRecommendation;
+  assert.equal(fresh.lanes[0].safe, true, 'the target corridor remains clear');
+  assert.equal(fresh.status, 'blocked', 'the car must have room to leave its original lane first');
+  assert.match(fresh.reason, /当前前车过近/);
+  assert.equal(app.state.laneAdvice.status, 'recommend', 'the old UI suggestion has not refreshed yet');
+  assert.equal(ui('lane-advice-accept').onclick(), false);
+  assert.equal(app.state.laneTarget, 1);
+  assert.equal(app.state.laneChanging, false);
+  assert.equal(app.car.x, 0);
+  assert.equal(app.state.laneAdvice.status, 'blocked');
+  assert.equal(ui('lane-advice-accept').disabled, true);
+  assertNoAutomaticBrake(app);
+});
+
+test('maneuvers, brakes and unavailable controls invalidate displayed advice before accepting it', () => {
+  const gates = [
+    ['active lane change', ({ app }) => { app.state.laneChanging = true; app.state.laneTarget = 0; }],
+    ['emergency shoulder', ({ app }) => { app.state.shoulderAlert = true; }],
+    ['shoulder recovery', ({ app }) => { app.state.shoulderRecovery = true; }],
+    ['emergency lock', ({ app }) => { app.state.estop = true; }],
+    ['failsafe', ({ app }) => { app.state.failsafe = true; }],
+    ['disconnected', ({ app }) => { app.state.connected = false; }],
+    ['reverse gear', ({ app }) => { app.car.gear = app.state.requestedGear = 'reverse'; }],
+    ['reverse requested', ({ app }) => { app.state.requestedGear = 'reverse'; }],
+    ['gear change pending', ({ app }) => { app.state.shiftPending = true; }],
+    ['held brake', ({ app }) => { app.state.controls.set('kArrowDown', 'brake'); }],
+    ['service brake', ({ app }) => { app.state.serviceBrake = 0.55; }],
+    ['automatic limit brake', ({ app }) => { app.state.autoLimitBraking = true; }],
+    ['last physical brake input', ({ app }) => { app.state.lastInput.brake = 1; }],
+    ['guardrail contact', ({ app }) => { app.car.wallContact = 'left'; }],
+    ['traffic contact', ({ app }) => { app.state.contactUntil = 1000; }],
+    ['off center', ({ app }) => { app.car.x = 1.1; }],
+    ['cooldown', ({ app }) => { app.state.adviceCooldownUntil = app.car.elapsedTime + 5; }]
+  ];
+  for (const [name, apply] of gates) {
+    const driver = loadApp(), { app, ui } = driver;
+    setAdviceTraffic(driver);
+    assert.equal(app.state.laneAdvice.status, 'recommend', name);
+    apply(driver);
+    const target = app.state.laneTarget, changing = app.state.laneChanging;
+    assert.equal(app.readState().laneRecommendation.status, 'unavailable', name);
+    assert.equal(ui('lane-advice-accept').onclick(), false, name);
+    assert.equal(app.state.laneTarget, target, name);
+    assert.equal(app.state.laneChanging, changing, name);
+    assert.equal(ui('lane-advice-accept').disabled, true, name);
+    assert.equal(ui('lane-advice').dataset.status, 'unavailable', name);
+    assert.equal(app.state.laneAdvice.targetLane, null, name);
+  }
+  const driver = loadApp();
+  setAdviceTraffic(driver);
+  driver.dispatch('rover-camera-lost');
+  assert.equal(driver.app.readState().laneRecommendation.status, 'unavailable');
+  assert.equal(driver.ui('lane-advice-accept').disabled, true);
+  assert.equal(driver.ui('lane-advice-accept').onclick(), false);
+  assert.equal(driver.app.state.laneTarget, 1);
+});
+
+test('finishing a real lane change waits five simulation seconds before recommending another', () => {
+  const driver = loadApp(), { app, ui } = driver;
+  app.world.vehicles = [];
+  app.car.speed = 25;
+  driver.setTarget(25);
+  driver.key('keydown', 'KeyW');
+  ui('lane-right').onclick();
+  advanceUntil(driver, () => !app.state.laneChanging);
+  const cooldown = app.state.adviceCooldownUntil;
+  assert.ok(cooldown > app.car.elapsedTime + 4.9);
+  setAdviceTraffic(driver, 'left', 2);
+  assert.equal(app.readState().laneRecommendation.status, 'unavailable');
+  assert.match(ui('lane-advice-reason').textContent, /刚完成变道/);
+  driver.advance(4);
+  assert.equal(app.readState().laneRecommendation.status, 'unavailable');
+  assert.equal(app.state.laneTarget, 2);
+  driver.advance(1.1);
+  assert.ok(app.car.elapsedTime > cooldown);
+  // The original slow leader has drawn too close during those five seconds.
+  // Present a new safe-but-beneficial gap to isolate cooldown expiry from
+  // the separate rule that forbids departing too late behind a close car.
+  app.world.vehicles = [adviceVehicle(2, app.car.y + 90, 15, 921)];
+  app.render();
+  assert.equal(app.readState().laneRecommendation.status, 'recommend');
+  assert.equal(app.readState().laneRecommendation.targetLane, 1);
+  assert.equal(app.state.laneTarget, 2, 'cooldown expiry shows advice without starting a change');
+  assert.equal(app.state.laneChanging, false);
+  ui('reset-session').onclick();
+  assert.equal(app.state.adviceCooldownUntil, 0);
+  assert.equal(app.state.laneAdvice.status, 'unavailable');
+  assert.equal(ui('lane-advice-accept').disabled, true);
 });

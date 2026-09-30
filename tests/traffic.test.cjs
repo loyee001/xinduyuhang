@@ -307,3 +307,249 @@ test('dense traffic remains separated and does not recycle its whole population 
   }
   assert.ok(resetCount > state.vehicles.length, 'exercise multiple complete traffic rotations');
 });
+
+const cruisingEgo = (overrides = {}) => ({ x: 0, y: 0, speed: 25, heading: 0, gear: 'forward', ...overrides });
+const slowLeader = (overrides = {}) => vehicle({ y: 90, speed: 15, ...overrides });
+const laneCar = (lane, overrides = {}) => vehicle({ lane, x: [-3.75, 0, 3.75][lane], ...overrides });
+
+test('advice recommends the clear adjacent lane in either direction with bumper gaps', () => {
+  for (const [target, blocked, direction] of [[0, 2, 'left'], [2, 0, 'right']]) {
+    const state = world([slowLeader(), laneCar(blocked, { id: 2, y: 0 })]);
+    const advice = traffic.getLaneRecommendation(state, cruisingEgo());
+    assert.equal(advice.status, 'recommend');
+    assert.equal(advice.direction, direction);
+    assert.equal(advice.targetLane, target);
+    assert.equal(advice.currentLane, 1);
+    assert.equal(advice.lanes[1].frontGap, 85.5);
+    assert.equal(advice.lanes[target].frontGap, null);
+    assert.equal(advice.lanes[target].rearGap, null);
+    assert.equal(advice.lanes[target].safe, true);
+    assert.equal(advice.lanes[blocked].safe, false);
+    assert.match(advice.lanes[blocked].reason, /并排/);
+  }
+});
+
+test('advice only permits one lane at a time at both road edges and excludes shoulder/opposite lanes', () => {
+  for (const currentLane of [0, 2]) {
+    const x = [-3.75, 0, 3.75][currentLane];
+    const state = world([slowLeader({ lane: currentLane, x }),
+      vehicle({ lane: 3, x: -25.75, y: 0, direction: -1 }),
+      vehicle({ lane: 6, x: 7.125, y: 0, direction: 1 })]);
+    const advice = traffic.getLaneRecommendation(state, cruisingEgo({ x }));
+    assert.equal(advice.status, 'recommend');
+    assert.equal(advice.targetLane, 1);
+    assert.equal(advice.direction, currentLane === 0 ? 'right' : 'left');
+    assert.deepEqual(advice.lanes.map(lane => lane.lane), [0, 1, 2]);
+    assert.equal(advice.lanes[2 - currentLane].safe, false);
+    assert.match(advice.lanes[2 - currentLane].reason, /跨越/);
+  }
+});
+
+test('fast closing rear traffic vetoes a lane despite a large present gap', () => {
+  const state = world([slowLeader(), laneCar(0, { y: -140, speed: 45 }), laneCar(2, { y: 0 })]);
+  const advice = traffic.getLaneRecommendation(state, cruisingEgo());
+  assert.equal(advice.status, 'blocked');
+  assert.equal(advice.targetLane, null);
+  assert.equal(advice.lanes[0].rearGap, 135.5);
+  assert.ok(advice.lanes[0].projectedRearGap < 0);
+  assert.equal(advice.lanes[0].safe, false);
+  assert.match(advice.lanes[0].reason, /后车快速接近/);
+});
+
+test('a farther fast rear car is not masked by the nearest rear vehicle', () => {
+  const state = world([slowLeader(), laneCar(0, { id: 2, y: -70, speed: 25 }),
+    laneCar(0, { id: 3, y: -150, speed: 47 }), laneCar(2, { id: 4, y: 0 })]);
+  const advice = traffic.getLaneRecommendation(state, cruisingEgo());
+  assert.equal(advice.status, 'blocked');
+  assert.equal(advice.lanes[0].rearGap, 65.5);
+  assert.equal(advice.lanes[0].rearSpeed, 25);
+  assert.ok(advice.lanes[0].projectedRearGap < 0);
+  assert.equal(advice.lanes[0].safe, false);
+});
+
+test('a near rear follower blocks the lane even without a large closing speed', () => {
+  const advice = traffic.getLaneRecommendation(world([slowLeader(), laneCar(0, { y: -24.5, speed: 25 }),
+    laneCar(2, { y: 0 })]), cruisingEgo());
+  assert.equal(advice.status, 'blocked');
+  assert.equal(advice.lanes[0].rearGap, 20);
+  assert.match(advice.lanes[0].reason, /后方间距不足/);
+});
+
+test('front clearance uses the complete vehicle body, including trucks', () => {
+  const advice = traffic.getLaneRecommendation(world([slowLeader(),
+    laneCar(0, { y: 37, speed: 32, length: 8.4 }), laneCar(2, { y: 0 })]), cruisingEgo());
+  assert.equal(advice.status, 'blocked');
+  assert.ok(Math.abs(advice.lanes[0].frontGap - 30.55) < 1e-8);
+  assert.match(advice.lanes[0].reason, /前方间距不足/);
+});
+
+test('prediction rejects a slow car that ego would catch during a gradual lane change', () => {
+  const advice = traffic.getLaneRecommendation(world([slowLeader(), laneCar(0, { y: 160, speed: 10 }),
+    laneCar(2, { y: 0 })]), cruisingEgo());
+  assert.equal(advice.lanes[0].frontGap, 155.5);
+  assert.ok(advice.lanes[0].projectedFrontGap < 25);
+  assert.equal(advice.lanes[0].safe, false);
+  assert.match(advice.lanes[0].reason, /变道期间.*前车/);
+  assert.equal(advice.status, 'blocked');
+});
+
+test('front prediction budgets acceleration toward the requested speed, while rear prediction gives no acceleration credit', () => {
+  const advice = traffic.getLaneRecommendation(world([slowLeader(),
+    laneCar(0, { y: 54.5, speed: 25 }), laneCar(0, { id: 3, y: -44.5, speed: 27 })]), cruisingEgo());
+  const left = advice.lanes[0];
+  assert.equal(left.frontGap, 50);
+  assert.ok(left.projectedFrontGap < 10, '50 m headway erodes during acceleration to 120 km/h');
+  assert.equal(left.projectedRearGap, 26, 'rear gap assumes current speed, not intended acceleration');
+  assert.equal(left.safe, false);
+});
+
+test('accelerating from low speed reserves the physical full-throttle travel distance before recommending a lane', () => {
+  const advice = traffic.getLaneRecommendation(world([slowLeader({ y: 35, speed: 1.5 }),
+    laneCar(0, { y: 130, speed: 8 }), laneCar(2, { y: 0 })]), cruisingEgo({ speed: 5 }), { desiredSpeed: 30 });
+  assert.equal(advice.status, 'blocked');
+  assert.equal(advice.lanes[0].frontGap, 125.5);
+  assert.ok(advice.lanes[0].projectedFrontGap < 30);
+  assert.equal(advice.lanes[0].safe, false);
+  assert.match(advice.lanes[0].reason, /变道期间.*前车/);
+});
+
+test('wet roads require more clearance and a longer prediction interval', () => {
+  const state = world([slowLeader(), laneCar(0, { y: 44.5, speed: 25 }), laneCar(2, { y: 0 })]);
+  const dry = traffic.getLaneRecommendation(state, cruisingEgo(), { desiredSpeed: 25 });
+  const wet = traffic.getLaneRecommendation(state, cruisingEgo(), { wet: true, desiredSpeed: 25 });
+  assert.equal(dry.status, 'recommend');
+  assert.equal(dry.targetLane, 0);
+  assert.equal(wet.status, 'blocked');
+  assert.equal(wet.lanes[0].safe, false);
+  const approaching = world([slowLeader(), laneCar(0, { y: -75, speed: 30 }), laneCar(2, { y: 0 })]);
+  const dryRear = traffic.getLaneRecommendation(approaching, cruisingEgo(), { desiredSpeed: 25 });
+  const wetRear = traffic.getLaneRecommendation(approaching, cruisingEgo(), { wet: true, desiredSpeed: 25 });
+  assert.equal(dryRear.status, 'recommend');
+  assert.equal(wetRear.status, 'blocked');
+  assert.equal(wetRear.lanes[0].projectedRearGap, dryRear.lanes[0].projectedRearGap - 5);
+});
+
+test('open current lanes and equal congestion do not produce pointless lane changes', () => {
+  assert.equal(traffic.getLaneRecommendation(world([]), cruisingEgo()).status, 'keep');
+  assert.equal(traffic.getLaneRecommendation(world([slowLeader({ y: 400 })]), cruisingEgo()).status, 'keep');
+  const congested = world([0, 1, 2].map(lane => laneCar(lane, { y: 65, speed: 15 })));
+  const advice = traffic.getLaneRecommendation(congested, cruisingEgo());
+  assert.equal(advice.status, 'blocked');
+  assert.equal(advice.direction, null);
+  assert.match(advice.reason, /没有明显通行优势/);
+});
+
+test('higher user speed settings cannot invent an advantage above the road limit', () => {
+  const ego = cruisingEgo({ y: 1200 });
+  const advice = traffic.getLaneRecommendation(world([slowLeader({ y: 1250, speed: 100 / 3.6 })]), ego,
+    { desiredSpeed: 100 });
+  assert.equal(advice.status, 'keep');
+  for (const lane of advice.lanes) assert.ok(lane.availableSpeed <= 100 / 3.6);
+  const slowing = traffic.getLaneRecommendation(world([slowLeader({ y: 1265 })]), cruisingEgo({ y: 1200, speed: 35 }));
+  assert.equal(slowing.status, 'unavailable');
+  assert.match(slowing.reason, /限速/);
+});
+
+test('a reduced speed target does not describe a too-close leading car as clear traffic', () => {
+  const advice = traffic.getLaneRecommendation(world([slowLeader({ y: 10, speed: 12 })]), cruisingEgo(),
+    { desiredSpeed: 10 });
+  assert.equal(advice.status, 'keep');
+  assert.match(advice.reason, /留意前车/);
+  assert.doesNotMatch(advice.reason, /通行顺畅/);
+});
+
+test('an empty adjacent lane cannot justify a departure that reaches the current leader before lateral clearance', () => {
+  for (const gap of [10, 20]) {
+    for (const wet of [false, true]) {
+      const advice = traffic.getLaneRecommendation(world([slowLeader({ y: gap + 4.5 }),
+        laneCar(2, { y: 0 })]), cruisingEgo(), { desiredSpeed: 30, wet });
+      assert.equal(advice.lanes[0].safe, true, 'destination is clear; the danger is leaving this lane');
+      assert.equal(advice.status, 'blocked', `gap=${gap}, wet=${wet}`);
+      assert.equal(advice.targetLane, null);
+      assert.equal(advice.direction, null);
+      assert.match(advice.reason, /当前前车过近.*先减速/);
+      assert.ok(advice.lanes[1].departureFrontGap < 10);
+    }
+  }
+});
+
+test('departure clearance accounts for low-speed acceleration and keeps useful highway recommendations', () => {
+  for (const wet of [false, true]) {
+    const low = traffic.getLaneRecommendation(world([slowLeader({ y: 64.5, speed: 2 }), laneCar(2, { y: 0 })]),
+      cruisingEgo({ speed: 5 }), { desiredSpeed: 30, wet });
+    assert.equal(low.lanes[1].frontGap, 60);
+    assert.equal(low.status, 'blocked', `wet=${wet}`);
+    assert.match(low.reason, /当前前车过近/);
+    assert.ok(low.lanes[1].departureFrontGap < 10);
+    const early = traffic.getLaneRecommendation(world([slowLeader(), laneCar(2, { y: 0 })]), cruisingEgo(),
+      { desiredSpeed: 30, wet });
+    assert.equal(early.status, 'recommend', `early departure remains useful, wet=${wet}`);
+    assert.equal(early.targetLane, 0);
+    assert.ok(early.lanes[1].departureFrontGap >= 10);
+  }
+});
+
+test('wet departure reserves another second in the original lane', () => {
+  const state = world([slowLeader({ y: 59.5 }), laneCar(2, { y: 0 })]);
+  const dry = traffic.getLaneRecommendation(state, cruisingEgo(), { desiredSpeed: 25 });
+  const wet = traffic.getLaneRecommendation(state, cruisingEgo(), { desiredSpeed: 25, wet: true });
+  assert.equal(dry.status, 'recommend');
+  assert.equal(dry.lanes[1].departureFrontGap, 15);
+  assert.equal(wet.status, 'blocked');
+  assert.equal(wet.lanes[1].departureFrontGap, 5);
+  assert.match(wet.reason, /当前前车过近/);
+});
+
+test('the departure veto covers real collisions before the geometric steering controller clears the original lane', () => {
+  const physics = require('../dist/physics.js');
+  const laneControl = require('../dist/lane-control.js');
+  for (const gap of [10, 20]) {
+    for (const wet of [false, true]) {
+      const ego = Object.assign(physics.createState(), cruisingEgo());
+      const leader = slowLeader({ y: gap + 4.5 });
+      const state = world([leader]);
+      const advice = traffic.getLaneRecommendation(state, ego, { wet, desiredSpeed: 30 });
+      assert.equal(advice.status, 'blocked');
+      // Reproduce the previously unsafe maneuver by deliberately ignoring
+      // the advice and feeding its former left target to the real controller.
+      let collision = null;
+      for (let elapsed = 0; elapsed < 4 && !collision; elapsed += 1 / 120) {
+        const previous = { ...ego };
+        leader.previousY = leader.y;
+        leader.y += leader.speed / 120;
+        physics.step(ego, { throttle: 1, targetSpeed: 30, wet,
+          steering: laneControl.steeringFor(ego, -3.75, { wet }) }, 1 / 120);
+        collision = traffic.resolveContact(state, ego, previous);
+      }
+      assert.ok(collision, `real body overlap must reproduce, gap=${gap}, wet=${wet}`);
+      assert.ok(ego.x > -2.2, 'contact occurs before the car has cleared the original lane');
+      assert.equal(laneControl.isCentered(ego, -3.75), false);
+    }
+  }
+});
+
+test('reverse, near-rest, emergency shoulder, and an unfinished lane change suppress advice', () => {
+  const state = world([slowLeader()]);
+  for (const pose of [{ gear: 'reverse' }, { speed: 0 }, { speed: 1.9 }, { x: 5.626 },
+    { x: -5.626 }, { x: 1 }, { heading: 12 }]) {
+    const advice = traffic.getLaneRecommendation(state, cruisingEgo(pose));
+    assert.equal(advice.status, 'unavailable', JSON.stringify(pose));
+    assert.equal(advice.targetLane, null);
+    assert.equal(advice.direction, null);
+  }
+});
+
+test('recommendations are deterministic and never mutate world, car, braking or controls', () => {
+  const ego = Object.freeze(cruisingEgo({ braking: true, estop: false, steer: 0, throttle: .7 }));
+  const state = Object.freeze({ vehicles: Object.freeze([Object.freeze(slowLeader())]),
+    elapsedTime: 4, contacts: 0 });
+  const before = JSON.stringify({ state, ego });
+  const first = traffic.getLaneRecommendation(state, ego);
+  const second = traffic.getLaneRecommendation(state, ego);
+  assert.deepEqual(first, second);
+  assert.equal(first.status, 'recommend');
+  assert.equal(first.targetLane, 0, 'equal free lanes use a deterministic left-hand tie break');
+  assert.equal(JSON.stringify({ state, ego }), before);
+  assert.equal(first.lanes.length, 3);
+  assert.doesNotThrow(() => traffic.getLaneRecommendation(null));
+});
