@@ -10,11 +10,14 @@
   // This is a high-power demonstration vehicle, not a calibrated road car.
   const constants = Object.freeze({
     mass: 1400, wheelbase: 2.7, rho: 1.225, CdA: 0.66, Crr: 0.012,
-    g: 9.81, dryMu: 0.85, wetMu: 0.45, maxSpeed: 100,
+    g: 9.81, dryMu: 0.85, wetMu: 0.45, maxSpeed: 100, maxReverseSpeed: 5,
     maxDriveForce: 8000, maxPower: 650000,
     maxSteer: Math.PI / 6, steerRate: Math.PI / 3,
     drivetrainEfficiency: 0.9, accessoryPower: 500, maxSubstep: 1 / 120,
-    guardrailX: 6.45, guardrailImpactLoss: 0.06, guardrailScrapeDeceleration: 0.4
+    // Centre limits include the vehicle half-width. Keep guardrailX as the
+    // historical left-side magnitude; the right side now has a full shoulder.
+    guardrailX: 6.45, guardrailLeft: -6.45, guardrailRight: 7.95,
+    guardrailImpactLoss: 0.06, guardrailScrapeDeceleration: 0.4
   });
   const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
   const finite = (value, fallback) => Number.isFinite(value) ? value : fallback;
@@ -22,7 +25,7 @@
 
   function createState() {
     return {
-      x: 0, y: 0, heading: 0, speed: 0, steer: 0, acceleration: 0,
+      x: 0, y: 0, heading: 0, speed: 0, gear: 'forward', steer: 0, acceleration: 0,
       yawRate: 0, lateralAcceleration: 0, distance: 0, energyKWh: 0,
       powerW: 0, driveForce: 0, brakeForce: 0, dragForce: 0,
       rollingForce: 0, brakeDistance: 0, brakeStartSpeed: 0,
@@ -39,6 +42,7 @@
       brake: clamp(finite(input.brake, 0), 0, 1),
       steering: clamp(finite(input.steering, 0), -1, 1),
       targetSpeed: clamp(finite(input.targetSpeed, constants.maxSpeed), 0, constants.maxSpeed),
+      gear: input.gear === 'forward' || input.gear === 'reverse' ? input.gear : null,
       wet: Boolean(input.wet), guardrails: Boolean(input.guardrails)
     };
   }
@@ -85,9 +89,10 @@
   }
 
   function firstRailHit(x, y, heading, curvature, travel) {
-    const limit = constants.guardrailX;
+    const left = constants.guardrailLeft, right = constants.guardrailRight;
     const epsilon = 1e-10;
     for (const side of [-1, 1]) {
+      const limit = side < 0 ? -left : right;
       const outwardSpeed = side * Math.sin(heading);
       const outwardTurn = side * Math.cos(heading) * curvature;
       if (side * x >= limit - epsilon && (outwardSpeed > epsilon ||
@@ -110,8 +115,9 @@
     stops.sort((a, b) => a - b);
     for (let i = 1; i < stops.length; i += 1) {
       const endX = arcPoint(x, y, heading, curvature, stops[i]).x;
-      const side = endX >= limit ? 1 : endX <= -limit ? -1 : 0;
+      const side = endX >= right ? 1 : endX <= left ? -1 : 0;
       if (!side) continue;
+      const limit = side < 0 ? -left : right;
       let low = stops[i - 1];
       let high = stops[i];
       for (let j = 0; j < 36; j += 1) {
@@ -125,7 +131,7 @@
   }
 
   function constrainToRails(state, motion, acceleration, curvature, dt) {
-    const heading = state.heading / RAD_TO_DEG;
+    const heading = state.heading / RAD_TO_DEG + (state.gear === 'reverse' ? Math.PI : 0);
     const hit = motion.travel > 0
       ? firstRailHit(state.x, state.y, heading, curvature, motion.travel) : null;
     if (!hit) return motion;
@@ -150,9 +156,10 @@
     // redirect along the rail, lose at most 6% on entry, then dissipate scrape
     // energy continuously. There is no brake input, control lock, or repeated
     // per-frame impact multiplier. Inward steering immediately leaves the rail.
-    const end = arcPoint(hit.side * constants.guardrailX, atHit.y, railHeading,
+    const railX = hit.side < 0 ? constants.guardrailLeft : constants.guardrailRight;
+    const end = arcPoint(railX, atHit.y, railHeading,
       steeringAway ? curvature : 0, slideTravel);
-    end.x = clamp(end.x, -constants.guardrailX, constants.guardrailX);
+    end.x = clamp(end.x, constants.guardrailLeft, constants.guardrailRight);
     return {
       ...end, speed, travel: hit.travel + slideTravel,
       movingTime: hitTime + slideTime,
@@ -162,6 +169,8 @@
 
   function substep(state, input, dt) {
     const startSpeed = state.speed;
+    const direction = state.gear === 'reverse' ? -1 : 1;
+    const headingOffset = direction < 0 ? Math.PI : 0;
     const steerTarget = input.steering * constants.maxSteer;
     state.steer += clamp(steerTarget - state.steer, -constants.steerRate * dt, constants.steerRate * dt);
     const initial = forces(startSpeed, state.steer, input);
@@ -176,12 +185,17 @@
     const travel = Math.max(0, (startSpeed + finalSpeed) * 0.5 * movingTime);
     const meanSpeed = (startSpeed + finalSpeed) / 2;
     const turnForces = forces(meanSpeed, state.steer, input);
-    const curvature = meanSpeed > 1e-9 ? turnForces.lateralAcceleration / (meanSpeed * meanSpeed) : 0;
+    // Integrate positive path length in the direction of motion. Reversing
+    // flips yaw while the body keeps its orientation and the odometer keeps
+    // counting positive distance. Rail collision checks use this same path.
+    const curvature = meanSpeed > 1e-9
+      ? direction * turnForces.lateralAcceleration / (meanSpeed * meanSpeed) : 0;
     let motion = {
-      ...arcPoint(state.x, state.y, state.heading / RAD_TO_DEG, curvature, travel),
+      ...arcPoint(state.x, state.y, state.heading / RAD_TO_DEG + headingOffset, curvature, travel),
       speed: finalSpeed, travel, movingTime, wallContact: null
     };
     if (input.guardrails) motion = constrainToRails(state, motion, acceleration, curvature, dt);
+    motion.heading -= headingOffset;
     const headingChange = motion.heading - state.heading / RAD_TO_DEG;
     const turn = Math.atan2(Math.sin(headingChange), Math.cos(headingChange));
     state.x = motion.x;
@@ -220,22 +234,40 @@
    * remains visible), preserving lastBrakeDistance from the last full stop.
    * Applying the brake again starts a new measurement from the current speed.
    * No reaction time/distance is included. Inputs are held throughout dt.
-   * Optional guardrails constrain x to +/- guardrailX with simplified sliding
+   * Optional guardrails constrain x to guardrailLeft/Right with sliding
    * guidance; disabled by default, including for straight-road stop estimates.
+   * speed remains a nonnegative magnitude; gear supplies the travel direction.
+   * A moving gear change applies at least service braking until a full stop,
+   * then changes gear. Omitted gear preserves the current direction. Reverse
+   * throttle uses the same force governor with a 5 m/s target ceiling.
    */
   function step(state, rawInput, dt) {
     if (!Number.isFinite(dt) || dt <= 0) return state;
     const input = normalizeInput(rawInput);
-    if (input.brake <= 0) state.braking = false;
-    else if (!state.braking && state.speed > 0) {
-      state.braking = true;
-      state.brakeDistance = 0;
-      state.brakeStartSpeed = state.speed;
-      state.brakeTime = 0;
-    }
+    if (state.gear !== 'reverse') state.gear = 'forward';
+    const requestedGear = input.gear || state.gear;
     const steps = Math.ceil(dt / constants.maxSubstep);
     const subDt = dt / steps;
-    for (let i = 0; i < steps; i += 1) substep(state, input, subDt);
+    for (let i = 0; i < steps; i += 1) {
+      if (state.speed === 0) state.gear = requestedGear;
+      const shifting = state.gear !== requestedGear;
+      const applied = {
+        ...input,
+        throttle: shifting ? 0 : input.throttle,
+        brake: shifting ? Math.max(0.55, input.brake) : input.brake,
+        targetSpeed: Math.min(input.targetSpeed,
+          state.gear === 'reverse' ? constants.maxReverseSpeed : constants.maxSpeed)
+      };
+      if (applied.brake <= 0) state.braking = false;
+      else if (!state.braking && state.speed > 0) {
+        state.braking = true;
+        state.brakeDistance = 0;
+        state.brakeStartSpeed = state.speed;
+        state.brakeTime = 0;
+      }
+      substep(state, applied, subDt);
+      if (state.speed === 0) state.gear = requestedGear;
+    }
     return state;
   }
 

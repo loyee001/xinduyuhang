@@ -4,10 +4,15 @@
 (() => {
   'use strict';
 
-  const ROAD = Object.freeze({ laneWidth: 3.75, lanes: 3, halfWidth: 5.625, shoulderEdge: 7.1, guardrail: 7.4, cameraHeight: 1.25, repeat: 400, far: 1500 });
-  const bounds = Object.freeze({ left: -ROAD.guardrail, right: ROAD.guardrail, back: -Infinity, front: Infinity });
+  const ROAD = Object.freeze({ laneWidth: 3.75, lanes: 3, halfWidth: 5.625, shoulderEdge: 7.1, guardrail: 7.4,
+    emergencyStart: 5.625, emergencyEnd: 8.625, emergencyCenter: 7.125,
+    guardrailLeft: -7.4, guardrailRight: 8.9, cameraHeight: 1.25, repeat: 400, far: 1500 });
+  const bounds = Object.freeze({ left: ROAD.guardrailLeft, right: ROAD.guardrailRight, back: -Infinity, front: Infinity });
   const obstacles = Object.freeze([]);
   const NEAR = .08, FOCAL = 1.48, HORIZON = .45;
+  // The camera follows the selected travel direction, while the physical
+  // vehicle pose continues to describe its nose even when reversing.
+  const viewHeading = pose => pose.heading + (pose.gear === 'reverse' ? 180 : 0);
   const rgb = hex => [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16) / 255);
   const COLORS = {
     grass: rgb('#91a877'), verge: rgb('#b6b39a'), road: rgb('#515961'), shoulder: rgb('#626a70'),
@@ -54,6 +59,8 @@
     'G':['01111','10000','10000','10111','10001','10001','01110'],
     'H':['10001','10001','10001','11111','10001','10001','10001'],
     'I':['111','010','010','010','010','010','111'],
+    'O':['01110','10001','10001','10001','10001','10001','01110'],
+    'S':['01111','10000','10000','01110','00001','00001','11110'],
     'W':['10001','10001','10001','10101','10101','10101','01010'],
     'Y':['10001','10001','01010','00100','00100','00100','00100'],
     '0':['01110','10001','10011','10101','11001','10001','01110'],
@@ -78,11 +85,11 @@
     }
   }
   function gantry(target, z) {
-    for (const x of [-8.3,8.3]) {
+    for (const x of [-8.3,9.8]) {
       box(target,x,0,z,.34,7.3,.34,COLORS.steelDark);
       box(target,x,0,z,.75,.3,.75,COLORS.steel);
     }
-    box(target,0,7,z,16.9,.28,.38,COLORS.steel);
+    box(target,.75,7,z,18.4,.28,.38,COLORS.steel);
     box(target,0,5.75,z,10.8,1.65,.18,COLORS.green);
     const front = z - .1;
     // A pale border, route badge, highway name and one arrow per lane.
@@ -104,15 +111,17 @@
     // Short ground strips preserve fog and perspective near the horizon.
     for (let z = start; z < end; z += 50) {
       ground(target,-2000,2000,z,z+50,-.07,COLORS.grass,0);
-      ground(target,-9.5,9.5,z,z+50,-.015,COLORS.verge,0);
-      ground(target,-ROAD.shoulderEdge,ROAD.shoulderEdge,z,z+50,0,COLORS.shoulder,1,1);
+      ground(target,-9.5,11,z,z+50,-.015,COLORS.verge,0);
+      ground(target,-ROAD.shoulderEdge,ROAD.emergencyEnd,z,z+50,0,COLORS.shoulder,1,1);
+      ground(target,ROAD.emergencyStart,ROAD.emergencyEnd,z,z+50,.002,rgb('#686b62'),1,1);
       ground(target,-ROAD.halfWidth,ROAD.halfWidth,z,z+50,.003,COLORS.road,1,1);
       for (const x of [-ROAD.halfWidth,ROAD.halfWidth]) ground(target,x-.085,x+.085,z,z+50,.012,COLORS.paint,2);
+      ground(target,ROAD.emergencyEnd-.1,ROAD.emergencyEnd,z,z+50,.013,COLORS.amber,2);
       // A parallel opposing carriageway, beyond the planted central reservation.
       ground(target,-29.1,-14.9,z,z+50,0,COLORS.shoulder,1,1);
       ground(target,-27.625,-16.375,z,z+50,.003,COLORS.road,1,1);
       for (const x of [-27.625,-16.375]) ground(target,x-.08,x+.08,z,z+50,.012,COLORS.paint,2);
-      for (const x of [-7.4,7.4,-14.6,-29.4]) {
+      for (const x of [ROAD.guardrailLeft,ROAD.guardrailRight,-14.6,-29.4]) {
         box(target,x,0,z+25,.34,.37,50,COLORS.steelDark);
         box(target,x,.62,z+25,.13,.23,50,COLORS.steel);
         box(target,x,.6,z+25,.14,.045,50,COLORS.steelDark);
@@ -122,19 +131,27 @@
       for (const x of [-1.875,1.875,-20.125,-23.875]) ground(target,x-.075,x+.075,z,z+6,.014,COLORS.paint,2);
     }
     for (let z = start; z < end; z += 12.5) {
-      for (const x of [-7.4,7.4]) box(target,x,0,z,.12,.77,.13,COLORS.steelDark);
+      for (const x of [ROAD.guardrailLeft,ROAD.guardrailRight]) box(target,x,0,z,.12,.77,.13,COLORS.steelDark);
     }
     for (let z = start; z < end; z += 50) {
-      for (const x of [-8.2,8.2]) {
+      for (const x of [-8.2,9.7]) {
         box(target,x,0,z,.16,1.05,.16,COLORS.white);
         box(target,x,.65,z-.09,.18,.27,.02,COLORS.dark);
         box(target,x,.72,z-.105,.09,.11,.022,x < 0 ? COLORS.amber : COLORS.red);
       }
       // Rumble-strip insets along the hard shoulder provide near-field motion.
       for (const x of [-6,6]) for (let dz = 0; dz < 50; dz += 5) ground(target,x-.17,x+.17,z+dz,z+dz+.16,.008,COLORS.steelDark,2);
+      // The 3 m paved emergency lane is outside the solid white edge line.
+      // Cross-hatching by the outer rail and SOS boards distinguish it from
+      // a fourth travel lane without filling the usable stopping surface.
+      for (let dz = 0; dz < 50; dz += 8) polygon(target,
+        [[8.1,.015,z+dz],[8.5,.015,z+dz+1],[8.5,.015,z+dz+1.5],[8.1,.015,z+dz+.5]],COLORS.amber,2);
     }
     for (let z = start; z < end; z += ROAD.repeat) {
       gantry(target,z+200);
+      box(target,10,0,z+110,.12,2.6,.12,COLORS.steel);
+      box(target,10,2.1,z+110,1.55,1.02,.13,COLORS.amber);
+      lettering(target,'SOS',10,2.38,z+109.92,.44,COLORS.dark);
       hill(target,480,z+150,670,470,120,COLORS.hillsFar);
       hill(target,-520,z+290,660,500,155,COLORS.hillsFar);
       hill(target,310,z+65,340,290,72,COLORS.hills);
@@ -152,12 +169,22 @@
   const highway = buildHighway();
 
   const vehicleTemplates = new Map();
-  function buildVehicleTemplate(vehicle, detail) {
-    const key = `${vehicle.kind}-${vehicle.color}-${detail}`;
+  function buildVehicleTemplate(vehicle, level) {
+    const key = `${vehicle.kind}-${vehicle.color}-${level}`;
     if (vehicleTemplates.has(key)) return vehicleTemplates.get(key);
     const target = mesh(), truck = vehicle.kind === 'truck';
+    const detail = level === 2;
     const body = rgb(vehicle.color), glass = rgb('#264454'), tyres = rgb('#20292c');
     const metal = rgb('#a0adb0'), lamps = rgb('#fff0ba'), tail = rgb('#e74637');
+    // Distant traffic is only a few pixels tall. Keep its silhouette and cab,
+    // but omit wheels, mirrors and tiny lamps in dense traffic scenes.
+    if (level === 0) {
+      box(target,0,.35,0,vehicle.width,truck ? 2.65 : .6,vehicle.length,body);
+      if (!truck) box(target,0,.95,-.12,1.45,.52,1.85,glass);
+      else box(target,0,1.65,vehicle.length/2+.01,1.95,.65,.02,glass);
+      vehicleTemplates.set(key,target);
+      return target;
+    }
     // Local +Z is the nose. The complete template is turned 180 degrees for
     // opposing traffic, including windscreens, cab, lamps and wheel positions.
     ground(target,-vehicle.width*.57,vehicle.width*.57,-vehicle.length*.52,vehicle.length*.52,.023,rgb('#384245'),2);
@@ -217,15 +244,16 @@
     polygon(target,points,color);
   }
   function speedSign(target,sign,origin) {
-    const x = 8.5, z = sign.y-origin;
+    const x = 10, z = sign.y-origin;
     box(target,x,0,z,.12,3.6,.12,COLORS.steel);
     disc(target,x,3.55,z+.012,.88,COLORS.steelDark);
     disc(target,x,3.55,z-.02,.88,rgb('#d4493f'));
     disc(target,x,3.55,z-.028,.71,COLORS.white);
     lettering(target,String(sign.limitKmh),x,3.28,z-.035,.55,rgb('#26363b'));
   }
-  function buildTraffic(pose,origin,stats) {
-    const target = mesh(), sin = Math.sin(pose.heading*Math.PI/180), cos = Math.cos(pose.heading*Math.PI/180);
+  function buildTraffic(pose,origin,stats,includeFaces) {
+    const heading = viewHeading(pose)*Math.PI/180;
+    const target = mesh(), sin = Math.sin(heading), cos = Math.cos(heading);
     stats.visibleTraffic = 0;
     for (const vehicle of pose.traffic || []) {
       if (![vehicle.x,vehicle.y].every(Number.isFinite)) continue;
@@ -234,11 +262,22 @@
       const margin = vehicle.length || 8;
       if (depth+margin < NEAR || depth-margin > ROAD.far || Math.abs(side) > Math.max(12,depth*1.4)+margin) continue;
       stats.visibleTraffic++;
-      const template = buildVehicleTemplate(vehicle,depth < 260);
+      const template = buildVehicleTemplate(vehicle,depth < 260 ? 2 : depth < 500 ? 1 : 0);
       const direction = vehicle.direction < 0 ? -1 : 1, z = vehicle.y-origin;
-      for (const face of template.faces) {
-        const points = face.points.map(p => [vehicle.x+p[0]*direction,p[1],z+p[2]*direction]);
-        polygon(target,points,face.color,face.layer,face.material);
+      if (includeFaces) {
+        for (const face of template.faces) {
+          const points = face.points.map(p => [vehicle.x+p[0]*direction,p[1],z+p[2]*direction]);
+          // A rigid translation/half turn preserves color and radius.
+          target.faces.push({ ...face, points, x: vehicle.x+face.x*direction, z: z+face.z*direction });
+        }
+      } else {
+        // WebGL only needs the packed triangle vertices. Avoid constructing
+        // thousands of short-lived face/point arrays for the software path.
+        const vertices = template.vertices;
+        for (let i = 0; i < vertices.length; i += 7) {
+          target.vertices.push(vehicle.x+vertices[i]*direction,vertices[i+1],z+vertices[i+2]*direction,
+            vertices[i+3],vertices[i+4],vertices[i+5],vertices[i+6]);
+        }
       }
       if (vehicle.braking && depth < 130) {
         for (const side of [-1,1]) box(target,vehicle.x+side*vehicle.width*.34,.62,z-direction*(vehicle.length/2+.022),.4,.21,.024,rgb('#ff7155'));
@@ -263,14 +302,25 @@
 
   function buildBrakingGuide(pose, origin, stats) {
     const target = mesh();
+    stats.emergencyLaneAlert = Boolean(pose.emergencyLaneAlert);
+    if (stats.emergencyLaneAlert) {
+      // Overlay only: the controller owns the alert and braking decision.
+      const near = pose.y-origin-100, far = pose.y-origin+100;
+      for (const x of [ROAD.emergencyStart,ROAD.emergencyEnd]) ground(target,x-.1,x+.1,near,far,.028,COLORS.red,2);
+      for (let z = Math.floor(near/12)*12; z < far; z += 12) {
+        const x = ROAD.emergencyCenter;
+        polygon(target,[[x-.6,.03,z],[x-.42,.03,z-.12],[x+.6,.03,z+2],[x+.42,.03,z+2.12]],COLORS.red,2);
+        polygon(target,[[x+.6,.03,z],[x+.42,.03,z-.12],[x-.6,.03,z+2],[x-.42,.03,z+2.12]],COLORS.red,2);
+      }
+    }
     const anchor = pose.brakeAnchor;
     const anchored = anchor && [anchor.x,anchor.y,anchor.heading,anchor.distance].every(Number.isFinite);
     const distance = Math.max(0,anchored ? anchor.distance : Number(pose.brakePrediction) || 0);
-    const heading = (anchored ? anchor.heading : pose.heading) * Math.PI / 180;
+    const heading = (anchored ? anchor.heading : viewHeading(pose)) * Math.PI / 180;
     const sin = Math.sin(heading), cos = Math.cos(heading);
     const ax = anchored ? anchor.x : pose.x, az = (anchored ? anchor.y : pose.y) - origin;
     const travelled = anchored ? (pose.x-ax)*sin+(pose.y-origin-az)*cos : 0;
-    const facingForward = Math.cos(pose.heading*Math.PI/180-heading) >= 0;
+    const facingForward = Math.cos(viewHeading(pose)*Math.PI/180-heading) >= 0;
     const windowStart = travelled-(facingForward ? 2 : 1198);
     const start = Math.max(0,Math.min(Math.max(0,distance-1200),windowStart));
     const end = Math.min(distance,start+1200);
@@ -309,7 +359,7 @@
     let width = 0, height = 0, frames = 0, totalFrames = 0, frameStart = performance.now(), disposed = false;
     let locations;
     const shaders = [];
-    const stats = { backend: '', fps: 0, frames: 0, worldOrigin: 0, cameraHeight: ROAD.cameraHeight, brakeClipped: false, brakeDistance: 0, visibleTraffic: 0 };
+    const stats = { backend: '', fps: 0, frames: 0, worldOrigin: 0, cameraHeight: ROAD.cameraHeight, cameraHeading: 0, brakeClipped: false, brakeDistance: 0, visibleTraffic: 0 };
     try { gl = canvas.getContext('webgl',{alpha:false,antialias:true,preserveDrawingBuffer:true,powerPreference:'low-power'}); } catch {}
     if (gl) {
       const compile = (type,source) => {
@@ -399,7 +449,7 @@
       return clipped;
     }
     function softwareDraw(pose, localY, guide, traffic) {
-      const angle = pose.heading*Math.PI/180, sin = Math.sin(angle), cos = Math.cos(angle), focal = height*FOCAL/2;
+      const angle = viewHeading(pose)*Math.PI/180, sin = Math.sin(angle), cos = Math.cos(angle), focal = height*FOCAL/2;
       const sky = context.createLinearGradient(0,0,0,height*.59);
       sky.addColorStop(0,pose.wet ? '#73a1b7' : '#5ca6d4'); sky.addColorStop(1,'#d4e3e0');
       context.fillStyle = sky; context.fillRect(0,0,width,height);
@@ -440,14 +490,15 @@
         if (disposed || gl?.isContextLost() || ![pose.x,pose.y,pose.heading].every(Number.isFinite)) return false;
         const origin = Math.floor(pose.y/ROAD.repeat)*ROAD.repeat, localY = pose.y-origin;
         stats.worldOrigin = origin;
+        stats.cameraHeading = viewHeading(pose);
         const guide = buildBrakingGuide(pose,origin,stats);
-        const traffic = buildTraffic(pose,origin,stats);
+        const traffic = buildTraffic(pose,origin,stats,!gl);
         if (gl) {
           gl.useProgram(program); gl.uniform2f(locations.size,width,height); gl.uniform1f(locations.wet,pose.wet ? 1 : 0);
           gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
           gl.disable(gl.DEPTH_TEST); gl.uniform1f(locations.sky,1); bind(skyBuffer); gl.drawArrays(gl.TRIANGLES,0,3);
           gl.enable(gl.DEPTH_TEST); gl.uniform1f(locations.sky,0);
-          const angle = pose.heading*Math.PI/180;
+          const angle = stats.cameraHeading*Math.PI/180;
           gl.uniform4f(locations.pose,pose.x,localY,Math.sin(angle),Math.cos(angle));
           bind(staticBuffer); gl.drawArrays(gl.TRIANGLES,0,highway.data.length/7);
           if (guide.vertices.length) {
