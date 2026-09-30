@@ -179,6 +179,107 @@
     return { speedLimitKmh: limitAt(y), density: densityFor(world.density), vehicleCount: world.vehicles.length,
       nearestAhead, nearestBehind, vehicles: world.vehicles, roadSigns: signsAround(y) };
   }
+
+  /**
+   * Advisory only: observe the three normal lanes without touching vehicles or
+   * controls. Gaps are bumper-to-bumper, not centre distances. A seven-second
+   * dry / eight-second wet window covers the geometric controller's gradual
+   * lane change. Front prediction uses an upper bound on physical acceleration
+   * (6 m/s² dry, 4.5 m/s² wet) toward the requested, road-capped speed;
+   * rear prediction does not assume that acceleration will open a safe gap.
+   * The current lane also needs clearance for the first four / five seconds:
+   * an empty destination cannot make a too-late departure safe.
+   */
+  function getLaneRecommendation(world, ego = {}, { wet = false, desiredSpeed = limitAt(ego.y) / 3.6 } = {}) {
+    const x = finite(ego.x), y = finite(ego.y), speed = Math.max(0, finite(ego.speed));
+    const currentLane = [0, 1, 2].reduce((best, lane) =>
+      Math.abs(x - lanes[lane]) < Math.abs(x - lanes[best]) ? lane : best, 0);
+    const roadSpeed = limitAt(y) / 3.6;
+    const desired = clamp(finite(desiredSpeed, roadSpeed), 0, roadSpeed);
+    const horizon = wet ? 8 : 7, acceleration = wet ? 4.5 : 6, extent = egoExtents(ego);
+    const projectedTravel = duration => {
+      const accelerationTime = Math.min(duration, Math.max(0, desired - speed) / acceleration);
+      return speed * duration + .5 * acceleration * accelerationTime * accelerationTime +
+        Math.max(0, desired - speed) * (duration - accelerationTime);
+    };
+    const projectedDistance = projectedTravel(horizon);
+    const departureHorizon = wet ? 5 : 4, departureDistance = projectedTravel(departureHorizon);
+    const frontMargin = Math.max(12, speed * (wet ? 1.8 : 1.3));
+    const futureFrontMargin = Math.max(10, Math.max(speed, desired) * (wet ? 1.4 : 1));
+    const vehicles = Array.isArray(world?.vehicles) ? world.vehicles : [];
+    const metres = gap => `${Math.max(0, Math.round(gap))} 米`;
+    const laneInfo = [0, 1, 2].map(lane => {
+      let frontGap = Infinity, rearGap = Infinity, frontSpeed = null, rearSpeed = null;
+      let projectedFrontGap = Infinity, projectedRearGap = Infinity, departureFrontGap = Infinity, availableSpeed = desired;
+      let overlap = false, shortFront = false, shortRear = false, closingFront = false, closingRear = false;
+      let fastRear = false;
+      // Check every car in the target corridor. A second, faster rear car
+      // must not be hidden by a nearer slower one in the same lane.
+      for (const v of vehicles) {
+        if (![v.x, v.y].every(Number.isFinite) ||
+          Math.abs(v.x - lanes[lane]) >= extent.x + Math.max(.5, finite(v.width, 1.85)) / 2 + .15) continue;
+        const carSpeed = Math.max(0, finite(v.speed)) * (v.direction === -1 ? -1 : 1);
+        const offset = v.y - y, halfLength = extent.y + Math.max(1, finite(v.length, 4.5)) / 2;
+        const gap = Math.abs(offset) - halfLength;
+        if (gap <= 2) overlap = true;
+        if (offset >= 0) {
+          const projectedGap = gap + carSpeed * horizon - projectedDistance;
+          if (gap < frontGap) { frontGap = gap; frontSpeed = carSpeed; }
+          projectedFrontGap = Math.min(projectedFrontGap, projectedGap);
+          departureFrontGap = Math.min(departureFrontGap, gap, gap + carSpeed * departureHorizon - departureDistance);
+          shortFront ||= gap < frontMargin;
+          closingFront ||= projectedGap < futureFrontMargin;
+          availableSpeed = Math.min(availableSpeed,
+            Math.max(0, carSpeed + Math.max(0, gap - frontMargin) / horizon));
+        } else {
+          const projectedGap = gap + (speed - carSpeed) * horizon;
+          if (gap < rearGap) { rearGap = gap; rearSpeed = carSpeed; }
+          projectedRearGap = Math.min(projectedRearGap, projectedGap);
+          shortRear ||= gap < Math.max(10, carSpeed * (wet ? 1.8 : 1.2));
+          const unsafeFuture = projectedGap < Math.max(10, carSpeed * (wet ? 1.2 : .8));
+          closingRear ||= unsafeFuture;
+          fastRear ||= unsafeFuture && carSpeed - speed > 3;
+        }
+      }
+      const adjacent = Math.abs(lane - currentLane) === 1;
+      const reachable = lane === currentLane || adjacent;
+      const safe = reachable && !overlap && !shortFront && !shortRear && !closingFront && !closingRear;
+      const reason = !reachable ? '需逐条变道，不能跨越车道' : overlap ? '有车辆并排行驶，等待间隙' :
+        shortFront ? `前车仅 ${metres(frontGap)}，前方间距不足` : fastRear ? '后车快速接近，变道期间间距不足' :
+        shortRear ? `后车仅 ${metres(rearGap)}，后方间距不足` : closingFront ? '预计变道期间会过于接近前车' :
+        closingRear ? '预计变道期间后方间距不足' : lane === currentLane ? '当前车道' : '前后间距满足当前变道预测';
+      const nullable = value => Number.isFinite(value) ? value : null;
+      return { lane, frontGap: nullable(frontGap), rearGap: nullable(rearGap), frontSpeed, rearSpeed,
+        projectedFrontGap: nullable(projectedFrontGap), projectedRearGap: nullable(projectedRearGap),
+        departureFrontGap: nullable(departureFrontGap), availableSpeed, safe, adjacent, reason };
+    });
+    const result = (status, reason, targetLane = null) => ({ status,
+      direction: targetLane === null ? null : targetLane < currentLane ? 'left' : 'right',
+      targetLane, currentLane, reason, lanes: laneInfo });
+    if (ego.gear === 'reverse') return result('unavailable', '倒车中，暂不推荐变道');
+    if (speed < 2) return result('unavailable', '车速较低，起步后再评估变道');
+    if (x > 5.625 || x < -5.625) return result('unavailable', '请先返回正常行车道');
+    const heading = Math.atan2(Math.sin(finite(ego.heading) * Math.PI / 180), Math.cos(finite(ego.heading) * Math.PI / 180));
+    if (Math.abs(x - lanes[currentLane]) > .6 || Math.abs(heading) > 8 * Math.PI / 180)
+      return result('unavailable', '正在调整车道位置，回正后重新评估');
+    if (speed > roadSpeed + .5) return result('unavailable', '正在降至道路限速，先保持当前车道');
+    const current = laneInfo[currentLane];
+    if (desired - current.availableSpeed < 2) {
+      const frontNeedsAttention = current.frontGap !== null &&
+        (current.frontGap < frontMargin || current.projectedFrontGap < futureFrontMargin);
+      return result('keep', frontNeedsAttention ? '前方间距较小，请留意前车并控制车速' : '当前车道通行顺畅，保持车道');
+    }
+    const beneficial = laneInfo.filter(info => info.adjacent && info.availableSpeed - current.availableSpeed >= 2);
+    const candidates = beneficial.filter(info => info.safe).sort((a, b) =>
+      b.availableSpeed - a.availableSpeed ||
+      Math.min(300, b.projectedFrontGap ?? 300) - Math.min(300, a.projectedFrontGap ?? 300) || a.lane - b.lane);
+    if (!candidates.length) return result('blocked', beneficial.length ?
+      '前方车流较慢，相邻车道间距不足，暂缓变道' : '相邻车道没有明显通行优势，保持当前车道');
+    if (current.departureFrontGap !== null && current.departureFrontGap < 10)
+      return result('blocked', '当前前车过近，请先减速拉开车距再变道');
+    const target = candidates[0], direction = target.lane < currentLane ? '左' : '右';
+    return result('recommend', `前方车流较慢，建议向${direction}变道；请留意周围车辆`, target.lane);
+  }
   // Swept relative AABB collision catches high-speed crossings between frames.
   // This intentionally small arcade contact model does not operate controls
   // or emergency-stop state. It corrects motion/brake measurements when a
@@ -252,5 +353,6 @@
     return { vehicleId: v.id, relativeSpeed: Math.hypot(signedSpeed * Math.sin(angle),
       signedSpeed * Math.cos(angle) - v.direction * v.speed), side: hit.axis === 'x' };
   }
-  return Object.freeze({ constants, densityPresets, createState, setDensity, step, limitAt, signsAround, getSnapshot, resolveContact });
+  return Object.freeze({ constants, densityPresets, createState, setDensity, step, limitAt, signsAround, getSnapshot,
+    getLaneRecommendation, resolveContact });
 });

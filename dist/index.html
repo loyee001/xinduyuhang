@@ -42,6 +42,18 @@
             <div class="road-limit"><span class="speed-sign" id="road-limit-sign" aria-label="道路限速120公里每小时">120</span><div><span>道路限速 · km/h</span><strong id="road-speed-status">限速内</strong><small id="next-road-limit">前方路段限速 100 km/h</small></div></div>
             <div class="traffic-awareness"><span id="traffic-direction-label">同车道前车</span><strong id="traffic-gap">—</strong><small id="traffic-status">周围车流运行中</small></div>
           </div>
+          <section class="lane-advice" id="lane-advice" data-status="unavailable" aria-labelledby="lane-advice-title">
+            <div class="lane-advice-heading"><span class="lane-advice-symbol" id="lane-advice-icon" aria-hidden="true">↑</span><div><span class="lane-advice-eyebrow">实时变道建议</span><h2 id="lane-advice-title">起步后评估车流</h2></div><span class="lane-advice-tag">辅助建议</span></div>
+            <p id="lane-advice-reason">结合前后车距和接近速度，寻找更通畅的相邻车道。</p>
+            <div class="advice-lanes" aria-label="三条普通车道的前后车距">
+              <div id="advice-lane-0"><strong>左车道</strong><span id="advice-status-0">待评估</span><small id="advice-gap-0">前 — · 后 —</small></div>
+              <div id="advice-lane-1"><strong>中间车道</strong><span id="advice-status-1">当前车道</span><small id="advice-gap-1">前 — · 后 —</small></div>
+              <div id="advice-lane-2"><strong>右车道</strong><span id="advice-status-2">待评估</span><small id="advice-gap-2">前 — · 后 —</small></div>
+            </div>
+            <button id="lane-advice-accept" disabled>按推荐变道</button>
+            <small class="lane-advice-note">点击后再次检查车距 · 应急车道不参与推荐</small>
+            <span class="sr-only" id="lane-advice-live" role="status" aria-live="polite" aria-atomic="true"></span>
+          </section>
           <div class="traffic-controls" aria-label="车流量设置"><div class="traffic-controls-heading"><span>车流量</span><small id="traffic-density-note">中等 · 周围车流运行中</small></div><div class="density-options" role="group" aria-label="选择车流量"><button data-density="low" aria-pressed="false">较少</button><button class="selected" data-density="medium" aria-pressed="true">中等</button><button data-density="dense" aria-pressed="false">拥挤</button></div></div>
           <div class="telemetry highway-metrics" aria-label="实时物理模拟数据">
             <div class="metric"><span><i data-icon="gauge"></i>当前速度</span><div><strong id="speed-value">0.0</strong><small>m/s</small></div><small class="metric-note" id="speed-kmh">0 km/h</small></div>
