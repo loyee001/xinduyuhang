@@ -10,6 +10,85 @@ function vehicle(overrides = {}) {
 }
 function world(vehicles) { return { vehicles, elapsedTime: 0, contacts: 0 }; }
 
+test('ordinary-road populations use two directional lanes and the 50 km/h limit', () => {
+  for (const [density,count] of [['low',14],['medium',26],['dense',58]]) {
+    const ego = { x:29,y:1850,speed:11,heading:0,gear:'forward' };
+    const state = traffic.createState(ego,{ density,roadType:'local',roadStart:1850 });
+    assert.equal(state.roadType,'local');
+    assert.equal(state.vehicles.length,count);
+    assert.ok(state.vehicles.every(v => v.y >= 1850));
+    for (const v of state.vehicles) {
+      assert.equal(v.x,v.direction === 1 ? 29 : 25.5);
+      assert.equal(v.lane,v.direction === 1 ? 0 : 1);
+      assert.equal(v.heading,v.direction === 1 ? 0 : 180);
+      assert.ok(v.speed > 0 && v.speed <= 50/3.6);
+      if (v.direction === 1) assert.ok(Math.abs(v.y-ego.y) > 30);
+    }
+    const snapshot = traffic.getSnapshot(state,ego);
+    assert.equal(snapshot.speedLimitKmh,50);
+    assert.equal(snapshot.vehicleCount,count);
+    assert.equal(snapshot.roadType,'local');
+    assert.ok(snapshot.roadSigns.every(sign => sign.limitKmh === 50));
+    assert.equal(traffic.getLaneRecommendation(state,ego).status,'unavailable');
+  }
+});
+
+test('ordinary-road forward and oncoming vehicles move in their own directions', () => {
+  const forward = vehicle({ x:29,y:2200,previousY:2200,lane:0,speed:10 });
+  const opposing = vehicle({ id:2,x:25.5,y:2300,previousY:2300,lane:1,speed:10,direction:-1,heading:180 });
+  const state = { ...world([forward,opposing]),roadType:'local' };
+  traffic.step(state,{ x:29,y:1850,speed:11,heading:0 },1);
+  assert.ok(forward.y > 2209);
+  assert.ok(opposing.y < 2291);
+  assert.equal(forward.x,29);
+  assert.equal(opposing.x,25.5);
+  assert.ok(state.vehicles.every(v => v.speed <= 50/3.6));
+});
+
+test('ordinary-road following preserves a stopped ego gap in the same lane', () => {
+  const follower = vehicle({ x:29,y:1850,previousY:1850,lane:0,speed:12 });
+  const state = { ...world([follower]),roadType:'local' }, ego = { x:29,y:1880,speed:0,heading:0 };
+  for (let i = 0; i < 20; i++) traffic.step(state,ego,.5);
+  assert.ok(follower.y+follower.length/2 < ego.y-2.25);
+  assert.ok(follower.speed < .1);
+});
+
+test('ordinary-road recycling and density changes remain local after long forward and reverse travel', () => {
+  const state = traffic.createState({ x:29,y:1850,speed:10 },{ roadType:'local',roadStart:1850 });
+  for (const [y,gear] of [[100000,'forward'],[-100000,'reverse']]) {
+    const ego = { x:29,y,speed:5,heading:0,gear }, before = { ...ego };
+    for (let i = 0; i < 20; i++) traffic.step(state,ego,.5);
+    assert.ok(state.vehicles.every(v => Math.abs(v.y-y) < 4000));
+    assert.ok(state.vehicles.every(v => v.x === 29 || v.x === 25.5));
+    assert.ok(state.vehicles.every(v => Number.isFinite(v.y) && v.speed >= 0 && v.speed <= 50/3.6));
+    traffic.setDensity(state,ego,'dense');
+    traffic.setDensity(state,ego,'low');
+    assert.equal(state.roadType,'local');
+    assert.equal(state.roadStart,1850);
+    assert.equal(state.vehicles.length,14);
+    assert.ok(state.vehicles.every(v => Math.abs(v.y-y) < 4000));
+    assert.deepEqual(ego,before);
+    assert.equal(traffic.resolveContact(state,ego,before),null);
+    assert.equal(traffic.getSnapshot(state,ego).speedLimitKmh,50);
+  }
+});
+
+test('ordinary-road rear and side contacts never return the car to highway bounds', () => {
+  const front = vehicle({ x:29,y:20,previousY:20,lane:0,speed:5 });
+  const state = { ...world([front]),roadType:'local' };
+  const previous = { x:29,y:0,speed:12,heading:0 }, ego = { ...previous,y:30 };
+  assert.ok(traffic.resolveContact(state,ego,previous));
+  assert.equal(ego.x,29);
+  assert.ok(ego.y < 20 && ego.speed < 5);
+
+  const sideState = { ...world([vehicle({ x:29,y:0,previousY:0,lane:0 })]),roadType:'local' };
+  const sideBefore = { x:26.5,y:0,speed:10,heading:0 }, sideEgo = { ...sideBefore,x:28.5 };
+  const contact = traffic.resolveContact(sideState,sideEgo,sideBefore);
+  assert.ok(contact?.side);
+  assert.ok(sideEgo.x > 24.68 && sideEgo.x < 29.82);
+  assert.ok(sideEgo.speed > 9 && sideEgo.speed < 10);
+});
+
 test('the initial highway has clear nearby same-direction and opposing traffic', () => {
   const state = traffic.createState();
   assert.equal(state.vehicles.length, 78);
@@ -34,17 +113,63 @@ test('same-direction vehicles advance, opposing traffic approaches, ego controls
   assert.deepEqual(ego, copy);
 });
 
-test('all posted signs and repeating zone boundaries agree with the speed-limit model', () => {
-  for (const [y, expected] of [[0,120],[999.999,120],[1000,100],[1999.999,100],[2000,80],[2999.999,80],[3000,120],[1000000,100]]) {
-    assert.equal(traffic.limitAt(y), expected);
-  }
-  for (const y of [-800, 0, 399, 400, 980, 1999, 3200, 1000000]) {
+test('random speed boundaries and every posted sign agree at ordinary and distant coordinates', () => {
+  assert.equal(traffic.limitAt(0),120);
+  const first = traffic.nextLimit(0);
+  assert.ok(first.y > 0 && first.limitKmh !== 120);
+  assert.equal(first.distance,first.y);
+  assert.equal(traffic.limitAt(first.y-.01),120);
+  assert.equal(traffic.limitAt(first.y),first.limitKmh);
+  for (const y of [-800, 0, 399, 400, 980, 1999, 3200, 1000000, -10000000000, 10000000000]) {
     const signs = traffic.signsAround(y);
     assert.ok(signs.length >= 6);
+    assert.equal(new Set(signs.map(sign => sign.y)).size,signs.length);
     for (const sign of signs) assert.equal(sign.limitKmh, traffic.limitAt(sign.y));
-    for (let boundary = Math.ceil((y-1600)/1000)*1000; boundary <= y+1600; boundary += 1000) {
-      assert.ok(signs.some(sign => sign.y === boundary));
+    for (let next = traffic.nextLimit(y-1600-.01); next.y <= y+1600; next = traffic.nextLimit(next.y)) {
+      assert.ok(signs.some(sign => sign.y === next.y && sign.limitKmh === next.limitKmh));
+      assert.notEqual(traffic.limitAt(next.y-.01),next.limitKmh,'nextLimit skips boundaries with unchanged limits');
     }
+  }
+});
+
+test('random speed schedules stay deterministic when revisited and do not repeat the old cycle', () => {
+  const positions = Array.from({ length:501 },(_,i) => -25000+i*173);
+  const baseline = positions.map(y => [traffic.limitAt(y),traffic.nextLimit(y),traffic.nextLimit(y,-1)]);
+  traffic.createState({ y:100000 },{ density:'dense' });
+  traffic.createState({ y:-100000 },{ roadType:'local' });
+  assert.deepEqual(positions.map(y => [traffic.limitAt(y),traffic.nextLimit(y),traffic.nextLimit(y,-1)]),baseline);
+  assert.deepEqual(new Set(baseline.map(row => row[0])),new Set([120,100,80]));
+  for (const oldPeriod of [3000,6000,4200,14000])
+    assert.ok(positions.some(y => traffic.limitAt(y) !== traffic.limitAt(y+oldPeriod)),`no ${oldPeriod} m speed-limit cycle`);
+  const lengths = [];
+  let y = -50000;
+  for (let i = 0; i < 60; i++) {
+    const next = traffic.nextLimit(y);
+    if (i) lengths.push(next.distance);
+    assert.equal(traffic.limitAt(next.y),next.limitKmh);
+    y = next.y;
+  }
+  assert.ok(new Set(lengths).size > 20,'road lengths vary instead of changing at uniform intervals');
+});
+
+test('next speed-limit changes have matching forward and reverse boundary semantics', () => {
+  let y = -18000;
+  for (let i = 0; i < 30; i++) {
+    const forward = traffic.nextLimit(y);
+    assert.ok(forward.y > y);
+    assert.equal(forward.distance,forward.y-y);
+    const reverseAtBoundary = traffic.nextLimit(forward.y,-1);
+    assert.equal(reverseAtBoundary.y,forward.y);
+    assert.equal(reverseAtBoundary.distance,0);
+    assert.equal(reverseAtBoundary.limitKmh,traffic.limitAt(forward.y-.01));
+    assert.notEqual(reverseAtBoundary.limitKmh,forward.limitKmh);
+    const reverseAfter = traffic.nextLimit(forward.y+20,-1);
+    assert.equal(reverseAfter.y,forward.y);
+    assert.equal(reverseAfter.distance,20);
+    const reverseBefore = traffic.nextLimit(forward.y-.01,-1);
+    assert.ok(reverseBefore.y < forward.y);
+    assert.equal(reverseBefore.limitKmh,traffic.limitAt(reverseBefore.y-.01));
+    y = forward.y;
   }
 });
 
@@ -440,12 +565,13 @@ test('open current lanes and equal congestion do not produce pointless lane chan
 });
 
 test('higher user speed settings cannot invent an advantage above the road limit', () => {
-  const ego = cruisingEgo({ y: 1200 });
-  const advice = traffic.getLaneRecommendation(world([slowLeader({ y: 1250, speed: 100 / 3.6 })]), ego,
+  const y = traffic.nextLimit(0).y+100, cap = traffic.limitAt(y)/3.6;
+  const ego = cruisingEgo({ y,speed:Math.min(25,cap) });
+  const advice = traffic.getLaneRecommendation(world([slowLeader({ y:y+50,speed:cap })]), ego,
     { desiredSpeed: 100 });
   assert.equal(advice.status, 'keep');
-  for (const lane of advice.lanes) assert.ok(lane.availableSpeed <= 100 / 3.6);
-  const slowing = traffic.getLaneRecommendation(world([slowLeader({ y: 1265 })]), cruisingEgo({ y: 1200, speed: 35 }));
+  for (const lane of advice.lanes) assert.ok(lane.availableSpeed <= cap);
+  const slowing = traffic.getLaneRecommendation(world([slowLeader({ y:y+65 })]), cruisingEgo({ y,speed:cap+5 }));
   assert.equal(slowing.status, 'unavailable');
   assert.match(slowing.reason, /限速/);
 });
