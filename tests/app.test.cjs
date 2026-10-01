@@ -83,7 +83,7 @@ function createDOM() {
   };
 }
 
-function loadApp() {
+function loadApp(windowOverrides = {}) {
   const document = createDOM();
   const listeners = new Map();
   let now = 0, timer = 0;
@@ -99,6 +99,7 @@ function loadApp() {
       }
     }
   };
+  Object.assign(window, windowOverrides);
   const context = vm.createContext({
     window, document, console, performance: { now: () => now },
     location: { protocol: 'file:' },
@@ -1449,6 +1450,136 @@ function startAutomatic(driver, route = 'cruise') {
   assert.equal(app.state.autodrive.active, true);
   assert.equal(app.state.autodrive.route, route);
 }
+
+function setHornTraffic(driver) {
+  const { app } = driver;
+  Object.assign(app.car, { x:0, y:900, heading:0, speed:20, gear:'forward' });
+  app.world.vehicles = [adviceVehicle(1,980,18,990)];
+  app.render();
+  return app.world.vehicles[0];
+}
+
+test('the common horn button produces a real gradual yield without changing ego controls', () => {
+  const driver = loadApp(), { app, ui } = driver, lead = setHornTraffic(driver);
+  const before = JSON.stringify(app.car);
+  const result = ui('horn-button').onclick();
+  assert.equal(result.status,'yielding');
+  assert.equal(JSON.stringify(app.car),before,'pressing the horn must not change the player pose or speed');
+  assert.equal(lead.x,0,'the lead car must not teleport at the button press');
+  assert.equal(app.state.controls.size,0);
+  assertNoAutomaticBrake(app);
+  assert.match(ui('horn-status').textContent,/安全避让/);
+  driver.advance(.8);
+  assert.ok(lead.x>0 && lead.x<3.75);
+  assert.equal(app.readState().horn.count,1);
+  driver.advance(4);
+  assert.equal(lead.x,3.75);
+  assert.equal(lead.lane,2);
+  assert.equal(app.readState().horn.status,'completed');
+  assert.match(ui('horn-status').textContent,/已完成避让/);
+  assert.equal(app.world.contacts,0);
+});
+
+test('horn activation and repeated presses preserve automatic driving ownership', () => {
+  const driver = loadApp(), { app, ui } = driver;
+  setHornTraffic(driver);
+  app.state.adviceCooldownUntil=999;
+  startAutomatic(driver);
+  const first=ui('horn-button').onclick();
+  assert.equal(first.status,'yielding');
+  assert.equal(ui('horn-button').onclick(),false);
+  assert.equal(app.state.horn.count,1);
+  assert.equal(app.state.mode,'auto');
+  assert.equal(app.state.autodrive.active,true);
+  driver.advance(5);
+  assert.equal(app.state.autodrive.active,true);
+  assert.equal(app.state.mode,'auto');
+  assert.equal(app.car.x,0);
+  assert.equal(app.world.contacts,0);
+  assert.equal(app.state.estop,false);
+});
+
+test('Space and Enter on the horn sound once without triggering the global brake shortcut', () => {
+  for(const code of ['Space','Enter']){
+    const driver=loadApp(),{app,ui}=driver;
+    setHornTraffic(driver);
+    const button=ui('horn-button');
+    const press=driver.key('keydown',code,false,button);
+    driver.key('keydown',code,true,button);
+    assert.equal(press.defaultPrevented,true);
+    assert.equal(app.state.horn.count,1);
+    assert.equal(app.state.horn.status,'yielding');
+    assert.equal(button.disabled,false,'cooldown must preserve keyboard focus');
+    assert.equal(button.getAttribute('aria-disabled'),'true');
+    assertNoAutomaticBrake(app);
+  }
+});
+
+test('a second beep during either cooldown still tracks the first car until it completes yielding', () => {
+  for(const seconds of [1.3,2.6]){
+    const driver=loadApp(),{app,ui}=driver,lead=setHornTraffic(driver);
+    ui('horn-button').onclick();driver.advance(seconds);
+    assert.equal(ui('horn-button').onclick().status,'cooldown');
+    assert.equal(app.state.horn.vehicle,lead);
+    assert.equal(app.state.horn.targetLane,2);
+    driver.advance(5);
+    assert.equal(app.state.horn.status,'completed');
+    assert.match(ui('horn-status').textContent,/已完成避让/);
+  }
+});
+
+test('the horn evaluates the leading car solid line rather than only the player road position', () => {
+  const driver=loadApp(),{app,ui}=driver,lead=setHornTraffic(driver);
+  app.car.y=300;lead.y=lead.previousY=380;
+  const result=ui('horn-button').onclick();
+  assert.equal(result.status,'blocked');
+  assert.match(ui('horn-status').textContent,/实线/);
+  assert.ok(!lead.laneChange);
+  assert.equal(app.state.serviceBrake,0);
+});
+
+test('a horn with no nearby car still gives clear feedback without changing the driving plan', () => {
+  const driver=loadApp(),{app,ui}=driver;
+  app.world.vehicles=[];app.car.y=900;
+  app.submitCommand('直行500米后停车');app.startPlan();
+  assert.equal(app.state.plan.status,'running');
+  const result=ui('horn-button').onclick();
+  assert.equal(result.status,'unavailable');
+  assert.match(ui('horn-status').textContent,/100 米/);
+  assert.equal(app.state.plan.status,'running');
+  assert.equal(app.state.serviceBrake,0);
+});
+
+test('unsupported audio does not break horn feedback or traffic yielding', () => {
+  const driver=loadApp({AudioContext:function(){throw new Error('audio unavailable');}}),{app,ui}=driver;
+  setHornTraffic(driver);
+  assert.equal(ui('horn-button').onclick().status,'yielding');
+  driver.advance(5);
+  assert.equal(app.state.horn.status,'completed');
+});
+
+test('disconnect disables the horn and reset clears its feedback and cooldown', () => {
+  const driver=loadApp(),{app,ui}=driver;
+  setHornTraffic(driver);ui('horn-button').onclick();
+  ui('toggle-connection').onclick();
+  assert.equal(ui('horn-button').disabled,true);
+  assert.equal(ui('horn-button').onclick(),false);
+  assert.equal(app.state.horn.count,1);
+  ui('toggle-connection').onclick();ui('reset-session').onclick();
+  assert.equal(app.readState().horn.status,'idle');
+  assert.equal(app.readState().horn.count,0);
+  assert.equal(ui('horn-button').disabled,false);
+  assert.ok(app.world.vehicles.every(vehicle=>!vehicle.laneChange));
+});
+
+test('rebuilding traffic cancels the reported yield instead of attributing it to a replacement car', () => {
+  const driver=loadApp(),{app,ui,document}=driver;
+  setHornTraffic(driver);ui('horn-button').onclick();
+  document.querySelectorAll('[data-density]').find(button=>button.dataset.density==='low').onclick();
+  assert.equal(app.state.horn.status,'cancelled');
+  assert.match(ui('horn-status').textContent,/取消避让/);
+  assert.ok(app.world.vehicles.every(vehicle=>!vehicle.laneChange));
+});
 
 test('automatic driving starts from rest without held controls and leaves the manual speed setting independent', () => {
   const driver = loadApp(), { app, ui } = driver;

@@ -116,6 +116,67 @@ test('the destination corridor is watched from the beginning of an active lane c
   assert.equal(decision.laneDirection, 0);
 });
 
+test('incoming yielding traffic reserves its destination before crossing the lane marking', () => {
+  const incoming = vehicle({ x: 3.75, lane: 2, y: 30, speed: 5,
+    laneChange: { fromLane: 2, targetLane: 1 } });
+  const decision = pilot.evaluate(world([incoming]), car(), { allowLaneChange: false });
+  assert.equal(decision.brake, 1);
+  assert.equal(decision.throttle, 0);
+  assert.equal(decision.laneDirection, 0);
+  assert.equal(pilot.evaluate(world([{ ...incoming, laneChange: null }]), car(),
+    { allowLaneChange: false }).brake, 0, 'ordinary adjacent traffic must not slow the ego car');
+});
+
+test('outgoing yielding leaders keep their source reserved until the change finishes', () => {
+  const departing = vehicle({ x: 3.7, lane: 1, y: 30, speed: 5,
+    laneChange: { fromLane: 1, targetLane: 2 } });
+  const decision = pilot.evaluate(world([departing]), car(), { allowLaneChange: false });
+  assert.equal(decision.brake, 1);
+  assert.equal(decision.throttle, 0);
+  departing.lane = 2;
+  departing.x = 3.75;
+  departing.laneChange = null;
+  const clear = pilot.evaluate(world([departing]), car(), { allowLaneChange: false });
+  assert.equal(clear.brake, 0);
+  assert.equal(clear.throttle, 1);
+});
+
+test('ego destination monitoring includes a yielding car that has physically left that corridor', () => {
+  const departing = vehicle({ x: -3.7, lane: 1, y: 25, speed: 0,
+    laneChange: { fromLane: 1, targetLane: 0 } });
+  const decision = pilot.evaluate(world([departing]), car({ x: 3.75 }),
+    { laneChanging: true, laneTarget: 1 });
+  assert.equal(decision.brake, 1);
+  assert.equal(decision.throttle, 0);
+  assert.equal(decision.laneDirection, 0);
+});
+
+test('dry and wet autopilot physically slows for a gradually merging yielding vehicle without contact', () => {
+  for (const wet of [false, true]) {
+    const ego = Object.assign(physics.createState(), car({ y: 700, speed: 25 }));
+    const leader = vehicle({ x: 3.75, lane: 2, y: wet ? 850 : 810, speed: 8,
+      laneChange: { fromLane: 2, targetLane: 1 } });
+    const state = world([leader]);
+    let contact = null, smallestGap = Infinity;
+    for (let index = 0; index < 1200; index++) {
+      const decision = pilot.evaluate(state, ego, { wet, allowLaneChange: false });
+      const previous = { ...ego };
+      physics.step(ego, { ...decision, wet, steering: 0 }, 1 / 120);
+      leader.previousX = leader.x;
+      leader.previousY = leader.y;
+      const progress = Math.min(1, (index + 1) / 720);
+      leader.x = 3.75 * (1 - progress * progress * (3 - 2 * progress));
+      leader.y += leader.speed / 120;
+      if (progress === 1) { leader.lane = 1; leader.laneChange = null; }
+      contact ||= traffic.resolveContact(state, ego, previous);
+      if (Math.abs(leader.x - ego.x) < 1.86) smallestGap = Math.min(smallestGap, leader.y - ego.y - 4.5);
+    }
+    assert.equal(contact, null, `wet=${wet}`);
+    assert.ok(smallestGap > 7, `wet=${wet}, gap=${smallestGap}`);
+    assert.ok(ego.speed < 12, 'the following speed changes through the physical controller');
+  }
+});
+
 test('lower limits are anticipated before the sign, with earlier wet-road slowing', () => {
   const drop = nextDrop(), initialCap = traffic.limitAt(drop.y - .01);
   const dry = pilot.evaluate(world([]), car({ y: drop.y - 100, speed: initialCap / 3.6 }));

@@ -679,3 +679,244 @@ test('recommendations are deterministic and never mutate world, car, braking or 
   assert.equal(first.lanes.length, 3);
   assert.doesNotThrow(() => traffic.getLaneRecommendation(null));
 });
+
+const road = require('../dist/road.js');
+const hornOptions = { canChangeLane:road.canChangeLane };
+const hornEgo = (overrides = {}) => cruisingEgo({ speed:20, ...overrides });
+function driveYield(state, ego, seconds, dt = 1/60) {
+  for (let time = 0; time < seconds; time += dt) {
+    ego.y += ego.speed * dt;
+    traffic.step(state, ego, dt);
+  }
+}
+
+test('horn requests only the nearest same-direction lead and smoothly yields right', () => {
+  const near = vehicle({ y:85, previousY:85 }), far = vehicle({ id:2,y:190,previousY:190 });
+  const state = world([far,near]), ego = hornEgo(), controls = { ...ego };
+  const result = traffic.requestYield(state,ego,hornOptions);
+  assert.equal(result.status,'yielding'); assert.equal(result.vehicleId,near.id);
+  assert.equal(result.targetLane,2); assert.equal(near.x,0);
+  assert.equal(far.laneChange,undefined); assert.deepEqual(ego,controls);
+  traffic.step(state,ego,.1);
+  assert.ok(near.x > 0 && near.x < .02,'starts at a bounded lateral velocity');
+  assert.equal(near.lane,1); assert.equal(near.previousX,0); assert.ok(near.heading > 0);
+  driveYield(state,ego,4.5);
+  assert.equal(near.lane,2); assert.equal(near.x,3.75); assert.equal(near.heading,0);
+  assert.equal(near.laneChange,null); assert.ok(near.y > 160);
+});
+
+test('horn falls back left when the right corridor is blocked, without crossing road edges', () => {
+  for (const lane of [0,1,2]) {
+    const x = [-3.75,0,3.75][lane], lead = laneCar(lane,{ y:85,previousY:85 });
+    const blockers = lane === 1 ? [laneCar(2,{ id:2,y:85 })] : [];
+    const state = world([lead,...blockers]), ego = hornEgo({ x });
+    const result = traffic.requestYield(state,ego,hornOptions);
+    assert.equal(result.status,'yielding');
+    assert.equal(result.targetLane,lane === 1 ? 0 : 1);
+    driveYield(state,ego,5);
+    assert.ok(lead.x >= -3.75 && lead.x <= 3.75);
+  }
+});
+
+test('horn refuses solid lines and an upcoming solid across the full NPC maneuver', () => {
+  for (const y of [250,400]) {
+    const lead = vehicle({ y,previousY:y }), state = world([lead]);
+    const result = traffic.requestYield(state,hornEgo({ y:y-85 }),hornOptions);
+    assert.equal(result.status,'blocked'); assert.match(result.reason,/实线/);
+    assert.equal(lead.laneChange,undefined);
+  }
+  let inspected;
+  const state = world([vehicle({ y:85,speed:19 })]);
+  traffic.requestYield(state,hornEgo(),{ canChangeLane:(y,options) => { inspected = { y,...options }; return { allowed:true }; } });
+  assert.equal(inspected.y,85); assert.equal(inspected.speed,19);
+  assert.ok(inspected.targetSpeed >= 19);
+  assert.equal(traffic.requestYield(world([vehicle()]),hornEgo()).status,'unavailable');
+});
+
+test('horn rejects unsafe adjacent front gaps, fast rear cars, and blocked source corridors', () => {
+  const cases = [
+    [laneCar(2,{ id:2,y:110,speed:20 })],
+    [laneCar(2,{ id:2,y:-80,speed:60 })],
+    [laneCar(2,{ id:2,y:140,speed:1 })],
+    [vehicle({ id:2,y:112,speed:1 })]
+  ];
+  for (const obstacles of cases) {
+    const lead = vehicle({ y:85 }), state = world([lead,laneCar(0,{ id:3,y:85 }),...obstacles]);
+    assert.equal(traffic.requestYield(state,hornEgo(),hornOptions).status,'blocked');
+    assert.equal(lead.laneChange,undefined);
+  }
+  const approaching = world([vehicle({ y:50,speed:10 })]);
+  assert.equal(traffic.requestYield(approaching,hornEgo({ speed:35 }),hornOptions).status,'blocked');
+});
+
+test('wet roads require larger yielding gaps and a longer gradual maneuver', () => {
+  const setup = () => world([vehicle({ y:85 }),laneCar(0,{ id:2,y:85 }),laneCar(2,{ id:3,y:50,speed:20 })]);
+  assert.equal(traffic.requestYield(setup(),hornEgo(),hornOptions).status,'yielding');
+  assert.equal(traffic.requestYield(setup(),hornEgo(),{ ...hornOptions,wet:true }).status,'blocked');
+  const wet = world([vehicle({ y:85 })]);
+  assert.equal(traffic.requestYield(wet,hornEgo(),{ ...hornOptions,wet:true }).status,'yielding');
+  assert.equal(wet.vehicles[0].laneChange.duration,5);
+});
+
+test('horn cannot move oncoming, distant, local-road or ramp vehicles', () => {
+  const scenarios = [
+    [world([]),hornEgo(),hornOptions],
+    [world([vehicle({ y:120 })]),hornEgo(),hornOptions],
+    [world([vehicle({ direction:-1 })]),hornEgo(),hornOptions],
+    [world([vehicle()]),hornEgo({ gear:'reverse' }),hornOptions],
+    [world([vehicle()]),hornEgo({ x:7.125 }),hornOptions],
+    [world([vehicle()]),hornEgo({ x:1.5 }),hornOptions],
+    [world([vehicle()]),hornEgo(),{ ...hornOptions,roadType:'ramp' }],
+    [{ ...world([vehicle({ lane:0,x:29,y:85 })]),roadType:'local' },hornEgo({ x:29 }),hornOptions]
+  ];
+  for (const [state,ego,options] of scenarios) {
+    assert.equal(traffic.requestYield(state,ego,options).status,'unavailable');
+    assert.ok(state.vehicles.every(car => !car.laneChange));
+  }
+});
+
+test('horn repeat cooldown uses simulated time and never stacks maneuvers', () => {
+  const lead = vehicle({ y:85 }), state = world([lead]), ego = hornEgo();
+  assert.equal(traffic.requestYield(state,ego,hornOptions).status,'yielding');
+  const turn = lead.laneChange;
+  assert.equal(traffic.requestYield(state,ego,hornOptions).status,'cooldown');
+  assert.equal(lead.laneChange,turn);
+  driveYield(state,ego,3);
+  assert.equal(traffic.requestYield(state,ego,hornOptions).status,'cooldown');
+  assert.equal(lead.laneChange,turn);
+  assert.equal(lead.lane,1);
+});
+
+test('yielding cars reserve both corridors for snapshot and lane advice', () => {
+  const lead = vehicle({ y:85,speed:15 }), state = world([lead]), ego = hornEgo({ speed:15 });
+  assert.equal(traffic.requestYield(state,ego,hornOptions).status,'yielding');
+  assert.equal(traffic.getSnapshot(state,{ x:3.75,y:0 }).nearestAhead.id,lead.id);
+  const advice = traffic.getLaneRecommendation(state,hornEgo({ speed:25 }));
+  assert.equal(advice.lanes[2].frontGap,80.5);
+  assert.equal(advice.lanes[1].frontGap,80.5);
+});
+
+test('new target traffic triggers a smooth early return when the original corridor remains clear', () => {
+  const lead = vehicle({ y:85 }), state = world([lead]), ego = hornEgo();
+  assert.equal(traffic.requestYield(state,ego,hornOptions).status,'yielding');
+  driveYield(state,ego,.5);
+  const beforeX = lead.x;
+  state.vehicles.push(laneCar(2,{ id:2,y:lead.y,speed:lead.speed }));
+  traffic.step(state,ego,1/60);
+  assert.ok(lead.x <= beforeX && lead.x > 0);
+  assert.equal(lead.laneChange.returning,true);
+  driveYield(state,ego,2.5);
+  assert.equal(lead.lane,1); assert.equal(lead.x,0); assert.equal(lead.laneChange,null);
+});
+
+test('late target hazard holds lateral position and brakes rather than cutting through a vehicle', () => {
+  const lead = vehicle({ y:85 }), state = world([lead]), ego = hornEgo();
+  assert.equal(traffic.requestYield(state,ego,hornOptions).status,'yielding');
+  driveYield(state,ego,2.1);
+  const beforeX = lead.x, beforeSpeed = lead.speed;
+  state.vehicles.push(laneCar(2,{ id:2,y:lead.y+20,speed:0 }));
+  traffic.step(state,ego,1/30);
+  assert.equal(lead.x,beforeX); assert.equal(lead.laneChange.status,'waiting');
+  assert.ok(lead.speed < beforeSpeed);
+  assert.equal(lead.lane,1);
+});
+
+test('NPC followers respect both reserved lanes throughout a yielding maneuver', () => {
+  const lead = vehicle({ y:85 }), rear = laneCar(2,{ id:2,y:-20,speed:20 });
+  const state = world([lead,rear]), ego = hornEgo();
+  assert.equal(traffic.requestYield(state,ego,hornOptions).status,'yielding');
+  for (let i = 0; i < 420; i++) {
+    ego.y += ego.speed/60; traffic.step(state,ego,1/60);
+    const gap = lead.y-rear.y-(lead.length+rear.length)/2;
+    assert.ok(gap >= traffic.constants.minGap-1e-8);
+    assert.equal(traffic.resolveContact(state,ego,{ ...ego,y:ego.y-ego.speed/60 }),null);
+  }
+  assert.equal(lead.lane,2);
+});
+
+test('moving NPC swept lateral contact is detected even when both endpoints are separated', () => {
+  const npc = vehicle({ x:3.75,previousX:-3.75,y:0,previousY:0 });
+  const state = world([npc]), ego = hornEgo({ x:0,y:0,speed:10 }), before = { ...ego };
+  const contact = traffic.resolveContact(state,ego,before);
+  assert.equal(contact?.side,true);
+  assert.ok(ego.speed < 10);
+  const clear = world([vehicle({ x:3.75,previousX:3.75,y:0,previousY:0 })]);
+  assert.equal(traffic.resolveContact(clear,before,{ ...before }),null);
+});
+
+test('recycling and density transitions discard yielding state without teleport collision trails', () => {
+  const state = world([vehicle({ y:85 })]), ego = hornEgo();
+  assert.equal(traffic.requestYield(state,ego,hornOptions).status,'yielding');
+  const lead = state.vehicles[0]; lead.y = -10000;
+  traffic.step(state,ego,1/60);
+  assert.equal(lead.laneChange,null); assert.equal(lead.previousX,lead.x);
+  assert.equal(lead.previousY,lead.y); assert.equal(lead.yieldCooldownUntil,0);
+  traffic.setDensity(state,ego,'dense');
+  assert.equal(state.hornUntil,0); assert.equal(state.lastYield,null);
+  assert.equal(state.vehicles.length,174);
+  assert.ok(state.vehicles.every(car => !car.laneChange && car.previousX === car.x));
+  assert.equal(traffic.resolveContact(state,ego,{ ...ego }),null);
+});
+
+test('traffic never changes lanes without a horn request', () => {
+  const state = traffic.createState(hornEgo(),{ density:'dense' });
+  const starts = state.vehicles.map(car => car.lane);
+  driveYield(state,hornEgo(),10,.1);
+  assert.deepEqual(state.vehicles.map(car => car.lane),starts);
+  assert.ok(state.vehicles.every(car => !car.laneChange));
+});
+
+test('a stationary or creeping lead never translates sideways after a horn', () => {
+  for (const speed of [0,.2,1.99]) {
+    const lead = vehicle({ y:85,speed }), state = world([lead]);
+    assert.equal(traffic.requestYield(state,hornEgo({ speed:0 }),hornOptions).status,'blocked');
+    assert.equal(lead.laneChange,undefined); assert.equal(lead.x,0);
+  }
+  const lead = vehicle({ y:85,speed:2 }), state = world([lead]), ego = hornEgo({ speed:0 });
+  assert.equal(traffic.requestYield(state,ego,hornOptions).status,'yielding');
+  for (let i = 0; i < 300; i++) {
+    const before = { x:lead.x,y:lead.y };
+    traffic.step(state,ego,1/60);
+    assert.ok(Math.abs(lead.x-before.x) <= Math.max(0,lead.y-before.y) * .13 + 1e-9);
+    assert.ok(Math.abs(lead.heading) < 8,'low-speed turn has bounded yaw');
+  }
+});
+
+test('an ongoing yield pauses lateral travel when it slows below walking speed and resumes with forward travel', () => {
+  const lead = vehicle({ y:85 }), state = world([lead]), ego = hornEgo({ speed:0 });
+  assert.equal(traffic.requestYield(state,ego,hornOptions).status,'yielding');
+  traffic.step(state,ego,1);
+  lead.speed = 0; lead.cruiseFactor = 0;
+  const x = lead.x, progress = lead.laneChange.progress;
+  traffic.step(state,ego,1);
+  assert.equal(lead.x,x); assert.equal(lead.laneChange.progress,progress); assert.equal(lead.heading,0);
+  lead.cruiseFactor = .85;
+  for (let i = 0; i < 600 && lead.laneChange; i++) {
+    traffic.step(state,ego,1/60);
+    assert.ok(Math.abs(lead.heading) < 8);
+  }
+  assert.equal(lead.lane,2); assert.equal(lead.laneChange,null);
+});
+
+test('a yielding car reserves braking plus completion room before a solid, then finishes after a hazard clears', () => {
+  const lead = vehicle({ y:65,speed:25 }), state = world([lead]), ego = hornEgo({ speed:0 });
+  const checks = [];
+  const options = { canChangeLane:(y, config) => {
+    checks.push({ y,distance:Math.max(config.speed,config.targetSpeed)*8 });
+    return road.canChangeLane(y,config);
+  } };
+  assert.equal(traffic.requestYield(state,ego,options).status,'yielding');
+  traffic.step(state,ego,2.2);
+  const progress = lead.laneChange.progress;
+  const stoppedCar = laneCar(2,{ id:2,y:lead.y+42,speed:0,cruiseFactor:0 });
+  state.vehicles.push(stoppedCar);
+  for (let i = 0; i < 600; i++) traffic.step(state,ego,1/60);
+  assert.ok(lead.speed < .1);
+  assert.ok(lead.y < 350);
+  assert.ok(checks.some(check => check.distance > (1-progress)*4*25 + 25*25/8),
+    'ongoing checks reserve stopping distance in addition to the unfinished turn');
+  state.vehicles = state.vehicles.filter(car => car !== stoppedCar);
+  for (let i = 0; i < 1200 && lead.laneChange; i++) traffic.step(state,ego,1/60);
+  assert.equal(lead.laneChange,null,'not permanently stranded across lanes after the obstacle clears');
+  assert.equal(lead.lane,2); assert.equal(lead.x,3.75); assert.ok(lead.y < 350);
+});
