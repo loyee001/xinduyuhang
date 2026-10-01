@@ -20,11 +20,60 @@ state.laneAdvice=null;state.adviceCooldownUntil=0;
 state.exitActive=null;state.exitCompleted=false;state.exitCruise=false;
 state.autodrive={active:false,route:'cruise',decision:null,nextLaneCheck:0,reason:'选择行程后点击启动，车辆将自动控制油门和刹车。'};
 state.horn={lastAt:-Infinity,count:0,status:'idle',reason:'前车会在允许变道且车距安全时避让。',vehicleId:null,targetLane:null,vehicle:null};
+state.collision=null;
+let collisionFramePending=false;
 let hornAudio=null;
 const driveNames={throttle:'油门',brake:'刹车',left:'左转向',right:'右转向'};
 function toast(message){$('toast').textContent=message;$('toast').classList.add('visible');clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('toast').classList.remove('visible'),3000);}
 function log(message){state.logs.unshift({time:new Date().toLocaleTimeString('zh-CN',{hour12:false}),message});state.logs=state.logs.slice(0,80);renderLogs();}
 function renderLogs(){const list=$('activity-log');list.replaceChildren();for(const entry of state.logs){const li=document.createElement('li'),time=document.createElement('time'),text=document.createElement('span');time.textContent=entry.time;text.textContent=entry.message;li.append(time,text);list.append(li);}}
+function finishWithCollision(kind,previousPose,contact=null){
+  if(state.collision)return;
+  const label=kind==='vehicle'?'与其他车辆发生碰撞':'与护栏发生碰撞';
+  state.collision={kind,label,vehicleId:contact?.vehicleId??null,speed:previousPose.speed,
+    distance:car.distance,elapsedTime:car.elapsedTime,sessionSeconds:(performance.now()-state.started)/1000};
+  // Preserve the collision solver's final pose and speed. Pausing the round
+  // is separate from physical braking and must freeze NPCs as well as ego.
+  state.controls.clear();cancelPlan('发生碰撞，本次驾驶已结束');
+  state.serviceBrake=0;state.lastInput={throttle:0,brake:0,steering:0};state.brakeAnchor=null;
+  state.autoLimitBraking=false;state.shiftPending=false;
+  if(['yielding','waiting','returning'].includes(state.horn.status)){
+    state.horn.status='cancelled';state.horn.reason='本次驾驶已结束，避让已暂停。';
+  }
+  state.trail.push([car.x,car.y]);
+  clearTimeout(toastTimer);$('toast').classList.remove('visible');$('toast').textContent='';
+  log(label+'，本次驾驶已结束');
+  for(const dialog of document.querySelectorAll('.sheet'))if(dialog.open)dialog.close();
+  collisionFramePending=true;camera?.pause();renderPlan();render();
+  $('collision-dialog').showModal();
+}
+function restartCollision(){
+  if(!state.collision)return false;
+  resetSession({clearEmergency:true});
+  $(state.mode+'-tab').focus();return true;
+}
+$('collision-restart').onclick=restartCollision;
+$('collision-restart').onkeydown=event=>{
+  if(['Enter',' '].includes(event.key)){event.preventDefault();if(!event.repeat)restartCollision();}
+};
+$('collision-dialog').oncancel=event=>event.preventDefault();
+$('collision-dialog').onclose=()=>{if(state.collision)$('collision-dialog').showModal();};
+function renderCollision(){
+  const collision=state.collision;
+  $('camera-panel').classList.toggle('collision-ended',!!collision);
+  if(!collision)return;
+  $('collision-detail').textContent=collision.label+'。画面和车流已暂停，可以重新开始一局。';
+  $('collision-speed').textContent=(collision.speed*3.6).toFixed(1)+' km/h';
+  $('collision-distance').textContent=collision.distance.toFixed(1)+' m';
+  $('camera-status').textContent='发生碰撞 · 本局结束';
+  $('camera-live-clock').textContent='碰撞暂停';
+  $('safety-title').textContent='发生碰撞 · 已暂停';
+  $('safety-description').textContent='点击重新开始，返回起点';
+  $('lane-status').textContent='本局结束 · 已暂停';$('lane-hint').textContent='重新开始后返回中间车道，再启动驾驶。';
+  $('braking-hud').hidden=true;
+  $('actual-brake-label').textContent=car.braking?'碰撞时制动':'上次制动';$('brake-result-label').textContent='本局已结束 · 数值已冻结';
+  $('frame-rate').textContent='PAUSED';$('device-fps').textContent='碰撞暂停';
+}
 function playHorn(){
   // Audio is created only by a deliberate press. The visual/simulation action
   // stays usable when a browser has no audio support or blocks playback.
@@ -51,7 +100,7 @@ function playHorn(){
   }catch{/* Sound is optional; traffic behaviour must remain available. */}
 }
 function pressHorn(){
-  if(!state.connected||!cameraReady||document.hidden||car.energyKWh>=51.6)return false;
+  if(state.collision||!state.connected||!cameraReady||document.hidden||car.energyKWh>=51.6)return false;
   if(car.elapsedTime-state.horn.lastAt<1.2)return false;
   state.horn.lastAt=car.elapsedTime;state.horn.count++;playHorn();
   const result=traffic.requestYield(trafficWorld,car,{wet:state.wet,roadType:currentRoadType(),canChangeLane:roadModel.canChangeLane});
@@ -77,7 +126,7 @@ function renderHorn(){
     }
   }
   const cooling=car.elapsedTime-horn.lastAt<1.2;
-  $('horn-button').disabled=!state.connected||!cameraReady||document.hidden||car.energyKWh>=51.6;
+  $('horn-button').disabled=!!state.collision||!state.connected||!cameraReady||document.hidden||car.energyKWh>=51.6;
   // Preserve keyboard focus during cooldown so a held Space key cannot fall
   // through to the page's braking shortcut after the first beep.
   $('horn-button').setAttribute('aria-disabled',String($('horn-button').disabled||cooling));
@@ -87,9 +136,10 @@ function renderHorn(){
   $('horn-feedback').dataset.status=horn.status;
 }
 function cancelPlan(reason){stopAutodrive(reason);const cruising=state.exitCruise;state.exitCruise=false;if(cruising){log('普通道路 AI 巡航已结束：'+reason);renderPlan();}if(state.plan&&['running','ready'].includes(state.plan.status)){state.plan.status='cancelled';state.plan.reason=reason;renderPlan();}}
-function requestBrake(reason,amount=.55,{emergency=false}={}){state.controls.clear();cancelPlan(reason);state.serviceBrake=Math.max(state.serviceBrake,amount);if(emergency)state.estop=true;log(reason);render();}
-function emergencyStop(){requestBrake('紧急制动：全力刹车，车辆仍将继续移动直至停止',1,{emergency:true});toast('正在全力制动，刹车距离会持续累计');}
+function requestBrake(reason,amount=.55,{emergency=false}={}){if(state.collision)return false;state.controls.clear();cancelPlan(reason);state.serviceBrake=Math.max(state.serviceBrake,amount);if(emergency)state.estop=true;log(reason);render();}
+function emergencyStop(){if(state.collision)return false;requestBrake('紧急制动：全力刹车，车辆仍将继续移动直至停止',1,{emergency:true});toast('正在全力制动，刹车距离会持续累计');}
 function releaseEmergency(){
+  if(state.collision)return false;
   if(car.speed>.01)return;
   state.estop=false;state.failsafe=false;state.serviceBrake=0;
   if(state.shoulderAlert){
@@ -98,9 +148,9 @@ function releaseEmergency(){
   }else log('制动锁定已解除，车辆保持静止');
   render();
 }
-function available(){if(state.estop){toast('请等车辆停稳后解除制动锁定');return false;}if(!state.connected||!cameraReady){toast('连接或画面不可用，保持制动');return false;}if(car.energyKWh>=51.6){toast('模拟电量耗尽，请重置模拟');return false;}return true;}
+function available(){if(state.collision)return false;if(state.estop){toast('请等车辆停稳后解除制动锁定');return false;}if(!state.connected||!cameraReady){toast('连接或画面不可用，保持制动');return false;}if(car.energyKWh>=51.6){toast('模拟电量耗尽，请重置模拟');return false;}return true;}
 const controlModes=['manual','ai','auto'];
-function switchMode(mode){if(!controlModes.includes(mode))return;if(mode!==state.mode){state.controls.clear();if(state.plan?.status==='running'||state.exitCruise||state.autodrive.active)requestBrake('已切换控制方式，取消 AI 并开始常规制动');state.mode=mode;}for(const name of controlModes){const active=name===mode;$(name+'-panel').hidden=!active;$(name+'-tab').classList.toggle('active',active);$(name+'-tab').setAttribute('aria-selected',String(active));$(name+'-tab').tabIndex=active?0:-1;}render();}
+function switchMode(mode){if(state.collision)return;if(!controlModes.includes(mode))return;if(mode!==state.mode){state.controls.clear();if(state.plan?.status==='running'||state.exitCruise||state.autodrive.active)requestBrake('已切换控制方式，取消 AI 并开始常规制动');state.mode=mode;}for(const name of controlModes){const active=name===mode;$(name+'-panel').hidden=!active;$(name+'-tab').classList.toggle('active',active);$(name+'-tab').setAttribute('aria-selected',String(active));$(name+'-tab').tabIndex=active?0:-1;}render();}
 $('auto-tab').onclick=()=>switchMode('auto');$('manual-tab').onclick=()=>switchMode('manual');$('ai-tab').onclick=()=>switchMode('ai');$('ai-shortcut').onclick=()=>{switchMode('ai');$('ai-tab').scrollIntoView({block:'nearest',behavior:'smooth'});};
 for(const mode of controlModes)$(mode+'-tab').onkeydown=event=>{if(['ArrowLeft','ArrowRight','Home','End'].includes(event.key)){event.preventDefault();const next=event.key==='Home'?'manual':event.key==='End'?'auto':controlModes[(controlModes.indexOf(mode)+(event.key==='ArrowLeft'?2:1))%3];switchMode(next);$(next+'-tab').focus();}};
 function pressDrive(action,id){if(state.controls.has(id)||!available())return false;cancelPlan('手动接管');state.failsafe=false;state.controls.set(id,action);if(action==='throttle'){state.serviceBrake=0;}log(`手动操作：${driveNames[action]}`);render();return true;}
@@ -144,7 +194,8 @@ function getLaneAdvice(){
   const advice=traffic.getLaneRecommendation(trafficWorld,car,{wet:state.wet,desiredSpeed:effectiveTarget(state.autodrive.active?100:state.speedLimit)});
   const rule=roadModel.canChangeLane(car.y,{speed:car.speed,gear:car.gear,targetSpeed:effectiveTarget(state.autodrive.active?100:state.speedLimit)});
   let reason='';
-  if(state.exitActive)reason=state.exitCompleted?'普通道路双向各一条车道，保持本车道，禁止跨越双黄线。':'正在沿出口路线行驶，暂停普通车道建议。';
+  if(state.collision)reason='本次驾驶发生碰撞，重新开始后再评估车道。';
+  else if(state.exitActive)reason=state.exitCompleted?'普通道路双向各一条车道，保持本车道，禁止跨越双黄线。':'正在沿出口路线行驶，暂停普通车道建议。';
   else if(!rule.allowed)reason=rule.reason;
   else if(state.estop||state.failsafe||!state.connected||!cameraReady)reason='制动锁定或连接不可用，暂停变道建议。';
   else if(state.shoulderAlert||state.shoulderRecovery)reason='请先完成应急车道停车与返回，再评估正常车道。';
@@ -161,7 +212,7 @@ function getLaneAdvice(){
 function renderLaneAdvice(){
   const advice=state.laneAdvice=getLaneAdvice(),recommended=advice.status==='recommend';
   document.querySelector('.advice-lanes').hidden=state.exitCompleted;
-  const title=recommended?`推荐向${advice.direction==='left'?'左':'右'}变道`:
+  const title=state.collision?'碰撞结束 · 建议已暂停':recommended?`推荐向${advice.direction==='left'?'左':'右'}变道`:
     advice.status==='keep'?'保持当前车道':advice.status==='blocked'?'暂不建议变道':
     state.exitCompleted?'普通道路 · 保持本车道':state.laneChanging?'正在完成变道':advice.reason==='车速较低，起步后再评估变道'?'起步后评估车流':'变道建议已暂停';
   $('lane-advice').dataset.status=advice.status;
@@ -201,7 +252,7 @@ $('lane-advice-accept').onkeydown=event=>{
 const keyMap={ArrowUp:'throttle',KeyW:'throttle',ArrowDown:'brake',KeyS:'brake'};
 const laneKeyMap={ArrowLeft:-1,KeyA:-1,ArrowRight:1,KeyD:1};
 window.addEventListener('keydown',event=>{
-  if(event.defaultPrevented||event.target.closest?.('input,textarea,select,[contenteditable="true"]')||document.querySelector('dialog[open]'))return;
+  if(state.collision||event.defaultPrevented||event.target.closest?.('input,textarea,select,[contenteditable="true"]')||document.querySelector('dialog[open]'))return;
   if(event.code==='Space'){event.preventDefault();requestBrake('按下空格，常规制动至停止');return;}
   if(event.key==='Escape'){requestBrake('已请求常规制动');if($('camera-panel').classList.contains('expanded'))toggleExpand(false);return;}
   if(event.altKey||event.ctrlKey||event.metaKey)return;
@@ -211,10 +262,10 @@ window.addEventListener('keydown',event=>{
   if(!keyMap[event.code])return;event.preventDefault();if(!event.repeat)pressDrive(keyMap[event.code],'k'+event.code);
 });
 window.addEventListener('keyup',event=>releaseDrive('k'+event.code));
-function failSafe(reason){state.failsafe=true;requestBrake(reason,1);}
+function failSafe(reason){if(state.collision)return;state.failsafe=true;requestBrake(reason,1);}
 window.addEventListener('blur',()=>{if(car.speed>.01||state.controls.size||state.plan?.status==='running'||state.exitCruise||state.autodrive.active)failSafe('页面失去焦点，接管为全力制动');});
-document.addEventListener('visibilitychange',()=>{if(document.hidden){state.pausedAt=performance.now();failSafe('页面进入后台，自动制动已触发');camera?.pause();}else{const elapsed=state.pausedAt===null?0:(performance.now()-state.pausedAt)/1000;advanceElapsed(Math.min(elapsed,60),true);state.pausedAt=null;lastFrame=performance.now();lastCameraFrame=0;render();}});
-window.addEventListener('pagehide',()=>{state.controls.clear();state.failsafe=true;cancelPlan('页面离开');});
+document.addEventListener('visibilitychange',()=>{if(state.collision){lastFrame=performance.now();return;}if(document.hidden){state.pausedAt=performance.now();failSafe('页面进入后台，自动制动已触发');camera?.pause();}else{const elapsed=state.pausedAt===null?0:(performance.now()-state.pausedAt)/1000;advanceElapsed(Math.min(elapsed,60),true);state.pausedAt=null;lastFrame=performance.now();lastCameraFrame=0;render();}});
+window.addEventListener('pagehide',()=>{if(state.collision)return;state.controls.clear();state.failsafe=true;cancelPlan('页面离开');});
 $('normal-stop').onclick=()=>requestBrake('常规制动：持续刹车至完全停止');$('emergency-stop').onclick=emergencyStop;$('reset-estop').onclick=releaseEmergency;
 function currentRoadType(){return state.exitCompleted?'local':state.exitActive?'ramp':'highway';}
 function currentRoadCap(){return (state.exitCompleted?roadModel.localRoad.speedLimitKmh:state.exitActive?40:traffic.limitAt(car.y))/3.6;}
@@ -230,12 +281,13 @@ function setGear(gear){
 }
 $('gear-forward').onclick=()=>setGear('forward');$('gear-reverse').onclick=()=>setGear('reverse');
 document.querySelectorAll('[data-density]').forEach(button=>button.onclick=()=>{
+  if(state.collision)return;
   const density=button.dataset.density;if(!traffic.densityPresets[density]||density===state.trafficDensity)return;
   traffic.setDensity(trafficWorld,car,density);state.trafficDensity=density;state.contactUntil=0;
   log(`车流切换为${traffic.densityPresets[density].label}，已重新布置周围车辆`);render();
 });
-$('speed-slider').oninput=event=>{const value=Number(event.target.value),max=state.requestedGear==='reverse'?physics.constants.maxReverseSpeed:100;if(!Number.isFinite(value)||value<1||value>max)return;state.speedLimit=value;render();};
-function setRoad(wet){if(car.braking){toast('请在本次制动结束后切换路面');return;}state.wet=wet;state.brakeAnchor=null;log(`路面切换为${wet?'湿滑':'干燥'}，摩擦系数 ${wet?.45:.85}`);render();}
+$('speed-slider').oninput=event=>{if(state.collision)return;const value=Number(event.target.value),max=state.requestedGear==='reverse'?physics.constants.maxReverseSpeed:100;if(!Number.isFinite(value)||value<1||value>max)return;state.speedLimit=value;render();};
+function setRoad(wet){if(state.collision)return;if(car.braking){toast('请在本次制动结束后切换路面');return;}state.wet=wet;state.brakeAnchor=null;log(`路面切换为${wet?'湿滑':'干燥'}，摩擦系数 ${wet?.45:.85}`);render();}
 $('dry-road').onclick=()=>setRoad(false);$('wet-road').onclick=()=>setRoad(true);
 function nextExitForRoute(){return roadModel.eventsAround(car.y,7000).exits.filter(exit=>exit.entryStart+25>=car.y).sort((a,b)=>a.entryStart-b.entryStart)[0]||null;}
 function requestExit({fromPlan=false,exit=null}={}){
@@ -252,6 +304,7 @@ function requestExit({fromPlan=false,exit=null}={}){
   log(`已选择${selected.name}，减速至 40 km/h 后沿匝道驶离`);render();return true;
 }
 $('exit-action').onclick=()=>{
+  if(state.collision)return;
   if(state.exitActive){
     if(state.exitCompleted)return;
     if(car.y<state.exitActive.entryStart){cancelPlan('取消出口路线');state.exitActive=null;log('已取消出口路线，继续沿右车道行驶');render();}
@@ -305,7 +358,7 @@ function brakingTest(target,title){
   return {kind:'brake-test',gear:'forward',target,title,labels:[brakingTargetLabel(target),'达到车速后全力制动；60 秒未达速则结束加速']};
 }
 function brakingTargetLabel(target){const capped=effectiveTarget(target,'forward');return `加速至 ${capped.toFixed(1)} m/s（${(capped*3.6).toFixed(0)} km/h）${target>capped?' · 已按路段限速调整':''}`;}
-function submitCommand(raw){try{const parsed=parseCommand(raw);if(parsed.emergency){emergencyStop();return {status:'braking'};}if(parsed.stop){requestBrake('AI 指令请求常规制动至停止');$('ai-feedback').textContent='已经踩下刹车，速度和实际制动距离仍会继续变化，直至停车。';return {status:'braking'};}if(!available())return {status:'blocked'};if(state.plan?.status==='running'||state.exitCruise||state.autodrive.active)requestBrake('新计划替换旧任务，先开始制动');state.plan={...parsed,status:'ready',phase:0,startDistance:car.distance,brakeStartDistance:0};$('ai-feedback').textContent='请确认计划。行驶遵守路段限速，超速会自动制动；前进 / 倒车切换会先停稳。';$('ai-feedback').classList.remove('error');log(`生成计划：${parsed.title}`);renderPlan();return {status:'ready',steps:parsed.labels};}catch(error){$('ai-feedback').textContent=error.message;$('ai-feedback').classList.add('error');return {status:'error',message:error.message};}}
+function submitCommand(raw){if(state.collision)return {status:'blocked',reason:'发生碰撞，请先重新开始'};try{const parsed=parseCommand(raw);if(parsed.emergency){emergencyStop();return {status:'braking'};}if(parsed.stop){requestBrake('AI 指令请求常规制动至停止');$('ai-feedback').textContent='已经踩下刹车，速度和实际制动距离仍会继续变化，直至停车。';return {status:'braking'};}if(!available())return {status:'blocked'};if(state.plan?.status==='running'||state.exitCruise||state.autodrive.active)requestBrake('新计划替换旧任务，先开始制动');state.plan={...parsed,status:'ready',phase:0,startDistance:car.distance,brakeStartDistance:0};$('ai-feedback').textContent='请确认计划。行驶遵守路段限速，超速会自动制动；前进 / 倒车切换会先停稳。';$('ai-feedback').classList.remove('error');log(`生成计划：${parsed.title}`);renderPlan();return {status:'ready',steps:parsed.labels};}catch(error){$('ai-feedback').textContent=error.message;$('ai-feedback').classList.add('error');return {status:'error',message:error.message};}}
 $('command-form').onsubmit=event=>{event.preventDefault();submitCommand($('command-input').value);};$('command-input').onkeydown=event=>{if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing){event.preventDefault();submitCommand(event.target.value);}};
 document.querySelectorAll('[data-command]').forEach(button=>button.onclick=()=>{$('command-input').value=button.dataset.command;submitCommand(button.dataset.command);});
 function startPlan({fromAuto=false}={}){
@@ -408,8 +461,8 @@ function sequenceTarget(plan){
   }
   return target;
 }
-$('task-action').onclick=()=>{if(state.plan?.status==='ready')startPlan();else if(state.plan?.status==='running'||state.exitCruise)requestBrake('停止 AI 任务，持续常规制动');else{state.plan=null;renderPlan();}};
-function renderPlan(){const plan=state.plan;$('task-card').hidden=!plan;if(!plan)return;if(plan.kind==='brake-test'&&plan.phase===0)plan.labels[0]=brakingTargetLabel(plan.target);const status={ready:'待确认',running:plan.kind==='sequence'?(plan.waitingReason?'等待 / 执行中':'执行中'):plan.phase?'制动中':'执行中',blocked:'受阻 · 制动停车',completed:state.exitCruise?'已驶离 · 巡航中':'已完成',limited:'未达目标 · 已结束',cancelled:car.speed>.01?(state.lastInput.brake>0?'已取消 · 制动中':'已取消 · 滑行中'):'已取消'};$('task-badge').textContent=status[plan.status];$('task-waiting').hidden=!plan.waitingReason;$('task-waiting').textContent=plan.waitingReason||'';$('task-steps').replaceChildren();plan.labels.forEach((label,index)=>{const li=document.createElement('li'),number=document.createElement('span'),text=document.createElement('span');number.className='step-number';const done=plan.status==='completed'||index<plan.phase;number.textContent=done?'✓':String(index+1);text.textContent=label;li.className=done?'done':plan.status==='running'&&index===plan.phase?'current':'';li.append(number,text);$('task-steps').append(li);});const action=$('task-action');action.replaceChildren();const icon=document.createElement('i'),text=document.createElement('span');icon.dataset.icon=plan.status==='running'||state.exitCruise?'stop':plan.status==='ready'?'play':'refresh';text.textContent=state.exitCruise?'结束巡航并制动':plan.status==='running'?'取消并制动':plan.status==='ready'?'开始执行':'新的任务';action.append(icon,text);paintIcons(action);}
+$('task-action').onclick=()=>{if(state.collision)return;if(state.plan?.status==='ready')startPlan();else if(state.plan?.status==='running'||state.exitCruise)requestBrake('停止 AI 任务，持续常规制动');else{state.plan=null;renderPlan();}};
+function renderPlan(){const plan=state.plan;$('task-card').hidden=!plan;if(!plan)return;if(plan.kind==='brake-test'&&plan.phase===0)plan.labels[0]=brakingTargetLabel(plan.target);const status={ready:'待确认',running:plan.kind==='sequence'?(plan.waitingReason?'等待 / 执行中':'执行中'):plan.phase?'制动中':'执行中',blocked:'受阻 · 制动停车',completed:state.exitCruise?'已驶离 · 巡航中':'已完成',limited:'未达目标 · 已结束',cancelled:state.collision?'碰撞结束':car.speed>.01?(state.lastInput.brake>0?'已取消 · 制动中':'已取消 · 滑行中'):'已取消'};$('task-badge').textContent=status[plan.status];$('task-waiting').hidden=!plan.waitingReason;$('task-waiting').textContent=plan.waitingReason||'';$('task-steps').replaceChildren();plan.labels.forEach((label,index)=>{const li=document.createElement('li'),number=document.createElement('span'),text=document.createElement('span');number.className='step-number';const done=plan.status==='completed'||index<plan.phase;number.textContent=done?'✓':String(index+1);text.textContent=label;li.className=done?'done':plan.status==='running'&&index===plan.phase?'current':'';li.append(number,text);$('task-steps').append(li);});const action=$('task-action');action.replaceChildren();const icon=document.createElement('i'),text=document.createElement('span');icon.dataset.icon=plan.status==='running'||state.exitCruise?'stop':plan.status==='ready'?'play':'refresh';text.textContent=state.exitCruise?'结束巡航并制动':plan.status==='running'?'取消并制动':plan.status==='ready'?'开始执行':'新的任务';action.append(icon,text);paintIcons(action);}
 function updatePlan(){
   const plan=state.plan;if(plan?.status!=='running')return;
   if(plan.kind==='sequence'){updateSequencePlan(plan);return;}
@@ -469,6 +522,7 @@ function updateAutodrive(){
 $('auto-start').onclick=startAutodrive;
 $('auto-stop').onclick=()=>requestBrake('已结束自动驾驶，制动至完全停止');
 for(const button of document.querySelectorAll('[data-auto-route]'))button.onclick=()=>{
+  if(state.collision)return;
   const route=button.dataset.autoRoute;if(route===state.autodrive.route)return;
   state.autodrive.route=route;if(state.autodrive.active)startAutodrive();else render();
 };
@@ -483,7 +537,7 @@ function renderAutodrive(){
   $('auto-speed').textContent=auto.active?((decision?.targetSpeed||0)*3.6).toFixed(0)+' km/h':'按路段限速';
   $('auto-steering').textContent=state.exitActive?(state.exitCompleted?'普通道路居中':'沿匝道循迹'):state.laneChanging?'移向'+laneName(state.laneTarget):'自动保持车道';
   $('auto-start').hidden=auto.active;$('auto-stop').hidden=!auto.active;
-  $('auto-start').disabled=state.estop||!state.connected||!cameraReady||state.shoulderAlert||state.shoulderRecovery;
+  $('auto-start').disabled=!!state.collision||state.estop||!state.connected||!cameraReady||state.shoulderAlert||state.shoulderRecovery;
   for(const button of document.querySelectorAll('[data-auto-route]')){const selected=button.dataset.autoRoute===auto.route;button.classList.toggle('selected',selected);button.setAttribute('aria-pressed',String(selected));button.disabled=button.dataset.autoRoute==='exit'&&state.exitCompleted;}
 }
 function getInput(){
@@ -523,6 +577,7 @@ function updateLaneState(){
   }
 }
 function advance(dt){
+  if(state.collision)return;
   updateExitState();updateLaneState();updatePlan();updateAutodrive();
   const input=getInput();state.lastInput=input;
   // Limit braking ends at the legal speed, so it has no fixed parking line.
@@ -538,18 +593,10 @@ function advance(dt){
   state.shiftPending=state.requestedGear!==car.gear;
   if(previousPose.gear!==car.gear){state.brakeAnchor=null;log(`已停稳换入${car.gear==='reverse'?'倒车 R':'前进 D'}挡`);}
   const contact=traffic.resolveContact(trafficWorld,car,previousPose);
-  if(car.wallContactCount>contacts){
-    state.brakeAnchor=null;
-    log('擦碰护栏：碰撞与摩擦使车速略降，可继续给油或转向离开');
-  }
-  if(contact){
-    car.acceleration=(car.speed-previousPose.speed)/dt;
-    state.brakeAnchor=null;
-    state.contactUntil=performance.now()+1000;
-    if(performance.now()-state.lastContactNotice>1500){
-      state.lastContactNotice=performance.now();
-      log('车辆发生接触，碰撞损失动能；驾驶控制保持可用');
-    }
+  if(contact||car.wallContactCount>contacts){
+    if(contact)car.acceleration=(car.speed-previousPose.speed)/dt;
+    finishWithCollision(contact?'vehicle':'guardrail',previousPose,contact);
+    return;
   }
   updateExitState();updateLaneState();
   const prev=state.trail[state.trail.length-1];
@@ -557,14 +604,30 @@ function advance(dt){
   if(wasBraking&&!car.braking&&car.speed===0){log(`车辆已停稳，制动距离 ${(car.lastBrakeDistance||0).toFixed(2)} m`);if(!state.estop&&!state.failsafe)state.serviceBrake=0;renderPlan();}
   updatePlan();
 }
-function advanceElapsed(elapsed,background=false){let remaining=Math.max(0,elapsed);while(remaining>0){const step=Math.min(remaining,1/120);advance(step);remaining-=step;if(background&&car.speed===0)break;}}
-function openSheet(id){requestBrake('打开信息面板，开始常规制动');$(id).showModal();}
-$('device-button').onclick=()=>openSheet('device-dialog');$('log-button').onclick=()=>openSheet('log-dialog');document.querySelectorAll('[data-close]').forEach(button=>button.onclick=()=>$(button.dataset.close).close());document.querySelectorAll('dialog').forEach(dialog=>dialog.onclick=event=>{if(event.target!==dialog)return;const r=dialog.getBoundingClientRect();if(event.clientX<r.left||event.clientX>r.right||event.clientY<r.top||event.clientY>r.bottom)dialog.close();});
-$('toggle-connection').onclick=()=>{state.connected=!state.connected;failSafe(state.connected?'连接已恢复，车辆继续制动至停止':'模拟连接断开，触发全力制动');camera?.pause();render();};
-function resetSession(){Object.assign(state.horn,{lastAt:-Infinity,count:0,status:'idle',reason:'前车会在允许变道且车距安全时避让。',vehicleId:null,targetLane:null,vehicle:null});Object.assign(state.autodrive,{active:false,route:'cruise',decision:null,nextLaneCheck:0,reason:'模拟已重置，点击启动自动驾驶。'});state.laneAdvice=null;state.adviceCooldownUntil=0;const keepLocked=state.estop;car=physics.createState();trafficWorld=traffic.createState(car,{density:state.trafficDensity});Object.assign(state,{exitActive:null,exitCompleted:false,exitCruise:false,estop:keepLocked,requestedGear:'forward',autoLimitBraking:false,shiftPending:false,laneTarget:1,laneChanging:false,shoulderAlert:false,shoulderRecovery:false,serviceBrake:0,failsafe:false,plan:null,trail:[[0,0]],logs:[],started:performance.now(),brakeAnchor:null,contactUntil:0,lastContactNotice:-Infinity,trafficInfo:null});state.controls.clear();$('command-input').value='';$('ai-feedback').textContent='支持距离、变道、调速、制动、等待、倒车与出口；可用“然后 / 并”组合，最多 8 步。';$('ai-feedback').classList.remove('error');log('模拟已重置，车辆回到起点');renderPlan();render();}
+function advanceElapsed(elapsed,background=false){let remaining=Math.max(0,elapsed);while(remaining>0&&!state.collision){const step=Math.min(remaining,1/120);advance(step);remaining-=step;if(background&&car.speed===0)break;}}
+function openSheet(id){if(state.collision)return;requestBrake('打开信息面板，开始常规制动');$(id).showModal();}
+$('device-button').onclick=()=>openSheet('device-dialog');$('log-button').onclick=()=>openSheet('log-dialog');document.querySelectorAll('[data-close]').forEach(button=>button.onclick=()=>$(button.dataset.close).close());document.querySelectorAll('.sheet').forEach(dialog=>dialog.onclick=event=>{if(event.target!==dialog)return;const r=dialog.getBoundingClientRect();if(event.clientX<r.left||event.clientX>r.right||event.clientY<r.top||event.clientY>r.bottom)dialog.close();});
+$('toggle-connection').onclick=()=>{if(state.collision)return;state.connected=!state.connected;failSafe(state.connected?'连接已恢复，车辆继续制动至停止':'模拟连接断开，触发全力制动');camera?.pause();render();};
+function resetSession({clearEmergency=!!state.collision}={}){
+  const keepLocked=state.estop&&!clearEmergency;
+  Object.assign(state.horn,{lastAt:-Infinity,count:0,status:'idle',reason:'前车会在允许变道且车距安全时避让。',vehicleId:null,targetLane:null,vehicle:null});
+  Object.assign(state.autodrive,{active:false,route:'cruise',decision:null,nextLaneCheck:0,reason:'模拟已重置，点击启动自动驾驶。'});
+  car=physics.createState();trafficWorld=traffic.createState(car,{density:state.trafficDensity});
+  Object.assign(state,{collision:null,laneAdvice:null,adviceCooldownUntil:0,exitActive:null,exitCompleted:false,exitCruise:false,
+    estop:keepLocked,requestedGear:'forward',autoLimitBraking:false,shiftPending:false,laneTarget:1,laneChanging:false,
+    shoulderAlert:false,shoulderRecovery:false,serviceBrake:0,failsafe:false,plan:null,trail:[[0,0]],logs:[],started:performance.now(),
+    brakeAnchor:null,contactUntil:0,lastContactNotice:-Infinity,trafficInfo:null,lastInput:{throttle:0,brake:0,steering:0},predicted:0,pausedAt:null});
+  state.controls.clear();collisionFramePending=false;
+  lastFrame=performance.now();lastCameraFrame=0;lastRender=0;camera?.pause();
+  clearTimeout(toastTimer);$('toast').classList.remove('visible');$('toast').textContent='';
+  if($('collision-dialog').open)$('collision-dialog').close();
+  $('camera-live-clock').textContent='00:00.0';
+  $('command-input').value='';$('ai-feedback').textContent='支持距离、变道、调速、制动、等待、倒车与出口；可用“然后 / 并”组合，最多 8 步。';
+  $('ai-feedback').classList.remove('error');log('模拟已重置，车辆回到起点');renderPlan();render();
+}
 $('reset-session').onclick=()=>{resetSession();$('device-dialog').close();};
-$('view-switch').onclick=()=>{state.map=!state.map;camera?.pause();$('map-view').hidden=!state.map;$('view-title').textContent=state.map?'行驶轨迹':'高速公路 · 驾驶视角';$('view-switch').querySelector('span').textContent=state.map?'画面':'轨迹';$('view-switch').setAttribute('aria-label',state.map?'切换到驾驶画面':'切换到行驶轨迹');render();};
-function toggleExpand(force){const expanded=force??!$('camera-panel').classList.contains('expanded');$('camera-panel').classList.toggle('expanded',expanded);$('expand-button').setAttribute('aria-label',expanded?'缩小画面':'放大画面');$('expand-button').setAttribute('aria-expanded',String(expanded));document.body.style.overflow=expanded?'hidden':'';}
+$('view-switch').onclick=()=>{if(state.collision)return;state.map=!state.map;camera?.pause();$('map-view').hidden=!state.map;$('view-title').textContent=state.map?'行驶轨迹':'高速公路 · 驾驶视角';$('view-switch').querySelector('span').textContent=state.map?'画面':'轨迹';$('view-switch').setAttribute('aria-label',state.map?'切换到驾驶画面':'切换到行驶轨迹');render();};
+function toggleExpand(force){if(state.collision)return;const expanded=force??!$('camera-panel').classList.contains('expanded');$('camera-panel').classList.toggle('expanded',expanded);$('expand-button').setAttribute('aria-label',expanded?'缩小画面':'放大画面');$('expand-button').setAttribute('aria-expanded',String(expanded));document.body.style.overflow=expanded?'hidden':'';}
 $('expand-button').onclick=()=>toggleExpand();
 function render(){const moving=car.speed>.01,braking=state.lastInput.brake>0&&moving;state.predicted=physics.estimateBrakingDistance(car.speed,{wet:state.wet,brake:1});$('speed-value').textContent=car.speed.toFixed(1);$('speed-kmh').textContent=(car.speed*3.6).toFixed(1)+' km/h';$('predicted-brake').textContent=state.predicted.toFixed(1);$('actual-brake').textContent=car.braking?car.brakeDistance.toFixed(1):car.lastBrakeDistance===null?'—':car.lastBrakeDistance.toFixed(1);$('actual-brake-label').textContent=car.braking?'正在制动':'上次制动';$('brake-result-label').textContent=car.braking?'距离正在累计':'停车后保留实测结果';$('braking-hud').hidden=!braking;$('braking-hud-distance').textContent=car.brakeDistance.toFixed(1)+' m';$('braking-hud-label').textContent=state.estop?'紧急制动':state.shiftPending?'换挡制动':state.autoLimitBraking?'限速自动制动':state.lastInput.brake>=1?'全力制动':'常规制动';$('speed-limit-label').textContent=String(state.speedLimit);$('target-kmh').textContent=(state.speedLimit*3.6).toFixed(0)+' km/h';$('odometer-live').textContent=car.distance.toFixed(1)+' m';$('distance-value').textContent=car.distance.toFixed(1);$('map-distance').textContent=car.distance.toFixed(1)+' m';$('heading-live').textContent=(Math.round(car.heading)%360)+'°';$('acceleration-live').textContent=car.acceleration.toFixed(2)+' m/s²';$('position-text').textContent=`X ${car.x.toFixed(1)} · Y ${car.y.toFixed(1)} m`;$('heading-text').textContent=String(Math.round(car.heading)%360).padStart(3,'0')+'°';$('steering-angle').textContent=(car.steer*180/Math.PI).toFixed(1)+'°';$('steering-indicator').style.transform=`rotate(${car.steer*180/Math.PI*3}deg)`;
   const touchingWall=!!car.wallContact&&moving,touchingTraffic=performance.now()<state.contactUntil;
@@ -614,13 +677,14 @@ function render(){const moving=car.speed>.01,braking=state.lastInput.brake>0&&mo
   document.querySelector('.road-awareness').classList.toggle('contact',touchingWall||touchingTraffic);
   document.querySelector('.traffic-awareness').classList.toggle('close',close);
   $('camera-panel').classList.toggle('wall-contact',touchingWall||touchingTraffic);
-  for(const button of document.querySelectorAll('[data-drive]')){button.classList.toggle('active',[...state.controls.values()].includes(button.dataset.drive));button.disabled=state.estop||!state.connected||!cameraReady;}const fps=state.connected&&!state.map?camera?.stats.fps:0;$('frame-rate').textContent=state.connected?`${fps||'—'} FPS`:'PAUSED';$('device-fps').textContent=fps?`${fps} FPS · ${camera.stats.backend}`:'画面暂停 / 测量中';const seconds=Math.floor((performance.now()-state.started)/1000);$('session-clock').textContent=String(Math.floor(seconds/60)).padStart(2,'0')+':'+String(seconds%60).padStart(2,'0');if(state.plan){$('task-action').disabled=state.plan.status==='ready'&&(state.estop||!state.connected||!cameraReady);let progress=state.plan.status==='completed'?1:state.plan.kind==='sequence'?state.plan.phase/state.plan.steps.length:state.plan.status==='running'&&!state.plan.motionStarted?0:state.plan.phase? .5+.5*(1-car.speed/Math.max(1,car.brakeStartSpeed)):state.plan.kind==='brake-test'?.5*Math.min(1,car.speed/effectiveTarget(state.plan.target,state.plan.gear)):.5*Math.min(1,(car.distance-state.plan.startDistance)/state.plan.distance);$('task-progress-fill').style.width=Math.max(0,Math.min(100,progress*100))+'%';}
+  for(const button of document.querySelectorAll('[data-drive]')){button.classList.toggle('active',[...state.controls.values()].includes(button.dataset.drive));button.disabled=state.estop||!state.connected||!cameraReady;}const fps=state.connected&&!state.map?camera?.stats.fps:0;$('frame-rate').textContent=state.connected?`${fps||'—'} FPS`:'PAUSED';$('device-fps').textContent=fps?`${fps} FPS · ${camera.stats.backend}`:'画面暂停 / 测量中';const seconds=Math.floor(state.collision?state.collision.sessionSeconds:(performance.now()-state.started)/1000);$('session-clock').textContent=String(Math.floor(seconds/60)).padStart(2,'0')+':'+String(seconds%60).padStart(2,'0');if(state.plan){$('task-action').disabled=state.plan.status==='ready'&&(state.estop||!state.connected||!cameraReady);let progress=state.plan.status==='completed'?1:state.plan.kind==='sequence'?state.plan.phase/state.plan.steps.length:state.plan.status==='running'&&!state.plan.motionStarted?0:state.plan.phase? .5+.5*(1-car.speed/Math.max(1,car.brakeStartSpeed)):state.plan.kind==='brake-test'?.5*Math.min(1,car.speed/effectiveTarget(state.plan.target,state.plan.gear)):.5*Math.min(1,(car.distance-state.plan.startDistance)/state.plan.distance);$('task-progress-fill').style.width=Math.max(0,Math.min(100,progress*100))+'%';}
+  renderCollision();
   if(state.map){const scale=.5,latest=car.y;const originY=260+latest*scale;$('map-origin').setAttribute('transform',`translate(320 ${originY})`);$('map-origin').style.display=originY>=0&&originY<=330?'':'none';$('route-trail').setAttribute('points',state.trail.filter(p=>p[1]>latest-480&&p[1]<latest+160).map(([x,y])=>`${320+x*8},${260-(y-latest)*scale}`).join(' '));$('map-rover').setAttribute('transform',`translate(${320+car.x*8} 260) rotate(${car.heading})`);}
 }
-function tick(now){if(!document.hidden){const elapsed=(now-lastFrame)/1000;lastFrame=now;if(elapsed>.5){if(car.speed>.01||state.controls.size||state.plan?.status==='running'||state.exitCruise||state.autodrive.active)failSafe('画面发生长时间停顿，自动接管制动');camera?.pause();}advanceElapsed(Math.min(Math.max(0,elapsed),60));const interval=1000/30;if(cameraReady&&state.connected&&!state.map&&now-lastCameraFrame>=interval){lastCameraFrame=now-((now-lastCameraFrame)%interval);const pose={...car,exitRoute:state.exitActive,localRoad:state.exitCompleted,emergencyLaneAlert:state.shoulderAlert,wet:state.wet,brakePrediction:state.predicted,brakeAnchor:state.brakeAnchor,traffic:trafficWorld.vehicles,roadSigns:state.exitCompleted?[]:traffic.signsAround(car.y)};if(camera.draw(pose,now)){$('camera-canvas').dataset.frame=String(camera.stats.frames);const seconds=(now-state.started)/1000;$('camera-live-clock').textContent=String(Math.floor(seconds/60)).padStart(2,'0')+':'+(seconds%60).toFixed(1).padStart(4,'0');}}if(now-lastRender>100){render();lastRender=now;}}requestAnimationFrame(tick);}
+function tick(now){if(!document.hidden){const elapsed=(now-lastFrame)/1000;lastFrame=now;if(elapsed>.5){if(car.speed>.01||state.controls.size||state.plan?.status==='running'||state.exitCruise||state.autodrive.active)failSafe('画面发生长时间停顿，自动接管制动');camera?.pause();}advanceElapsed(Math.min(Math.max(0,elapsed),60));const interval=1000/30;if(cameraReady&&state.connected&&!state.map&&(!state.collision||collisionFramePending)&&now-lastCameraFrame>=interval){lastCameraFrame=now-((now-lastCameraFrame)%interval);const pose={...car,exitRoute:state.exitActive,localRoad:state.exitCompleted,emergencyLaneAlert:state.shoulderAlert,wet:state.wet,brakePrediction:state.predicted,brakeAnchor:state.brakeAnchor,traffic:trafficWorld.vehicles,roadSigns:state.exitCompleted?[]:traffic.signsAround(car.y)};if(camera.draw(pose,now)){collisionFramePending=false;$('camera-canvas').dataset.frame=String(camera.stats.frames);const seconds=(now-state.started)/1000;$('camera-live-clock').textContent=state.collision?'碰撞暂停':String(Math.floor(seconds/60)).padStart(2,'0')+':'+(seconds%60).toFixed(1).padStart(4,'0');}}if(now-lastRender>100){render();lastRender=now;}}requestAnimationFrame(tick);}
 try{camera=window.RoverSimulator.createCamera($('camera-canvas'));cameraReady=true;}catch(error){$('camera-error').hidden=false;console.error(error);}
 window.addEventListener('rover-camera-lost',()=>{cameraReady=false;failSafe('画面丢失，继续全力制动');$('camera-error').hidden=false;});
 async function probeLocalService(){if(location.protocol==='file:')return;if(document.hidden){setTimeout(probeLocalService,2000);return;}const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),2000),started=performance.now();try{const response=await fetch('./health.json?t='+Math.floor(started),{method:'HEAD',cache:'no-store',signal:controller.signal});if(!response.ok)throw new Error();state.latency=performance.now()-started;}catch{state.latency=null;}finally{clearTimeout(timer);setTimeout(probeLocalService,2000);}}
-function readState(){const road=traffic.getSnapshot(trafficWorld,car);return {horn:{count:state.horn.count,status:state.horn.status,reason:state.horn.reason,vehicleId:state.horn.vehicleId,targetLane:state.horn.targetLane},autodrive:{active:state.autodrive.active,route:state.autodrive.route,status:state.autodrive.decision?.status||'idle',reason:state.autodrive.reason},roadType:currentRoadType(),exitCruise:state.exitCruise,road:state.exitCompleted?{type:'local',speedLimitKmh:50,solid:true,nextExit:null}:roadModel.getState(car.y),exit:state.exitActive?{...state.exitActive,completed:state.exitCompleted}:null,taskStep:state.plan?.kind==='sequence'?state.plan.steps[state.plan.phase]:null,taskWaiting:state.plan?.waitingReason||'',laneRecommendation:getLaneAdvice(),laneTarget:state.laneTarget,laneTargetName:state.exitCompleted?'普通道路本车道':laneName(state.laneTarget),laneChanging:state.laneChanging,emergencyLaneAlert:state.shoulderAlert,returningFromEmergencyLane:state.shoulderRecovery,gear:car.gear,requestedGear:state.requestedGear,signedSpeed:car.speed*(car.gear==='reverse'?-1:1),trafficDensity:state.trafficDensity,automaticSpeedLimit:true,autoLimitBraking:state.autoLimitBraking,effectiveTargetSpeed:effectiveTarget(state.autodrive.active?100:state.speedLimit),roadLimitKmh:Math.round(currentRoadCap()*3.6),overspeed:car.speed>currentRoadCap()+.01,trafficCount:road.vehicles.length,nearestAhead:road.nearestAhead,nearestBehind:road.nearestBehind,wallContact:car.wallContact,simulation:true,scenario:currentRoadType(),model:'simplified vehicle dynamics',connected:state.connected,emergencyBrake:state.estop,speed:car.speed,maxSpeed:100,targetSpeed:state.speedLimit,acceleration:car.acceleration,position:{x:car.x,y:car.y,heading:car.heading},distance:car.distance,braking:car.braking,brakeDistance:car.brakeDistance,lastBrakeDistance:car.lastBrakeDistance,predictedBrakingDistance:state.predicted,wet:state.wet,taskStatus:state.plan?.status||'none',cameraFps:camera?.stats.fps||0,localLatencyMs:state.latency};}
-if(document.modelContext?.registerTool){const lifecycle=new AbortController();const definitions=[{name:'change_rover_simulation_lane',title:'切换模拟车辆车道',description:'Request one adjacent lane through the same controls as the left/right buttons. Left/right refer to the road. Entering the right emergency shoulder triggers physical emergency braking.',inputSchema:{type:'object',properties:{direction:{type:'string',enum:['left','right']}},required:['direction'],additionalProperties:false},annotations:{readOnlyHint:false},execute(input){if(!input||!['left','right'].includes(input.direction))throw new Error('direction required');const accepted=requestLaneChange(input.direction==='left'?-1:1);if(accepted)switchMode('manual');return {accepted,...readState()};}},{name:'read_rover_simulation',title:'查看车辆物理模拟状态',description:'Read local highway physics, actual speed and physical braking distance. No real hardware.',inputSchema:{type:'object',properties:{},additionalProperties:false},annotations:{readOnlyHint:true},execute:readState},{name:'stage_rover_simulation_command',title:'准备高速模拟任务',description:'Stage a local highway simulation plan for confirmation. Brake commands apply deceleration immediately; they do not teleport speed to zero.',inputSchema:{type:'object',properties:{command:{type:'string',minLength:1,maxLength:240}},required:['command'],additionalProperties:false},annotations:{readOnlyHint:false},execute(input){if(!input||typeof input.command!=='string')throw new Error('command required');switchMode('ai');$('command-input').value=input.command;return submitCommand(input.command);}},{name:'emergency_stop_rover_simulation',title:'全力制动模拟车辆',description:'Latch full emergency brakes in the local simulation. Speed decreases physically over a nonzero braking distance. Does not immediately stop or control real hardware.',inputSchema:{type:'object',properties:{},additionalProperties:false},annotations:{readOnlyHint:false},execute(){emergencyStop();return readState();}}];for(const tool of definitions){try{Promise.resolve(document.modelContext.registerTool(tool,{signal:lifecycle.signal})).catch(()=>{});}catch{}}window.addEventListener('pagehide',()=>lifecycle.abort(),{once:true});}
+function readState(){const road=traffic.getSnapshot(trafficWorld,car);return {collision:state.collision?{...state.collision}:null,simulationPaused:!!state.collision,horn:{count:state.horn.count,status:state.horn.status,reason:state.horn.reason,vehicleId:state.horn.vehicleId,targetLane:state.horn.targetLane},autodrive:{active:state.autodrive.active,route:state.autodrive.route,status:state.autodrive.decision?.status||'idle',reason:state.autodrive.reason},roadType:currentRoadType(),exitCruise:state.exitCruise,road:state.exitCompleted?{type:'local',speedLimitKmh:50,solid:true,nextExit:null}:roadModel.getState(car.y),exit:state.exitActive?{...state.exitActive,completed:state.exitCompleted}:null,taskStep:state.plan?.kind==='sequence'?state.plan.steps[state.plan.phase]:null,taskWaiting:state.plan?.waitingReason||'',laneRecommendation:getLaneAdvice(),laneTarget:state.laneTarget,laneTargetName:state.exitCompleted?'普通道路本车道':laneName(state.laneTarget),laneChanging:state.laneChanging,emergencyLaneAlert:state.shoulderAlert,returningFromEmergencyLane:state.shoulderRecovery,gear:car.gear,requestedGear:state.requestedGear,signedSpeed:car.speed*(car.gear==='reverse'?-1:1),trafficDensity:state.trafficDensity,automaticSpeedLimit:true,autoLimitBraking:state.autoLimitBraking,effectiveTargetSpeed:effectiveTarget(state.autodrive.active?100:state.speedLimit),roadLimitKmh:Math.round(currentRoadCap()*3.6),overspeed:car.speed>currentRoadCap()+.01,trafficCount:road.vehicles.length,nearestAhead:road.nearestAhead,nearestBehind:road.nearestBehind,wallContact:car.wallContact,simulation:true,scenario:currentRoadType(),model:'simplified vehicle dynamics',connected:state.connected,emergencyBrake:state.estop,speed:car.speed,maxSpeed:100,targetSpeed:state.speedLimit,acceleration:car.acceleration,position:{x:car.x,y:car.y,heading:car.heading},distance:car.distance,braking:car.braking,brakeDistance:car.brakeDistance,lastBrakeDistance:car.lastBrakeDistance,predictedBrakingDistance:state.predicted,wet:state.wet,taskStatus:state.plan?.status||'none',cameraFps:camera?.stats.fps||0,localLatencyMs:state.latency};}
+if(document.modelContext?.registerTool){const lifecycle=new AbortController();const definitions=[{name:'change_rover_simulation_lane',title:'切换模拟车辆车道',description:'Request one adjacent lane through the same controls as the left/right buttons. Left/right refer to the road. Entering the right emergency shoulder triggers physical emergency braking.',inputSchema:{type:'object',properties:{direction:{type:'string',enum:['left','right']}},required:['direction'],additionalProperties:false},annotations:{readOnlyHint:false},execute(input){if(!input||!['left','right'].includes(input.direction))throw new Error('direction required');const accepted=requestLaneChange(input.direction==='left'?-1:1);if(accepted)switchMode('manual');return {accepted,...readState()};}},{name:'read_rover_simulation',title:'查看车辆物理模拟状态',description:'Read local highway physics, actual speed and physical braking distance. No real hardware.',inputSchema:{type:'object',properties:{},additionalProperties:false},annotations:{readOnlyHint:true},execute:readState},{name:'stage_rover_simulation_command',title:'准备高速模拟任务',description:'Stage a local highway simulation plan for confirmation. Brake commands apply deceleration immediately; they do not teleport speed to zero.',inputSchema:{type:'object',properties:{command:{type:'string',minLength:1,maxLength:240}},required:['command'],additionalProperties:false},annotations:{readOnlyHint:false},execute(input){if(!input||typeof input.command!=='string')throw new Error('command required');if(state.collision)return {status:'blocked',reason:'发生碰撞，请先重新开始'};switchMode('ai');$('command-input').value=input.command;return submitCommand(input.command);}},{name:'emergency_stop_rover_simulation',title:'全力制动模拟车辆',description:'Latch full emergency brakes in the local simulation. Speed decreases physically over a nonzero braking distance. Does not immediately stop or control real hardware.',inputSchema:{type:'object',properties:{},additionalProperties:false},annotations:{readOnlyHint:false},execute(){emergencyStop();return readState();}}];for(const tool of definitions){try{Promise.resolve(document.modelContext.registerTool(tool,{signal:lifecycle.signal})).catch(()=>{});}catch{}}window.addEventListener('pagehide',()=>lifecycle.abort(),{once:true});}
 log('车道辅助已就绪：左右点按自动变道居中，进入应急车道会紧急制动');render();requestAnimationFrame(tick);probeLocalService();

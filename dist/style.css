@@ -72,3 +72,16 @@
   .safety-inner .emergency-button,.safety-inner .reset-button{min-width:110px;max-width:110px;gap:5px;font-size:12px}
   .safety-state strong{font-size:12px}
 }
+
+/* Collision is a paused round, with an explicit touch-sized restart. */
+.collision-dialog{width:calc(100% - 32px);max-width:420px;max-height:calc(100dvh - 32px);margin:auto;padding:28px 24px 22px;overflow:auto;border:1px solid #785447;border-radius:22px;background:#1e2620;color:var(--text);box-shadow:0 24px 100px #0008;text-align:center}
+.collision-dialog::backdrop{background:#080e0cbb;backdrop-filter:blur(4px)}
+.collision-symbol{display:grid;place-items:center;width:56px;height:56px;margin:0 auto 16px;border:1px solid #956254;border-radius:17px;background:#3d2924;color:#ffc1a2}
+.collision-symbol .icon{width:28px;height:28px}.collision-eyebrow{font-size:11px;letter-spacing:2px;color:#d3a08a}
+.collision-dialog h2{font-size:28px;font-weight:600;margin:8px 0 12px;letter-spacing:1px}
+.collision-dialog p{font-size:13px;color:#acb9a8;line-height:1.8;margin:0;overflow-wrap:anywhere}
+.collision-metrics{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:22px 0;padding:17px 4px;border-top:1px solid #3c4537;border-bottom:1px solid #3c4537}
+.collision-metrics dt{font-size:11px;color:#95a28e}.collision-metrics dd{font:500 19px/1.5 ui-monospace,monospace;margin:5px 0 0;color:#e2e9d6;overflow-wrap:anywhere}
+#collision-restart{width:100%;min-height:50px;justify-content:center;touch-action:manipulation}
+.collision-dialog .collision-note{margin-top:15px;font-size:11px;color:#92a08b}.collision-ended{border-color:#cb8d73}
+@media(max-width:360px){.collision-dialog{padding:23px 18px 18px}.collision-dialog h2{font-size:25px}.collision-metrics dd{font-size:17px}}
