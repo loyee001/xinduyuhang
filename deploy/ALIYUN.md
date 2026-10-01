@@ -1,29 +1,62 @@
 # 阿里云静态部署记录
 
-2026-09-27 已发布：<http://39.97.244.43/rover/>。
+站点：<http://39.97.244.43/rover/>。服务器为 Alibaba Cloud Linux 3，使用已有 Caddy 和 HTTP 80 端口。入口 `/var/www/qdstorm/rover` 是指向同目录 `.rover-release.*` 发布目录的符号链接。网页全部在浏览器运行，不需要 Node.js、数据库或 ChatGPT 登录。
 
-- 服务器：39.97.244.43，Alibaba Cloud Linux 3。
-- 服务：现有 Caddy，使用已开放的 HTTP 80 端口。
-- 网页入口：`/var/www/qdstorm/rover`，符号链接指向同目录下独立的 `.rover-release.*` 发布目录。
-- 公开内容：`index.html`、`style.css`、`app.js`、`physics.js`、`simulator.js`、`health.json`。没有上传源码仓库、服务端环境文件、账号或数据库。
-- 运行方式：浏览器直接执行静态页面。无需 Node.js、构建、数据库、ChatGPT 登录或新增服务器。
-- 本次没有修改 Caddy 配置、其他站点、端口或安全组，也无需重载服务。
+## 当前版本更新流程（待执行）
 
-## 版本与验证
+本次自动驾驶与随机限速版本已准备更新流程；这里的命令和功能说明不表示已部署。完成实际发布和公网验证后，再追加真实的提交、目录与验证结果。
 
-使用 GitHub 提交 `c1cf90fdfe44c13d52e752c57f52ef0d8bf6d4d0` 的静态文件，将 4 处资源路径和 1 处健康检查路径改为相对路径，使根目录及 `/rover/` 子目录均可运行。安装过程先核验源归档 SHA-256，再核验调整后的全部 6 个文件，成功后才创建公开入口。
+当前公开文件共 11 个：`index.html`、`style.css`、`app.js`、`physics.js`、`road.js`、`traffic.js`、`lane-control.js`、`simulator.js`、`commands.js`、`autopilot.js`、`health.json`。只发布这 11 个静态文件；源仓库、测试、发布脚本、校验清单、服务器配置和凭证不放入公开目录。
 
-`aliyun-static-install.sh` 记录首次部署步骤，只适用于目标 `/rover` 尚不存在的情况。已有部署时脚本会直接停止，不会覆盖。后续更新应先准备并验证新的独立发布目录，再切换此站点的符号链接。
+### 1. 本地验证并固定提交
 
-公网验证通过：
+运行数值与界面检查，完成浏览器验证。代码最终确定后，在仓库根目录重新生成当前清单，并将清单、脚本和代码一起提交推送：
 
-- 6 个文件全部返回 HTTP 200，内容逐字节等于本地 `dist`，摘要见 `SHA256SUMS`。
-- `/rover` 自动以 HTTP 308 跳转到 `/rover/`。
-- 390 px 手机视口下内容宽度为 390 px，无水平溢出，实时画面约 30 FPS。
-- 线上完成 30 m/s 加速和全力制动试验，停车速度归零，实际刹车距离 52.38 m。
-- 浏览器没有 warn/error 日志。
+```sh
+node --test tests/*.test.cjs
+(
+  cd dist
+  shasum -a 256 index.html style.css app.js physics.js road.js traffic.js lane-control.js simulator.js commands.js autopilot.js health.json
+) > deploy/SHA256SUMS
+git rev-parse HEAD
+```
 
-## 维护
+记录推送后的完整 40 位提交 SHA。`deploy/SHA256SUMS` 必须与同一提交的 `dist` 一致，不能沿用旧版本清单。
+
+### 2. 在既有服务器下载并审查更新脚本
+
+以下命令在已授权的该服务器 root 终端中执行，将 `ROVER_COMMIT` 替换为已推送的完整 SHA。只接受固定仓库 `loyee001/xinduyuhang`：
+
+```sh
+ROVER_COMMIT='填写已推送的40位提交SHA'
+[[ $ROVER_COMMIT =~ ^[0-9a-f]{40}$ ]] || exit 1
+ROVER_RUN=$(mktemp -d /var/tmp/rover-run.XXXXXXXX)
+chmod 700 "$ROVER_RUN"
+curl --proto '=https' --tlsv1.2 -fL --retry 2 --connect-timeout 15 --max-time 120 \
+  "https://raw.githubusercontent.com/loyee001/xinduyuhang/$ROVER_COMMIT/deploy/aliyun-static-update.sh" \
+  -o "$ROVER_RUN/update.sh"
+bash -n "$ROVER_RUN/update.sh"
+cat "$ROVER_RUN/update.sh"
+```
+
+本机没有该 IP 的已登记 SSH 主机密钥；可以沿用已登录的 XTerminal 会话，不需要为此改动服务器 SSH 配置或部署凭证。
+
+### 3. 先检查，再发布
+
+```sh
+bash "$ROVER_RUN/update.sh" --check "$ROVER_COMMIT"
+bash "$ROVER_RUN/update.sh" "$ROVER_COMMIT"
+```
+
+`--check` 下载该提交的 GitHub 归档，验证站点入口及 Caddy 状态，严格检查提交内的 11 项清单、归档文件类型、文件名和逐文件 SHA-256。它只在私有 `/var/tmp/rover-update.*` 目录准备检查文件，不切换站点。
+
+正式发布使用 `/run/lock/rover-static-update.lock` 目录防止并行更新。现有入口必须是有效符号链接，解析后的目标必须是 `/var/www/qdstorm` 下的 `.rover-release.*` 目录；脚本不会覆盖普通文件、普通目录或其他站点的链接。新文件写入独立 release，全部验证后设置目录 `755`、文件 `644`，再通过同目录临时链接及 `mv -T` 原子替换入口。
+
+切换后，脚本通过本机 Caddy 的 `Host: 39.97.244.43` 逐项获取 11 个文件并核对摘要；健康请求失败、任何内容不一致或 Caddy 停止都会自动恢复旧链接。旧 release 始终保留。脚本不会修改 Caddy 配置、其他站点、端口或安全组，也不重载服务。
+
+成功输出 `ROVER_LIVE`、`RELEASE`、`PREVIOUS_RELEASE` 和 `RECORDS`。`RECORDS` 指向私有记录目录，其中保存提交 SHA、归档摘要、校验清单及新旧目录路径；保留此目录用于检查与回退。如果进程被无法捕获的信号中断，先检查现有链接及锁目录再处理，不要直接重复覆盖。
+
+### 4. 公网验证及回退
 
 ```sh
 readlink -f /var/www/qdstorm/rover
@@ -31,6 +64,16 @@ systemctl is-active caddy
 curl -fsS http://39.97.244.43/rover/health.json
 ```
 
-这个入口目前使用 HTTP。此模拟器没有登录、密钥或真实车辆连接。
+从公网核验全部 11 个资源的 HTTP 状态与摘要，验证 `/rover` 到 `/rover/` 的跳转，再检查自动驾驶启动、跟车、提前降限、受限变道、出口接入、停止与手动接管，以及手机布局和控制台错误。
 
-原 Sites 的本地部署配置已从版本库移除，备份保留在本机忽略目录 `.openai/hosting.sites-backup.json`，后续不要再使用 Sites 发布本项目。本次未删除此前创建的私有 Sites 站点。
+若公网功能验证失败，用发布输出记录的旧 release 恢复。先确认当前入口仍指向本次 `RELEASE`、旧目录确实位于同一站点根目录，再创建新的临时符号链接并原子替换；保留两个 release 以便调查。仅静态文件更新不需要重启 Caddy。
+
+## 首次部署历史：2026-09-27
+
+首次发布使用提交 `c1cf90fdfe44c13d52e752c57f52ef0d8bf6d4d0`，公开 6 个文件。部署时将四处资源路径及健康请求改成相对路径，使 `/rover/` 可用；现在源文件已经使用相对路径，无需发布时改写。
+
+当时验证通过：6 文件均 HTTP 200，`/rover` 返回 308 跳转；390 px 手机布局无横向溢出，约 30 FPS；30 m/s 制动试验停稳，实测 52.38 m；浏览器无 warn/error。此处只描述首次版本，不代表当前功能已上线。
+
+`aliyun-static-install.sh` 保留首次安装过程及其固定校验值，只适用于 `/rover` 不存在时，不能用于后续更新。`SHA256SUMS` 则用于当前待发布提交，由发布者随最终静态文件重新生成。
+
+此入口目前使用 HTTP，模拟器没有登录、密钥或真实车辆连接。旧 Sites 配置的本机备份仍在忽略目录 `.openai/hosting.sites-backup.json`；本项目后续继续使用阿里云，不使用 Sites 发布。
