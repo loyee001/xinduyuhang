@@ -2,11 +2,24 @@
 
 站点：<http://39.97.244.43/rover/>。服务器为 Alibaba Cloud Linux 3，使用已有 Caddy 和 HTTP 80 端口。入口 `/var/www/qdstorm/rover` 是指向同目录 `.rover-release.*` 发布目录的符号链接。网页全部在浏览器运行，不需要 Node.js、数据库或 ChatGPT 登录。
 
-## 当前版本更新流程（待执行）
+## 当前发布：2026-10-01
 
-本次自动驾驶与随机限速版本已准备更新流程；这里的命令和功能说明不表示已部署。完成实际发布和公网验证后，再追加真实的提交、目录与验证结果。
+自动驾驶与随机限速版本已发布，对应 GitHub 提交 [`d6632e2d940e33f7d18fd5149cdd38c33932e6da`](https://github.com/loyee001/xinduyuhang/commit/d6632e2d940e33f7d18fd5149cdd38c33932e6da)。此次发布同时包含之前在本地完成的车流、倒车、推荐变道、出口匝道与普通道路功能。
 
 当前公开文件共 11 个：`index.html`、`style.css`、`app.js`、`physics.js`、`road.js`、`traffic.js`、`lane-control.js`、`simulator.js`、`commands.js`、`autopilot.js`、`health.json`。只发布这 11 个静态文件；源仓库、测试、发布脚本、校验清单、服务器配置和凭证不放入公开目录。
+
+- 184 项自动测试通过。
+- 服务器发布脚本对 11 个文件分别输出 `VERIFIED` 和 `HTTP_VERIFIED`，成功输出 `ROVER_LIVE`；归档文件和 Caddy 提供的内容均通过发布清单 SHA-256 校验。
+- 公网再次下载全部 11 个文件，内容摘要全部与 `deploy/SHA256SUMS` 一致。
+- 线上浏览器完成自动驶离测试：从 0 m 自动起步并靠右，按 40 km/h 匝道限速驶离高速，再进入普通道路继续行驶 126 m，车速 50 km/h，自动驾驶保持运行。实测画面 30 FPS。
+- 320 px、390 px 手机视口下 `scrollWidth` 均等于 `innerWidth`，无横向溢出；浏览器控制台没有 warn/error。
+- 当前发布目录：`/var/www/qdstorm/.rover-release.heqWtP9o`，由 `/var/www/qdstorm/rover` 链接指向。
+- 发布记录目录：`/var/tmp/rover-update.WYBJOUy5`，其中 `new-release.txt` 保存本次 release 路径，`previous-release.txt` 保存回退目标。
+- 旧目录 `/var/www/qdstorm/.rover-release.u8vkBtN0` 已保留。本次只原子切换 Rover 的符号链接，没有修改或重载共享 Caddy。
+
+以上为本次已完成的测试和发布验证；下方首次发布的数据单独保留为历史记录。
+
+## 后续更新流程
 
 ### 1. 本地验证并固定提交
 
@@ -72,8 +85,8 @@ curl -fsS http://39.97.244.43/rover/health.json
 
 首次发布使用提交 `c1cf90fdfe44c13d52e752c57f52ef0d8bf6d4d0`，公开 6 个文件。部署时将四处资源路径及健康请求改成相对路径，使 `/rover/` 可用；现在源文件已经使用相对路径，无需发布时改写。
 
-当时验证通过：6 文件均 HTTP 200，`/rover` 返回 308 跳转；390 px 手机布局无横向溢出，约 30 FPS；30 m/s 制动试验停稳，实测 52.38 m；浏览器无 warn/error。此处只描述首次版本，不代表当前功能已上线。
+当时验证通过：6 文件均 HTTP 200，`/rover` 返回 308 跳转；390 px 手机布局无横向溢出，约 30 FPS；30 m/s 制动试验停稳，实测 52.38 m；浏览器无 warn/error。此处只描述首次版本，当前发布的验证结果见本文开头。
 
-`aliyun-static-install.sh` 保留首次安装过程及其固定校验值，只适用于 `/rover` 不存在时，不能用于后续更新。`SHA256SUMS` 则用于当前待发布提交，由发布者随最终静态文件重新生成。
+`aliyun-static-install.sh` 保留首次安装过程及其固定校验值，只适用于 `/rover` 不存在时，不能用于后续更新。`SHA256SUMS` 对应当前发布的 11 个静态文件，后续发布时应随最终代码重新生成并提交。
 
 此入口目前使用 HTTP，模拟器没有登录、密钥或真实车辆连接。旧 Sites 配置的本机备份仍在忽略目录 `.openai/hosting.sites-backup.json`；本项目后续继续使用阿里云，不使用 Sites 发布。
