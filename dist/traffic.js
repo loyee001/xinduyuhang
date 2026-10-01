@@ -8,7 +8,8 @@
 
   const constants = Object.freeze({ laneWidth: 3.75, zoneLength: 1000, signSpacing: 500,
     recycleDistance: 2050, spawnDistance: 1750, minGap: 3, headway: 1.5, maxSubstep: 1 / 30,
-    guardrailCenter: 6.45, guardrailLeft: -6.45, guardrailRight: 7.95 });
+    guardrailCenter: 6.45, guardrailLeft: -6.45, guardrailRight: 7.95,
+    hornRange: 100, hornCooldown: 2.5, yieldSeconds: 4 });
   const densityPresets = Object.freeze({
     low: Object.freeze({ label: '较少', countPerLane: 7, vehicleCount: 42, spacing: 590, headway: 1.8,
       speedFactor: 1, recycleDistance: 2200, spawnDistance: 1900 }),
@@ -101,7 +102,7 @@
         const y = egoY + base + row * preset.spacing + offsets[lane];
         const cruiseFactor = (lane % 3 === 0 ? .94 : lane % 3 === 1 ? .86 : .77) - (truck ? .09 : 0) + (id % 3) * .015;
         const direction = directionFor(world,lane);
-        laneVehicles.push({ id, lane, x: laneCenters[lane], y, previousY: y, direction,
+        laneVehicles.push({ id, lane, x: laneCenters[lane], previousX: laneCenters[lane], y, previousY: y, direction,
           heading: direction > 0 ? 0 : 180, speed: limitFor(world,y) / 3.6 * cruiseFactor * preset.speedFactor, cruiseFactor,
           length: truck ? 8.4 : 4.5, width: truck ? 2.35 : 1.85, height: truck ? 3.2 : 1.5,
           kind: truck ? 'truck' : 'car', color: paint[id % paint.length], braking: false });
@@ -125,12 +126,135 @@
     world.density = next;
     populate(world, ego);
     world.lastContact = null;
+    world.hornUntil = 0;
+    world.lastYield = null;
     return world;
   }
   function egoExtents(ego) {
     const angle = finite(ego.heading) * Math.PI / 180;
     return { x: .93 * Math.abs(Math.cos(angle)) + 2.25 * Math.abs(Math.sin(angle)),
       y: 2.25 * Math.abs(Math.cos(angle)) + .93 * Math.abs(Math.sin(angle)) };
+  }
+  function vehicleExtents(vehicle, heading = vehicle.heading) {
+    const angle = finite(heading) * Math.PI / 180;
+    return { x:vehicle.width / 2 * Math.abs(Math.cos(angle)) + vehicle.length / 2 * Math.abs(Math.sin(angle)),
+      y:vehicle.length / 2 * Math.abs(Math.cos(angle)) + vehicle.width / 2 * Math.abs(Math.sin(angle)) };
+  }
+  const occupiedLanes = vehicle => vehicle.laneChange ?
+    [vehicle.laneChange.fromLane, vehicle.laneChange.targetLane] : [vehicle.lane];
+  const overlapsCorridor = (vehicle, x, halfWidth = .93, margin = 0) =>
+    Math.abs(vehicle.x - x) < halfWidth + vehicleExtents(vehicle).x + margin ||
+    Boolean(vehicle.laneChange && occupiedLanes(vehicle).some(lane =>
+      Math.abs(lanes[lane] - x) < halfWidth + vehicle.width / 2 + margin));
+  function yieldLaneSafe(world, vehicle, ego, lane, wet, horizon) {
+    const speed = Math.max(0, vehicle.speed), headway = wet ? 1.6 : 1.1;
+    const halfLength = vehicle.length / 2;
+    const obstacles = world.vehicles.filter(other => other !== vehicle &&
+      overlapsCorridor(other, lanes[lane], vehicle.width / 2, .2));
+    const extent = egoExtents(ego);
+    if (Math.abs(finite(ego.x) - lanes[lane]) < extent.x + vehicle.width / 2 + .2)
+      obstacles.push({ y:finite(ego.y), length:extent.y * 2,
+        speed:travelDirection(ego) * Math.max(0, finite(ego.speed)) * Math.cos(finite(ego.heading) * Math.PI / 180), direction:1 });
+    for (const other of obstacles) {
+      const offset = other.y - vehicle.y, gap = Math.abs(offset) - halfLength - other.length / 2;
+      const otherSpeed = other.speed * other.direction;
+      if (gap < 5) return false;
+      if (offset >= 0) {
+        // Reserve acceleration room; following control still caps acceleration
+        // against both lanes while the full vehicle leaves the source lane.
+        const future = gap + (otherSpeed - speed) * horizon - .8 * horizon * horizon;
+        if (gap < Math.max(10, speed * headway) || future < Math.max(8, speed * .7)) return false;
+      } else {
+        // Do not count on our acceleration, or on a fast rear car braking.
+        const future = gap + (speed - otherSpeed) * horizon - .8 * horizon * horizon;
+        if (gap < Math.max(8, otherSpeed * headway) || future < Math.max(7, otherSpeed * .65)) return false;
+      }
+    }
+    return true;
+  }
+  function yieldRoadAllowed(check, vehicle, reservedDistance = null) {
+    if (typeof check !== 'function') return false;
+    const upperSpeed = Math.max(vehicle.speed, Math.min(limitAt(vehicle.y) / 3.6, vehicle.speed + 8));
+    // RoverRoad reserves eight seconds. A distance budget during an ongoing
+    // turn includes both its unfinished path and a full stop before a solid.
+    const speed = reservedDistance === null ? vehicle.speed : Math.max(0, reservedDistance) / 8;
+    const targetSpeed = reservedDistance === null ? upperSpeed : speed;
+    const result = check(vehicle.y, { speed, gear:'forward', targetSpeed });
+    return result === true || result?.allowed === true;
+  }
+  function requestYield(world, ego = {}, { wet = false, roadType = 'highway', canChangeLane } = {}) {
+    const answer = (status, reason, vehicle, targetLane) => ({ status, reason,
+      ...(vehicle ? { vehicleId:vehicle.id } : {}), ...(Number.isInteger(targetLane) ? { targetLane } : {}) });
+    if (!world || !Array.isArray(world.vehicles)) return answer('unavailable', '车流尚未就绪');
+    if (isLocal(world) || roadType !== 'highway') return answer('unavailable', '当前道路没有可安全避让的同向车道');
+    if (ego.gear === 'reverse' || ![ego.x, ego.y].every(Number.isFinite) ||
+      Math.abs(finite(ego.heading)) > 8 || !lanes.slice(0, 3).some(x => Math.abs(x - ego.x) < .8))
+      return answer('unavailable', '请在正常行车道内向前行驶时鸣笛');
+    if (typeof canChangeLane !== 'function') return answer('unavailable', '路况信息未就绪，前车保持车道');
+    if (finite(world.elapsedTime) < finite(world.hornUntil)) return answer('cooldown', '请稍候再鸣笛，给前车留出反应时间');
+    world.hornUntil = finite(world.elapsedTime) + constants.hornCooldown;
+    const extent = egoExtents(ego);
+    const lead = world.vehicles.filter(vehicle => vehicle.direction === 1 && vehicle.lane >= 0 && vehicle.lane <= 2 &&
+      vehicle.y > ego.y && vehicle.y - ego.y - vehicle.length / 2 - extent.y <= constants.hornRange &&
+      overlapsCorridor(vehicle, ego.x, extent.x)).sort((a, b) => a.y - b.y)[0];
+    if (!lead) return answer('unavailable', '前方 100 米内没有可提醒的同向车辆');
+    if (lead.speed < 2) return answer('blocked', '前车车速较低，起步并有足够空间后才能安全避让', lead);
+    if (lead.laneChange || finite(lead.yieldCooldownUntil) > finite(world.elapsedTime))
+      return answer('cooldown', '前车正在避让或刚完成变道，请保持安全距离', lead);
+    if (!yieldRoadAllowed(canChangeLane, lead)) return answer('blocked', '前车处于实线或临近实线路段，暂时无法避让', lead);
+    const duration = constants.yieldSeconds + (wet ? 1 : 0);
+    if (!yieldLaneSafe(world, lead, ego, lead.lane, wet, duration))
+      return answer('blocked', '前车当前车道间距不足，请先保持安全距离', lead);
+    const target = [lead.lane + 1, lead.lane - 1].find(lane => lane >= 0 && lane <= 2 &&
+      yieldLaneSafe(world, lead, ego, lane, wet, duration));
+    if (!Number.isInteger(target)) return answer('blocked', '相邻车道没有安全间隙，前车继续保持车道', lead);
+    lead.laneChange = { fromLane:lead.lane, targetLane:target, startX:lead.x,
+      endX:lanes[target], progress:0, duration, referenceSpeed:Math.max(12, lead.speed), wet, canChangeLane, status:'moving' };
+    lead.yieldCooldownUntil = finite(world.elapsedTime) + duration + 8;
+    const result = answer('yielding', `前车收到鸣笛，正在向${target > lead.lane ? '右' : '左'}安全避让`, lead, target);
+    world.lastYield = result;
+    return result;
+  }
+  function advanceYield(world, vehicle, ego, dt) {
+    const turn = vehicle.laneChange;
+    if (!turn) return;
+    const remaining = (1 - turn.progress) * turn.duration;
+    const destination = turn.returning ? turn.fromLane : turn.targetLane;
+    const horizon = Math.min(8, remaining * turn.referenceSpeed / Math.max(2, vehicle.speed));
+    const safe = yieldLaneSafe(world, vehicle, ego, destination, turn.wet, horizon);
+    // Reserving completion + stopping travel prevents a paused turn from
+    // consuming all road space before a solid and becoming stranded there.
+    const completionTravel = remaining * Math.max(turn.referenceSpeed, vehicle.speed);
+    const stoppingTravel = vehicle.speed * vehicle.speed / 8 + Math.max(5, vehicle.speed * .5);
+    const legal = yieldRoadAllowed(turn.canChangeLane, vehicle, completionTravel + stoppingTravel);
+    if (!safe || !legal) {
+      // An early change can return only after checking the entire source
+      // corridor. Otherwise hold lateral position and brake in both lanes.
+      if (!turn.returning && turn.progress > 0 && turn.progress < .45 && legal &&
+        yieldLaneSafe(world, vehicle, ego, turn.fromLane, turn.wet, Math.max(1.5, turn.progress * turn.duration))) {
+        turn.returning = true;
+        turn.startX = vehicle.x; turn.endX = lanes[turn.fromLane];
+        turn.duration = Math.max(1.5, turn.progress * turn.duration); turn.progress = 0;
+        turn.status = 'returning';
+      } else {
+        turn.status = 'waiting'; vehicle.heading = 0; return;
+      }
+    }
+    turn.status = turn.returning ? 'returning' : 'moving';
+    const beforeX = vehicle.x;
+    // A stopped car cannot translate sideways. Tie turn progress to forward
+    // travel; the 12 m/s reference bounds yaw to about seven degrees even
+    // while a previously moving car slows almost to rest.
+    const progressRate = vehicle.speed < 2 ? 0 : Math.min(1, vehicle.speed / turn.referenceSpeed);
+    turn.progress = Math.min(1, turn.progress + dt / turn.duration * progressRate);
+    const t = turn.progress, eased = t * t * (3 - 2 * t);
+    vehicle.x = turn.startX + (turn.endX - turn.startX) * eased;
+    vehicle.heading = Math.atan2((vehicle.x - beforeX) / dt, Math.max(.001, vehicle.speed)) * 180 / Math.PI;
+    if (t >= 1) {
+      vehicle.lane = turn.returning ? turn.fromLane : turn.targetLane;
+      vehicle.x = lanes[vehicle.lane]; vehicle.heading = 0;
+      vehicle.laneChange = null;
+    }
   }
   function recycle(world, ego) {
     const preset = presetFor(world);
@@ -144,10 +268,14 @@
       let candidate = ego.y + side * preset.spawnDistance;
       let attempts = 0;
       const clearGap = Math.min(85, preset.spacing * .6), stride = clearGap + 10;
-      while (world.vehicles.some(other => other !== vehicle && other.lane === vehicle.lane &&
+      while (world.vehicles.some(other => other !== vehicle && occupiedLanes(other).includes(vehicle.lane) &&
         Math.abs(other.y - candidate) < clearGap + (vehicle.length + other.length) / 2) && attempts++ < 40) candidate += side * stride;
       if (attempts > 40) continue;
       vehicle.y = vehicle.previousY = candidate;
+      vehicle.laneChange = null;
+      vehicle.x = vehicle.previousX = lanesFor(world)[vehicle.lane];
+      vehicle.heading = vehicle.previousHeading = vehicle.direction > 0 ? 0 : 180;
+      vehicle.yieldCooldownUntil = 0;
       vehicle.speed = limitFor(world,candidate) / 3.6 * vehicle.cruiseFactor * preset.speedFactor;
       vehicle.braking = false;
     }
@@ -159,22 +287,35 @@
     const egoForwardSpeed = travelDirection(ego) * finite(ego.speed) * Math.cos(finite(ego.heading) * Math.PI / 180);
     const preset = presetFor(world);
     const substeps = Math.ceil(Math.min(dt, 10) / constants.maxSubstep), subDt = Math.min(dt, 10) / substeps;
-    for (const vehicle of world.vehicles) vehicle.previousY = vehicle.y;
-    const laneGroups = lanesFor(world).map((_, lane) => world.vehicles.filter(v => v.lane === lane));
+    for (const vehicle of world.vehicles) {
+      vehicle.previousY = vehicle.y; vehicle.previousX = vehicle.x; vehicle.previousHeading = vehicle.heading;
+    }
     for (let i = 0; i < substeps; i++) {
-      for (const group of laneGroups) {
-        if (!group.length) continue;
-        const direction = group[0].direction;
-        group.sort((a, b) => direction * (b.y - a.y));
-        let leader = null;
-        for (const vehicle of group) {
+      for (const vehicle of world.vehicles) advanceYield(world, vehicle, ego, subDt);
+      // A turning car occupies both lanes until centered. Build predecessor
+      // lists once per substep, then move every car exactly once, front first.
+      const leaders = new Map();
+      for (let lane = 0; lane < lanesFor(world).length; lane++) {
+        const direction = directionFor(world, lane);
+        const group = world.vehicles.filter(vehicle => occupiedLanes(vehicle).includes(lane))
+          .sort((a, b) => direction * (b.y - a.y));
+        for (let j = 1; j < group.length; j++) {
+          const list = leaders.get(group[j]) || [];
+          list.push(group[j-1]); leaders.set(group[j], list);
+        }
+      }
+      const ordered = world.vehicles.slice().sort((a, b) => b.direction - a.direction || a.direction * (b.y - a.y));
+      for (const vehicle of ordered) {
+          const direction = vehicle.direction;
           let gap = Infinity, leaderSpeed = 0, stopAt = null;
-          if (leader) {
-            gap = direction * (leader.y - vehicle.y) - (vehicle.length + leader.length) / 2;
-            leaderSpeed = leader.speed;
-            stopAt = leader.y - direction * ((vehicle.length + leader.length) / 2 + constants.minGap);
+          for (const leader of leaders.get(vehicle) || []) {
+            const candidateGap = direction * (leader.y - vehicle.y) - (vehicle.length + leader.length) / 2;
+            if (candidateGap < gap) {
+              gap = candidateGap; leaderSpeed = leader.speed;
+              stopAt = leader.y - direction * ((vehicle.length + leader.length) / 2 + constants.minGap);
+            }
           }
-          if (Math.abs(vehicle.x - egoX) < vehicle.width / 2 + extent.x + .2 &&
+          if (overlapsCorridor(vehicle, egoX, extent.x, .2) &&
             direction * (egoY - vehicle.y) > 0) {
             const egoGap = direction * (egoY - vehicle.y) - vehicle.length / 2 - extent.y;
             if (egoGap < gap) {
@@ -184,6 +325,7 @@
           }
           const roadSpeed = Math.min(limitFor(world,vehicle.y), limitFor(world,vehicle.y + direction * 95)) / 3.6;
           let desired = roadSpeed * vehicle.cruiseFactor * preset.speedFactor;
+          if (vehicle.laneChange?.status === 'waiting') desired = 0;
           if (Number.isFinite(gap)) {
             // A stopping-distance + time-headway bound makes a slow queue
             // stable, including when the player's car is standing still.
@@ -204,8 +346,6 @@
             vehicle.y = startY + direction * Math.max(0, direction * (stopAt - startY));
             vehicle.speed = Math.min(vehicle.speed, leaderSpeed);
           }
-          leader = vehicle;
-        }
       }
       world.elapsedTime += subDt;
     }
@@ -216,7 +356,7 @@
     const x = finite(ego.x), y = finite(ego.y), extent = egoExtents(ego);
     let nearestAhead = null, nearestBehind = null;
     for (const vehicle of world.vehicles) {
-      if (vehicle.direction !== 1 || Math.abs(vehicle.x - x) >= vehicle.width / 2 + extent.x) continue;
+      if (vehicle.direction !== 1 || !overlapsCorridor(vehicle, x, extent.x)) continue;
       const distance = Math.max(0, Math.abs(vehicle.y - y) - vehicle.length / 2 - extent.y);
       const item = { id: vehicle.id, lane: vehicle.lane, distance, speedKmh: vehicle.speed * 3.6 };
       if (vehicle.y >= y && (!nearestAhead || distance < nearestAhead.distance)) nearestAhead = item;
@@ -267,7 +407,7 @@
       // must not be hidden by a nearer slower one in the same lane.
       for (const v of vehicles) {
         if (![v.x, v.y].every(Number.isFinite) ||
-          Math.abs(v.x - lanes[lane]) >= extent.x + Math.max(.5, finite(v.width, 1.85)) / 2 + .15) continue;
+          !overlapsCorridor(v, lanes[lane], extent.x, .15)) continue;
         const carSpeed = Math.max(0, finite(v.speed)) * (v.direction === -1 ? -1 : 1);
         const offset = v.y - y, halfLength = extent.y + Math.max(1, finite(v.length, 4.5)) / 2;
         const gap = Math.abs(offset) - halfLength;
@@ -333,15 +473,18 @@
   // Swept relative AABB collision catches high-speed crossings between frames.
   // This intentionally small arcade contact model does not operate controls
   // or emergency-stop state. It corrects motion/brake measurements when a
-  // collision truncates the physics step. NPCs stay in their lanes.
+  // collision truncates the physics step, including NPC lateral movement.
   function resolveContact(world, ego, previousPose) {
     if (!world || !ego || ![ego.x, ego.y, ego.speed].every(Number.isFinite)) return null;
     const previous = previousPose && [previousPose.x, previousPose.y].every(Number.isFinite) ? previousPose : ego;
     const extent = egoExtents(ego), contacts = [];
     for (const v of world.vehicles) {
-      const halfX = extent.x + v.width / 2, halfY = extent.y + v.length / 2;
-      const sx = previous.x - v.x, sy = previous.y - finite(v.previousY, v.y);
-      const dx = ego.x - previous.x, dy = ego.y - previous.y - (v.y - finite(v.previousY, v.y));
+      const npcExtent = vehicleExtents(v), previousExtent = vehicleExtents(v, finite(v.previousHeading, v.heading));
+      const halfX = extent.x + Math.max(npcExtent.x, previousExtent.x);
+      const halfY = extent.y + Math.max(npcExtent.y, previousExtent.y);
+      const sx = previous.x - finite(v.previousX, v.x), sy = previous.y - finite(v.previousY, v.y);
+      const dx = ego.x - previous.x - (v.x - finite(v.previousX, v.x));
+      const dy = ego.y - previous.y - (v.y - finite(v.previousY, v.y));
       let enter = 0, exit = 1, axis = 'y';
       let hit = true;
       for (const [start, delta, half, name] of [[sx, dx, halfX, 'x'], [sy, dy, halfY, 'y']]) {
@@ -406,5 +549,5 @@
       signedSpeed * Math.cos(angle) - v.direction * v.speed), side: hit.axis === 'x' };
   }
   return Object.freeze({ constants, densityPresets, createState, setDensity, step, limitAt, nextLimit, signsAround, getSnapshot,
-    getLaneRecommendation, resolveContact });
+    getLaneRecommendation, requestYield, resolveContact });
 });

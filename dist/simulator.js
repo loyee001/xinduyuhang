@@ -417,6 +417,22 @@
     disc(target,x,3.55,z-.028,.71,COLORS.white);
     lettering(target,String(sign.limitKmh),x,3.28,z-.035,.55,rgb('#26363b'));
   }
+  function placeVehicleMesh(target,source,x,z,sin,cos,includeFaces) {
+    if (includeFaces) {
+      for (const face of source.faces) {
+        const points = face.points.map(p => [x+p[0]*cos+p[2]*sin,p[1],z-p[0]*sin+p[2]*cos]);
+        // Rigid rotation preserves each face's color and bounding radius.
+        target.faces.push({ ...face, points, x:x+face.x*cos+face.z*sin, z:z-face.x*sin+face.z*cos });
+      }
+    } else {
+      // WebGL only needs packed triangle vertices, including their yaw.
+      const vertices = source.vertices;
+      for (let i = 0; i < vertices.length; i += 7) {
+        target.vertices.push(x+vertices[i]*cos+vertices[i+2]*sin,vertices[i+1],z-vertices[i]*sin+vertices[i+2]*cos,
+          vertices[i+3],vertices[i+4],vertices[i+5],vertices[i+6]);
+      }
+    }
+  }
   function buildTraffic(pose,origin,stats,includeFaces) {
     const heading = viewHeading(pose)*Math.PI/180;
     const target = mesh(), sin = Math.sin(heading), cos = Math.cos(heading);
@@ -433,24 +449,13 @@
       if (depth+margin < NEAR || depth-margin > ROAD.far || Math.abs(side) > Math.max(12,depth*1.4)+margin) continue;
       stats.visibleTraffic++;
       const template = buildVehicleTemplate(vehicle,depth < 260 ? 2 : depth < 500 ? 1 : 0);
-      const direction = vehicle.direction < 0 ? -1 : 1, z = vehicle.y-origin;
-      if (includeFaces) {
-        for (const face of template.faces) {
-          const points = face.points.map(p => [vehicle.x+p[0]*direction,p[1],z+p[2]*direction]);
-          // A rigid translation/half turn preserves color and radius.
-          target.faces.push({ ...face, points, x: vehicle.x+face.x*direction, z: z+face.z*direction });
-        }
-      } else {
-        // WebGL only needs the packed triangle vertices. Avoid constructing
-        // thousands of short-lived face/point arrays for the software path.
-        const vertices = template.vertices;
-        for (let i = 0; i < vertices.length; i += 7) {
-          target.vertices.push(vehicle.x+vertices[i]*direction,vertices[i+1],z+vertices[i+2]*direction,
-            vertices[i+3],vertices[i+4],vertices[i+5],vertices[i+6]);
-        }
-      }
+      const yaw = (Number.isFinite(vehicle.heading) ? vehicle.heading : vehicle.direction < 0 ? 180 : 0)*Math.PI/180;
+      const vehicleSin = Math.sin(yaw), vehicleCos = Math.cos(yaw), z = vehicle.y-origin;
+      placeVehicleMesh(target,template,vehicle.x,z,vehicleSin,vehicleCos,includeFaces);
       if (vehicle.braking && depth < 130) {
-        for (const side of [-1,1]) box(target,vehicle.x+side*vehicle.width*.34,.62,z-direction*(vehicle.length/2+.022),.4,.21,.024,rgb('#ff7155'));
+        const lamps = mesh();
+        for (const side of [-1,1]) box(lamps,side*vehicle.width*.34,.62,-(vehicle.length/2+.022),.4,.21,.024,rgb('#ff7155'));
+        placeVehicleMesh(target,lamps,vehicle.x,z,vehicleSin,vehicleCos,includeFaces);
       }
     }
     const signs = pose.localRoad ? [] : pose.roadSigns || window.RoverTraffic?.signsAround(pose.y) || [];

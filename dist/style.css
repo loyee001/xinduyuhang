@@ -47,3 +47,28 @@
 .mode-tabs .mode-tab{gap:5px;white-space:nowrap;font-size:13px;min-width:0}.mode-tabs .mode-tab .icon{width:16px;height:16px}
 .auto-intro{padding:24px 0 16px}.auto-pill{font-size:10px;letter-spacing:1.4px;color:var(--lime)}.auto-intro h2{font-size:23px;font-weight:550;margin:10px 0}.auto-intro p,.auto-note{color:var(--muted);font-size:12px;line-height:1.8;margin:0}.auto-route-label{font-size:12px;color:var(--muted);margin-bottom:9px}.auto-routes{display:grid;grid-template-columns:1fr 1fr;gap:9px}.auto-routes button{padding:14px 10px;border:1px solid var(--border);border-radius:11px;background:#151f18;text-align:left;min-height:107px}.auto-routes button.selected{border-color:#9bb662;background:#29351f}.auto-routes i{color:var(--lime);margin-bottom:7px}.auto-routes strong,.auto-routes small{display:block}.auto-routes strong{font-size:13px;font-weight:550}.auto-routes small{font-size:10px;line-height:1.6;color:var(--muted);margin-top:5px}.auto-status{margin:18px 0 14px;padding:14px 12px;background:#141d17;border:1px solid var(--border);border-radius:11px;display:flex;gap:10px}.auto-status strong{font-size:14px;font-weight:550}.auto-status p{margin:5px 0 0;color:var(--muted);font-size:12px;line-height:1.7}.auto-indicator{width:7px;height:7px;flex:0 0 7px;background:#75846d;border-radius:50%;margin-top:7px}.auto-status.active .auto-indicator{background:var(--lime);box-shadow:0 0 0 4px #d3fa7612}.auto-controls{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:0 0 18px}.auto-controls>span{font-size:11px;color:var(--muted)}.auto-controls strong{display:block;font-size:13px;font-weight:500;color:var(--text);margin-top:4px}.auto-note{margin:14px 0 3px;font-size:11px}#auto-start{width:100%;min-height:48px}#auto-stop{margin-top:0}
 @media(max-width:360px){.mode-tabs .mode-tab{font-size:12px;gap:3px}.mode-tabs .mode-tab .icon{width:14px;height:14px}.auto-routes button{padding:12px 8px}.auto-routes strong{font-size:12px}.auto-intro h2{font-size:21px}}
+/* A thumb-accessible horn stays beside braking in every driving mode. */
+.horn-button{display:flex;align-items:center;justify-content:center;gap:8px;flex-shrink:0;min-width:90px;min-height:49px;padding:8px 12px;border:1px solid #69734d;border-radius:10px;background:#2b3424;color:#d3fa76;font:inherit;font-size:14px;cursor:pointer;touch-action:manipulation}
+.horn-button .icon{width:22px;height:22px}
+.horn-button:hover,.horn-button.sounding{background:#475735;border-color:#d3fa76}
+.horn-button:disabled,.horn-button[aria-disabled="true"]{opacity:.55;cursor:default}
+.horn-button.sounding{opacity:1}
+.horn-button:focus-visible{outline:2px solid #d3fa76;outline-offset:3px}
+.safety-inner .safety-state{flex:1}
+.horn-feedback{display:flex;align-items:flex-start;gap:10px;padding:12px 14px;margin-top:12px;background:#19211a;border:1px solid #333e2c;border-radius:12px;color:#a8b29c}
+.horn-feedback>i{margin-top:2px;flex-shrink:0;color:#d3fa76}
+.horn-feedback strong{font-size:13px;font-weight:500;color:#d9e4cd}
+.horn-feedback p{margin:3px 0 0;font-size:12px;line-height:1.65}
+.horn-feedback[data-status="yielding"],.horn-feedback[data-status="completed"]{border-color:#657849}
+@media(max-width:760px){
+  .safety-inner{gap:8px}
+  .safety-inner .safety-symbol{display:none}
+  .horn-button{flex-direction:column;gap:2px;min-width:54px;min-height:48px;padding:4px 8px;font-size:11px;border-radius:9px}
+  .horn-button .icon{width:19px;height:19px}
+  .safety-state strong{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .safety-state small{font-size:10px!important}
+}
+@media(max-width:360px){
+  .safety-inner .emergency-button,.safety-inner .reset-button{min-width:110px;max-width:110px;gap:5px;font-size:12px}
+  .safety-state strong{font-size:12px}
+}

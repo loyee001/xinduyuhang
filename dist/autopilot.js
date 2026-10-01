@@ -82,8 +82,19 @@
     const brakingBudget = wet ? 2.4 : 4.5, headway = wet ? 2.6 : 1.8;
     let following = false, urgent = false, nearestGap = Infinity;
     for (const vehicle of vehicles) {
-      if (![vehicle.x, vehicle.y].every(Number.isFinite) || !corridors.some(center =>
-        Math.abs(vehicle.x - center) < halfX + Math.max(.5, finite(vehicle.width, 1.85)) / 2 + .2)) continue;
+      if (![vehicle.x, vehicle.y].every(Number.isFinite)) continue;
+      const occupiedCenters = [vehicle.x];
+      // A yielding car reserves both lanes until it finishes. Keep following
+      // an outgoing leader and anticipate an incoming car before its body
+      // crosses a lane marking, including our own destination corridor.
+      if (roadType === 'highway' && vehicle.laneChange) {
+        for (const reservedLane of [vehicle.laneChange.fromLane, vehicle.laneChange.targetLane]) {
+          if (Number.isInteger(reservedLane) && reservedLane >= 0 && reservedLane <= 2)
+            occupiedCenters.push(laneControl.constants.laneCenters[reservedLane]);
+        }
+      }
+      if (!corridors.some(center => occupiedCenters.some(occupied =>
+        Math.abs(occupied - center) < halfX + Math.max(.5, finite(vehicle.width, 1.85)) / 2 + .2))) continue;
       const offset = vehicle.y - y, bodyLength = halfY + Math.max(1, finite(vehicle.length, 4.5)) / 2;
       if (offset < -bodyLength) continue;
       const gap = offset - bodyLength;

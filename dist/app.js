@@ -1,6 +1,7 @@
 'use strict';
 const icons={settings:'<path d="m9 3-1 3-3 1v4l3 1 1 3h4l1-3 3-1V7l-3-1-1-3Z" transform="translate(1 2)"/><circle cx="12" cy="11" r="3"/>',camera:'<path d="M14 4h-4L8 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-4Z"/><circle cx="12" cy="13" r="3"/>',route:'<circle cx="5" cy="5" r="2"/><circle cx="19" cy="19" r="2"/><path d="M7 5h8a4 4 0 0 1 0 8H9a4 4 0 0 0 0 8h8"/>',expand:'<path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/>',battery:'<rect x="2" y="7" width="17" height="10" rx="2"/><path d="M22 10v4m-16-3v2m4-2v2m4-2v2"/>',gauge:'<path d="M4 18a9 9 0 1 1 16 0"/><path d="m12 13 4-5"/><circle cx="12" cy="13" r="1"/>',signal:'<path d="M3 19v-3m6 3v-7m6 7V8m6 11V4"/>',info:'<circle cx="12" cy="12" r="9"/><path d="M12 11v6m0-10v.1"/>',gamepad:'<path d="M7 7h10a4 4 0 0 1 4 3l1 7a2 2 0 0 1-3 2l-4-3H9l-4 3a2 2 0 0 1-3-2l1-7a4 4 0 0 1 4-3Z"/><path d="M6 11h4m-2-2v4m8-2h.1m2 2h.1"/>',sparkles:'<path d="m12 3 2.7 6.3L21 12l-6.3 2.7L12 21l-2.7-6.3L3 12l6.3-2.7ZM20 2v4m-2-2h4"/>','chevron-right':'<path d="m9 5 7 7-7 7"/>','chevron-left':'<path d="m15 5-7 7 7 7"/>','chevron-up':'<path d="m5 15 7-7 7 7"/>','chevron-down':'<path d="m5 9 7 7 7-7"/>','arrow-up':'<path d="M12 20V4m-6 6 6-6 6 6"/>','arrow-up-right':'<path d="M6 18 18 6M6 6h12v12"/>','turn-left':'<path d="m9 3-6 6 6 6M3 9h10a7 7 0 0 1 7 7v5"/>',stop:'<rect x="6" y="6" width="12" height="12" rx="2"/>',play:'<path d="m8 4 12 8-12 8Z"/>',shield:'<path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6Z"/><path d="m8 12 3 3 5-5"/>',octagon:'<path d="m8 2-6 6v8l6 6h8l6-6V8l-6-6Z"/><path d="M9 9h6v6H9Z"/>',refresh:'<path d="M20 8a8 8 0 1 0 0 8M20 3v5h-5"/>',x:'<path d="m6 6 12 12M6 18 18 6"/>','wifi-off':'<path d="m3 3 18 18M2 8a16 16 0 0 1 4-2m4-1a16 16 0 0 1 12 3M5 12a11 11 0 0 1 5-2m5 1 4 1M8 16a6 6 0 0 1 8 0m-4 4h.01"/>'};
 function paintIcons(root=document){root.querySelectorAll('[data-icon]').forEach(el=>{el.innerHTML=`<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${icons[el.dataset.icon]||icons.info}</svg>`;});}
+icons.horn='<path d="M3 9h4l6-5v16l-6-5H3Z"/><path d="M17 8a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14"/>';
 paintIcons();
 const $=id=>document.getElementById(id);
 const physics=window.RoverPhysics;
@@ -18,10 +19,73 @@ let camera=null,cameraReady=false,lastFrame=performance.now(),lastRender=0,lastC
 state.laneAdvice=null;state.adviceCooldownUntil=0;
 state.exitActive=null;state.exitCompleted=false;state.exitCruise=false;
 state.autodrive={active:false,route:'cruise',decision:null,nextLaneCheck:0,reason:'选择行程后点击启动，车辆将自动控制油门和刹车。'};
+state.horn={lastAt:-Infinity,count:0,status:'idle',reason:'前车会在允许变道且车距安全时避让。',vehicleId:null,targetLane:null,vehicle:null};
+let hornAudio=null;
 const driveNames={throttle:'油门',brake:'刹车',left:'左转向',right:'右转向'};
 function toast(message){$('toast').textContent=message;$('toast').classList.add('visible');clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('toast').classList.remove('visible'),3000);}
 function log(message){state.logs.unshift({time:new Date().toLocaleTimeString('zh-CN',{hour12:false}),message});state.logs=state.logs.slice(0,80);renderLogs();}
 function renderLogs(){const list=$('activity-log');list.replaceChildren();for(const entry of state.logs){const li=document.createElement('li'),time=document.createElement('time'),text=document.createElement('span');time.textContent=entry.time;text.textContent=entry.message;li.append(time,text);list.append(li);}}
+function playHorn(){
+  // Audio is created only by a deliberate press. The visual/simulation action
+  // stays usable when a browser has no audio support or blocks playback.
+  const AudioContext=window.AudioContext||window.webkitAudioContext;
+  if(!AudioContext)return;
+  try{
+    if(!hornAudio||hornAudio.state==='closed')hornAudio=new AudioContext();
+    const context=hornAudio;
+    const sound=()=>{
+      if(context.state!=='running')return;
+      const start=context.currentTime,gain=context.createGain();
+      gain.gain.setValueAtTime(0,start);gain.gain.linearRampToValueAtTime(.075,start+.02);
+      gain.gain.setValueAtTime(.075,start+.22);gain.gain.linearRampToValueAtTime(0,start+.32);
+      gain.connect(context.destination);
+      let remaining=2;
+      for(const frequency of [350,440]){
+        const tone=context.createOscillator();tone.type='triangle';tone.frequency.value=frequency;tone.connect(gain);
+        tone.onended=()=>{tone.disconnect();if(--remaining===0)gain.disconnect();};
+        tone.start(start);tone.stop(start+.34);
+      }
+    };
+    if(context.state==='suspended')Promise.resolve(context.resume()).then(()=>{if(!document.hidden)sound();}).catch(()=>{});
+    else sound();
+  }catch{/* Sound is optional; traffic behaviour must remain available. */}
+}
+function pressHorn(){
+  if(!state.connected||!cameraReady||document.hidden||car.energyKWh>=51.6)return false;
+  if(car.elapsedTime-state.horn.lastAt<1.2)return false;
+  state.horn.lastAt=car.elapsedTime;state.horn.count++;playHorn();
+  const result=traffic.requestYield(trafficWorld,car,{wet:state.wet,roadType:currentRoadType(),canChangeLane:roadModel.canChangeLane});
+  const tracking=trafficWorld.vehicles.includes(state.horn.vehicle)&&state.horn.vehicle?.laneChange;
+  // A second beep can be declined while the first car is still moving. Keep
+  // observing that car so waiting, returning and completion remain visible.
+  if(result.status==='yielding'||!tracking)Object.assign(state.horn,{status:result.status,reason:result.reason,vehicleId:result.vehicleId??null,targetLane:result.targetLane??null,vehicle:trafficWorld.vehicles.find(item=>item.id===result.vehicleId)||null});
+  log('鸣笛：'+result.reason);toast(result.reason);render();return result;
+}
+$('horn-button').onclick=pressHorn;
+$('horn-button').onkeydown=event=>{
+  if(['Enter',' '].includes(event.key)){event.preventDefault();if(!event.repeat)pressHorn();}
+};
+function renderHorn(){
+  const horn=state.horn,vehicle=trafficWorld.vehicles.includes(horn.vehicle)?horn.vehicle:null;
+  if(['yielding','waiting','returning'].includes(horn.status)){
+    if(!vehicle?.laneChange){
+      horn.status=vehicle?.lane===horn.targetLane?'completed':'cancelled';
+      horn.reason=horn.status==='completed'?'前车已完成避让，请继续保持安全车距。':'路况已变化，前车取消避让，请保持安全车距。';
+    }else{
+      horn.status=vehicle.laneChange.status==='waiting'?'waiting':vehicle.laneChange.returning?'returning':'yielding';
+      horn.reason=horn.status==='waiting'?'前车正在等待安全间隙，暂缓避让。':horn.status==='returning'?'目标车道出现风险，前车正在返回原车道。':`前车收到鸣笛，正在向${horn.targetLane>vehicle.laneChange.fromLane?'右':'左'}安全避让`;
+    }
+  }
+  const cooling=car.elapsedTime-horn.lastAt<1.2;
+  $('horn-button').disabled=!state.connected||!cameraReady||document.hidden||car.energyKWh>=51.6;
+  // Preserve keyboard focus during cooldown so a held Space key cannot fall
+  // through to the page's braking shortcut after the first beep.
+  $('horn-button').setAttribute('aria-disabled',String($('horn-button').disabled||cooling));
+  $('horn-button').classList.toggle('sounding',car.elapsedTime-horn.lastAt<.4);
+  $('horn-label').textContent=cooling?'已鸣笛':'鸣笛';
+  if($('horn-status').textContent!==horn.reason)$('horn-status').textContent=horn.reason;
+  $('horn-feedback').dataset.status=horn.status;
+}
 function cancelPlan(reason){stopAutodrive(reason);const cruising=state.exitCruise;state.exitCruise=false;if(cruising){log('普通道路 AI 巡航已结束：'+reason);renderPlan();}if(state.plan&&['running','ready'].includes(state.plan.status)){state.plan.status='cancelled';state.plan.reason=reason;renderPlan();}}
 function requestBrake(reason,amount=.55,{emergency=false}={}){state.controls.clear();cancelPlan(reason);state.serviceBrake=Math.max(state.serviceBrake,amount);if(emergency)state.estop=true;log(reason);render();}
 function emergencyStop(){requestBrake('紧急制动：全力刹车，车辆仍将继续移动直至停止',1,{emergency:true});toast('正在全力制动，刹车距离会持续累计');}
@@ -497,7 +561,7 @@ function advanceElapsed(elapsed,background=false){let remaining=Math.max(0,elaps
 function openSheet(id){requestBrake('打开信息面板，开始常规制动');$(id).showModal();}
 $('device-button').onclick=()=>openSheet('device-dialog');$('log-button').onclick=()=>openSheet('log-dialog');document.querySelectorAll('[data-close]').forEach(button=>button.onclick=()=>$(button.dataset.close).close());document.querySelectorAll('dialog').forEach(dialog=>dialog.onclick=event=>{if(event.target!==dialog)return;const r=dialog.getBoundingClientRect();if(event.clientX<r.left||event.clientX>r.right||event.clientY<r.top||event.clientY>r.bottom)dialog.close();});
 $('toggle-connection').onclick=()=>{state.connected=!state.connected;failSafe(state.connected?'连接已恢复，车辆继续制动至停止':'模拟连接断开，触发全力制动');camera?.pause();render();};
-function resetSession(){Object.assign(state.autodrive,{active:false,route:'cruise',decision:null,nextLaneCheck:0,reason:'模拟已重置，点击启动自动驾驶。'});state.laneAdvice=null;state.adviceCooldownUntil=0;const keepLocked=state.estop;car=physics.createState();trafficWorld=traffic.createState(car,{density:state.trafficDensity});Object.assign(state,{exitActive:null,exitCompleted:false,exitCruise:false,estop:keepLocked,requestedGear:'forward',autoLimitBraking:false,shiftPending:false,laneTarget:1,laneChanging:false,shoulderAlert:false,shoulderRecovery:false,serviceBrake:0,failsafe:false,plan:null,trail:[[0,0]],logs:[],started:performance.now(),brakeAnchor:null,contactUntil:0,lastContactNotice:-Infinity,trafficInfo:null});state.controls.clear();$('command-input').value='';$('ai-feedback').textContent='支持距离、变道、调速、制动、等待、倒车与出口；可用“然后 / 并”组合，最多 8 步。';$('ai-feedback').classList.remove('error');log('模拟已重置，车辆回到起点');renderPlan();render();}
+function resetSession(){Object.assign(state.horn,{lastAt:-Infinity,count:0,status:'idle',reason:'前车会在允许变道且车距安全时避让。',vehicleId:null,targetLane:null,vehicle:null});Object.assign(state.autodrive,{active:false,route:'cruise',decision:null,nextLaneCheck:0,reason:'模拟已重置，点击启动自动驾驶。'});state.laneAdvice=null;state.adviceCooldownUntil=0;const keepLocked=state.estop;car=physics.createState();trafficWorld=traffic.createState(car,{density:state.trafficDensity});Object.assign(state,{exitActive:null,exitCompleted:false,exitCruise:false,estop:keepLocked,requestedGear:'forward',autoLimitBraking:false,shiftPending:false,laneTarget:1,laneChanging:false,shoulderAlert:false,shoulderRecovery:false,serviceBrake:0,failsafe:false,plan:null,trail:[[0,0]],logs:[],started:performance.now(),brakeAnchor:null,contactUntil:0,lastContactNotice:-Infinity,trafficInfo:null});state.controls.clear();$('command-input').value='';$('ai-feedback').textContent='支持距离、变道、调速、制动、等待、倒车与出口；可用“然后 / 并”组合，最多 8 步。';$('ai-feedback').classList.remove('error');log('模拟已重置，车辆回到起点');renderPlan();render();}
 $('reset-session').onclick=()=>{resetSession();$('device-dialog').close();};
 $('view-switch').onclick=()=>{state.map=!state.map;camera?.pause();$('map-view').hidden=!state.map;$('view-title').textContent=state.map?'行驶轨迹':'高速公路 · 驾驶视角';$('view-switch').querySelector('span').textContent=state.map?'画面':'轨迹';$('view-switch').setAttribute('aria-label',state.map?'切换到驾驶画面':'切换到行驶轨迹');render();};
 function toggleExpand(force){const expanded=force??!$('camera-panel').classList.contains('expanded');$('camera-panel').classList.toggle('expanded',expanded);$('expand-button').setAttribute('aria-label',expanded?'缩小画面':'放大画面');$('expand-button').setAttribute('aria-expanded',String(expanded));document.body.style.overflow=expanded?'hidden':'';}
@@ -542,7 +606,7 @@ function render(){const moving=car.speed>.01,braking=state.lastInput.brake>0&&mo
     button.disabled=!!state.exitActive||state.estop||!state.connected||!cameraReady;
     button.classList.toggle('shoulder-next',button.dataset.laneChange==='1'&&state.laneTarget===2);
   }
-  renderRoadEvents();renderLaneAdvice();renderAutodrive();
+  renderRoadEvents();renderLaneAdvice();renderAutodrive();renderHorn();
   $('shoulder-alert').hidden=!state.shoulderAlert;
   $('shoulder-alert-title').textContent=state.estop?(moving?'已进入应急车道 · 紧急制动':'应急车道 · 已停稳，制动锁定'):(moving?'正在返回右车道':'返回右车道 · 等待驾驶操作');
   $('shoulder-alert-detail').textContent=state.estop?(moving?'正在全力减速，仍有制动距离。请等待车辆停稳。':'点击底部“解除并返回右车道”，再按住油门驶回。'):(moving?'正在自动驶回并回正，到达右车道中央后警报解除。':'已选择右车道，按住油门自动驶回；到达中央后警报解除。');
@@ -557,6 +621,6 @@ function tick(now){if(!document.hidden){const elapsed=(now-lastFrame)/1000;lastF
 try{camera=window.RoverSimulator.createCamera($('camera-canvas'));cameraReady=true;}catch(error){$('camera-error').hidden=false;console.error(error);}
 window.addEventListener('rover-camera-lost',()=>{cameraReady=false;failSafe('画面丢失，继续全力制动');$('camera-error').hidden=false;});
 async function probeLocalService(){if(location.protocol==='file:')return;if(document.hidden){setTimeout(probeLocalService,2000);return;}const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),2000),started=performance.now();try{const response=await fetch('./health.json?t='+Math.floor(started),{method:'HEAD',cache:'no-store',signal:controller.signal});if(!response.ok)throw new Error();state.latency=performance.now()-started;}catch{state.latency=null;}finally{clearTimeout(timer);setTimeout(probeLocalService,2000);}}
-function readState(){const road=traffic.getSnapshot(trafficWorld,car);return {autodrive:{active:state.autodrive.active,route:state.autodrive.route,status:state.autodrive.decision?.status||'idle',reason:state.autodrive.reason},roadType:currentRoadType(),exitCruise:state.exitCruise,road:state.exitCompleted?{type:'local',speedLimitKmh:50,solid:true,nextExit:null}:roadModel.getState(car.y),exit:state.exitActive?{...state.exitActive,completed:state.exitCompleted}:null,taskStep:state.plan?.kind==='sequence'?state.plan.steps[state.plan.phase]:null,taskWaiting:state.plan?.waitingReason||'',laneRecommendation:getLaneAdvice(),laneTarget:state.laneTarget,laneTargetName:state.exitCompleted?'普通道路本车道':laneName(state.laneTarget),laneChanging:state.laneChanging,emergencyLaneAlert:state.shoulderAlert,returningFromEmergencyLane:state.shoulderRecovery,gear:car.gear,requestedGear:state.requestedGear,signedSpeed:car.speed*(car.gear==='reverse'?-1:1),trafficDensity:state.trafficDensity,automaticSpeedLimit:true,autoLimitBraking:state.autoLimitBraking,effectiveTargetSpeed:effectiveTarget(state.autodrive.active?100:state.speedLimit),roadLimitKmh:Math.round(currentRoadCap()*3.6),overspeed:car.speed>currentRoadCap()+.01,trafficCount:road.vehicles.length,nearestAhead:road.nearestAhead,nearestBehind:road.nearestBehind,wallContact:car.wallContact,simulation:true,scenario:currentRoadType(),model:'simplified vehicle dynamics',connected:state.connected,emergencyBrake:state.estop,speed:car.speed,maxSpeed:100,targetSpeed:state.speedLimit,acceleration:car.acceleration,position:{x:car.x,y:car.y,heading:car.heading},distance:car.distance,braking:car.braking,brakeDistance:car.brakeDistance,lastBrakeDistance:car.lastBrakeDistance,predictedBrakingDistance:state.predicted,wet:state.wet,taskStatus:state.plan?.status||'none',cameraFps:camera?.stats.fps||0,localLatencyMs:state.latency};}
+function readState(){const road=traffic.getSnapshot(trafficWorld,car);return {horn:{count:state.horn.count,status:state.horn.status,reason:state.horn.reason,vehicleId:state.horn.vehicleId,targetLane:state.horn.targetLane},autodrive:{active:state.autodrive.active,route:state.autodrive.route,status:state.autodrive.decision?.status||'idle',reason:state.autodrive.reason},roadType:currentRoadType(),exitCruise:state.exitCruise,road:state.exitCompleted?{type:'local',speedLimitKmh:50,solid:true,nextExit:null}:roadModel.getState(car.y),exit:state.exitActive?{...state.exitActive,completed:state.exitCompleted}:null,taskStep:state.plan?.kind==='sequence'?state.plan.steps[state.plan.phase]:null,taskWaiting:state.plan?.waitingReason||'',laneRecommendation:getLaneAdvice(),laneTarget:state.laneTarget,laneTargetName:state.exitCompleted?'普通道路本车道':laneName(state.laneTarget),laneChanging:state.laneChanging,emergencyLaneAlert:state.shoulderAlert,returningFromEmergencyLane:state.shoulderRecovery,gear:car.gear,requestedGear:state.requestedGear,signedSpeed:car.speed*(car.gear==='reverse'?-1:1),trafficDensity:state.trafficDensity,automaticSpeedLimit:true,autoLimitBraking:state.autoLimitBraking,effectiveTargetSpeed:effectiveTarget(state.autodrive.active?100:state.speedLimit),roadLimitKmh:Math.round(currentRoadCap()*3.6),overspeed:car.speed>currentRoadCap()+.01,trafficCount:road.vehicles.length,nearestAhead:road.nearestAhead,nearestBehind:road.nearestBehind,wallContact:car.wallContact,simulation:true,scenario:currentRoadType(),model:'simplified vehicle dynamics',connected:state.connected,emergencyBrake:state.estop,speed:car.speed,maxSpeed:100,targetSpeed:state.speedLimit,acceleration:car.acceleration,position:{x:car.x,y:car.y,heading:car.heading},distance:car.distance,braking:car.braking,brakeDistance:car.brakeDistance,lastBrakeDistance:car.lastBrakeDistance,predictedBrakingDistance:state.predicted,wet:state.wet,taskStatus:state.plan?.status||'none',cameraFps:camera?.stats.fps||0,localLatencyMs:state.latency};}
 if(document.modelContext?.registerTool){const lifecycle=new AbortController();const definitions=[{name:'change_rover_simulation_lane',title:'切换模拟车辆车道',description:'Request one adjacent lane through the same controls as the left/right buttons. Left/right refer to the road. Entering the right emergency shoulder triggers physical emergency braking.',inputSchema:{type:'object',properties:{direction:{type:'string',enum:['left','right']}},required:['direction'],additionalProperties:false},annotations:{readOnlyHint:false},execute(input){if(!input||!['left','right'].includes(input.direction))throw new Error('direction required');const accepted=requestLaneChange(input.direction==='left'?-1:1);if(accepted)switchMode('manual');return {accepted,...readState()};}},{name:'read_rover_simulation',title:'查看车辆物理模拟状态',description:'Read local highway physics, actual speed and physical braking distance. No real hardware.',inputSchema:{type:'object',properties:{},additionalProperties:false},annotations:{readOnlyHint:true},execute:readState},{name:'stage_rover_simulation_command',title:'准备高速模拟任务',description:'Stage a local highway simulation plan for confirmation. Brake commands apply deceleration immediately; they do not teleport speed to zero.',inputSchema:{type:'object',properties:{command:{type:'string',minLength:1,maxLength:240}},required:['command'],additionalProperties:false},annotations:{readOnlyHint:false},execute(input){if(!input||typeof input.command!=='string')throw new Error('command required');switchMode('ai');$('command-input').value=input.command;return submitCommand(input.command);}},{name:'emergency_stop_rover_simulation',title:'全力制动模拟车辆',description:'Latch full emergency brakes in the local simulation. Speed decreases physically over a nonzero braking distance. Does not immediately stop or control real hardware.',inputSchema:{type:'object',properties:{},additionalProperties:false},annotations:{readOnlyHint:false},execute(){emergencyStop();return readState();}}];for(const tool of definitions){try{Promise.resolve(document.modelContext.registerTool(tool,{signal:lifecycle.signal})).catch(()=>{});}catch{}}window.addEventListener('pagehide',()=>lifecycle.abort(),{once:true});}
 log('车道辅助已就绪：左右点按自动变道居中，进入应急车道会紧急制动');render();requestAnimationFrame(tick);probeLocalService();
