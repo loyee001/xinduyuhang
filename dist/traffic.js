@@ -18,45 +18,91 @@
       speedFactor: .42, recycleDistance: 950, spawnDistance: 780 })
   });
   const lanes = [-3.75, 0, 3.75, -25.75, -22, -18.25];
+  const localLanes = [29, 25.5];
+  const localRoad = Object.freeze({ speedLimitKmh:50, left:23.75, right:30.75 });
   const paint = ['#bd534b', '#e7e7d9', '#4f84ad', '#c9a456', '#657778', '#ece8df', '#50756c'];
   const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
   const finite = (n, fallback = 0) => Number.isFinite(n) ? n : fallback;
-  const modulo = (n, d) => ((n % d) + d) % d;
 
-  function limitAt(y) { return [120, 100, 80][modulo(Math.floor(finite(y) / constants.zoneLength), 3)]; }
+  // Every boundary has a stable, independently jittered world position.
+  // The 1400 m spacing is an indexing aid, not a repeating speed zone: both
+  // lengths and values come from the index hash, and equal neighbours merge.
+  const limitSpacing = 1400, limitChoices = [120,100,80];
+  function roadHash(index, salt) {
+    const high = Math.floor(index / 4294967296);
+    let value = Math.imul(index | 0,374761393) ^ Math.imul(high | 0,668265263) ^ salt;
+    value = Math.imul(value ^ (value >>> 13),1274126177);
+    return (value ^ (value >>> 16)) >>> 0;
+  }
+  const limitBoundary = index => index * limitSpacing + (index === 0 ? 0 : roadHash(index,0x1b873593) % 501);
+  const limitForIndex = index => index === 0 ? 120 : limitChoices[roadHash(index,0x51ed270b) % limitChoices.length];
+  function limitIndex(y) {
+    const index = Math.floor(y / limitSpacing);
+    return y < limitBoundary(index) ? index-1 : index;
+  }
+  function limitAt(y) { return limitForIndex(limitIndex(finite(y))); }
+  function nextLimit(y, direction = 1) {
+    y = finite(y); direction = direction < 0 ? -1 : 1;
+    const current = limitAt(y);
+    let index = limitIndex(y) + (direction > 0 ? 1 : 0);
+    // A bounded search also makes out-of-precision caller inputs harmless.
+    for (let attempts = 0; attempts < 512; attempts++, index += direction) {
+      const at = limitBoundary(index), next = limitForIndex(index-(direction < 0 ? 1 : 0));
+      if (next !== current && direction*(at-y) >= 0)
+        return { y:at,limitKmh:next,distance:Math.max(0,direction*(at-y)) };
+    }
+    throw new RangeError('Road coordinate is outside the supported numeric precision');
+  }
   function signsAround(y, radius = 1600) {
     y = finite(y); radius = clamp(finite(radius, 1600), 0, 5000);
-    const signs = [];
+    const signs = new Map();
     for (let at = Math.ceil((y - radius) / constants.signSpacing) * constants.signSpacing;
-      at <= y + radius; at += constants.signSpacing) signs.push({ y: at, limitKmh: limitAt(at) });
-    if (Math.abs(y - 40) <= radius) signs.push({ y: 40, limitKmh: 120 });
-    return signs.sort((a, b) => a.y - b.y);
+      at <= y + radius; at += constants.signSpacing) signs.set(at,{ y:at,limitKmh:limitAt(at) });
+    const first = limitIndex(y-radius), last = limitIndex(y+radius)+1;
+    for (let index = first; index <= last; index++) {
+      const at = limitBoundary(index);
+      if (at >= y-radius && at <= y+radius && limitForIndex(index) !== limitForIndex(index-1))
+        signs.set(at,{ y:at,limitKmh:limitForIndex(index) });
+    }
+    if (Math.abs(y - 40) <= radius) signs.set(40,{ y:40,limitKmh:120 });
+    return [...signs.values()].sort((a, b) => a.y - b.y);
   }
   const densityFor = density => Object.prototype.hasOwnProperty.call(densityPresets, density) ? density : 'medium';
   const presetFor = world => densityPresets[densityFor(world?.density)];
+  const isLocal = world => world?.roadType === 'local';
+  const lanesFor = world => isLocal(world) ? localLanes : lanes;
+  const limitFor = (world, y) => isLocal(world) ? localRoad.speedLimitKmh : limitAt(y);
+  const directionFor = (world, lane) => lane < (isLocal(world) ? 1 : 3) ? 1 : -1;
   const travelDirection = ego => ego.gear === 'reverse' ? -1 : 1;
-  function createState(ego = {}, { density = 'medium' } = {}) {
-    const world = { vehicles: [], density: densityFor(density), elapsedTime: 0, contacts: 0 };
-    populate(world, ego);
+  function createState(ego = {}, { density = 'medium', roadType = 'highway', roadStart } = {}) {
+    const world = { vehicles: [], density: densityFor(density), roadType:roadType === 'local' ? 'local' : 'highway',
+      roadStart:Number.isFinite(roadStart) ? roadStart : null, elapsedTime: 0, contacts: 0 };
+    populate(world, ego, true);
     return world;
   }
-  function populate(world, ego = {}) {
+  function populate(world, ego = {}, initial = false) {
     const preset = presetFor(world), extent = egoExtents(ego), egoX = finite(ego.x), egoY = finite(ego.y);
     const offsets = world.density === 'dense' ? [0, 17, 35, 11, 28, 43] : [0, 70, 45, 30, 125, 210];
-    const base = world.density === 'medium' ? -1790 : -(preset.countPerLane - 1) / 2 * preset.spacing + (world.density === 'dense' ? 25 : 70);
+    let base = world.density === 'medium' ? -1790 : -(preset.countPerLane - 1) / 2 * preset.spacing + (world.density === 'dense' ? 25 : 70);
+    // The first ordinary-road generation starts after the ramp connection.
+    // Subsequent recycling/density changes stay centered on ego, including
+    // when reversing a long distance past the original connection coordinate.
+    if (initial && isLocal(world) && Number.isFinite(world.roadStart)) base = Math.max(base,world.roadStart+10-egoY);
     // Rebuilding a selected density is deterministic. Keep a clear corridor
     // in the player's lane in both directions, even when switching at speed.
     const clearance = Math.max(25, Math.abs(finite(ego.speed)) * 1.5) + extent.y + 5;
     world.vehicles = [];
-    for (let lane = 0; lane < lanes.length; lane++) {
+    const laneCenters = lanesFor(world);
+    for (let lane = 0; lane < laneCenters.length; lane++) {
       const laneVehicles = [];
       for (let row = 0; row < preset.countPerLane; row++) {
         const id = lane * preset.countPerLane + row;
         const truck = id % 7 === 3 || (lane === 2 && row === 6);
         const y = egoY + base + row * preset.spacing + offsets[lane];
         const cruiseFactor = (lane % 3 === 0 ? .94 : lane % 3 === 1 ? .86 : .77) - (truck ? .09 : 0) + (id % 3) * .015;
-        laneVehicles.push({ id, lane, x: lanes[lane], y, previousY: y, direction: lane < 3 ? 1 : -1,
-          heading: lane < 3 ? 0 : 180, speed: limitAt(y) / 3.6 * cruiseFactor * preset.speedFactor, cruiseFactor,
+        const direction = directionFor(world,lane);
+        laneVehicles.push({ id, lane, x: laneCenters[lane], y, previousY: y, direction,
+          heading: direction > 0 ? 0 : 180, speed: limitFor(world,y) / 3.6 * cruiseFactor * preset.speedFactor, cruiseFactor,
           length: truck ? 8.4 : 4.5, width: truck ? 2.35 : 1.85, height: truck ? 3.2 : 1.5,
           kind: truck ? 'truck' : 'car', color: paint[id % paint.length], braking: false });
       }
@@ -67,7 +113,7 @@
         // unchanged and never moving the player's car or controls.
         v.y = v.y < egoY ? (low -= preset.spacing) : (high += preset.spacing);
         v.previousY = v.y;
-        v.speed = limitAt(v.y) / 3.6 * v.cruiseFactor * preset.speedFactor;
+        v.speed = limitFor(world,v.y) / 3.6 * v.cruiseFactor * preset.speedFactor;
       }
       world.vehicles.push(...laneVehicles);
     }
@@ -102,7 +148,7 @@
         Math.abs(other.y - candidate) < clearGap + (vehicle.length + other.length) / 2) && attempts++ < 40) candidate += side * stride;
       if (attempts > 40) continue;
       vehicle.y = vehicle.previousY = candidate;
-      vehicle.speed = limitAt(candidate) / 3.6 * vehicle.cruiseFactor * preset.speedFactor;
+      vehicle.speed = limitFor(world,candidate) / 3.6 * vehicle.cruiseFactor * preset.speedFactor;
       vehicle.braking = false;
     }
   }
@@ -114,7 +160,7 @@
     const preset = presetFor(world);
     const substeps = Math.ceil(Math.min(dt, 10) / constants.maxSubstep), subDt = Math.min(dt, 10) / substeps;
     for (const vehicle of world.vehicles) vehicle.previousY = vehicle.y;
-    const laneGroups = lanes.map((_, lane) => world.vehicles.filter(v => v.lane === lane));
+    const laneGroups = lanesFor(world).map((_, lane) => world.vehicles.filter(v => v.lane === lane));
     for (let i = 0; i < substeps; i++) {
       for (const group of laneGroups) {
         if (!group.length) continue;
@@ -136,7 +182,7 @@
               stopAt = egoY - direction * (vehicle.length / 2 + extent.y + constants.minGap);
             }
           }
-          const roadSpeed = Math.min(limitAt(vehicle.y), limitAt(vehicle.y + direction * 95)) / 3.6;
+          const roadSpeed = Math.min(limitFor(world,vehicle.y), limitFor(world,vehicle.y + direction * 95)) / 3.6;
           let desired = roadSpeed * vehicle.cruiseFactor * preset.speedFactor;
           if (Number.isFinite(gap)) {
             // A stopping-distance + time-headway bound makes a slow queue
@@ -176,8 +222,10 @@
       if (vehicle.y >= y && (!nearestAhead || distance < nearestAhead.distance)) nearestAhead = item;
       if (vehicle.y < y && (!nearestBehind || distance < nearestBehind.distance)) nearestBehind = item;
     }
-    return { speedLimitKmh: limitAt(y), density: densityFor(world.density), vehicleCount: world.vehicles.length,
-      nearestAhead, nearestBehind, vehicles: world.vehicles, roadSigns: signsAround(y) };
+    return { speedLimitKmh: limitFor(world,y), roadType:isLocal(world) ? 'local' : 'highway',
+      density: densityFor(world.density), vehicleCount: world.vehicles.length,
+      nearestAhead, nearestBehind, vehicles: world.vehicles,
+      roadSigns: signsAround(y).map(sign => isLocal(world) ? { ...sign,limitKmh:localRoad.speedLimitKmh } : sign) };
   }
 
   /**
@@ -191,6 +239,8 @@
    * an empty destination cannot make a too-late departure safe.
    */
   function getLaneRecommendation(world, ego = {}, { wet = false, desiredSpeed = limitAt(ego.y) / 3.6 } = {}) {
+    if (isLocal(world)) return { status:'unavailable', direction:null, targetLane:null, currentLane:0,
+      reason:'普通道路每方向一条车道，请沿当前车道行驶', lanes:[] };
     const x = finite(ego.x), y = finite(ego.y), speed = Math.max(0, finite(ego.speed));
     const currentLane = [0, 1, 2].reduce((best, lane) =>
       Math.abs(x - lanes[lane]) < Math.abs(x - lanes[best]) ? lane : best, 0);
@@ -314,7 +364,9 @@
     const sideX = v.x + (hit.sx < 0 ? -1 : 1) * (hit.halfX + .02);
     // A car pinned against a guardrail must separate along the road. Moving
     // through the barrier would cause physics/contact to fight every frame.
-    if (hit.axis === 'x' && (sideX < constants.guardrailLeft || sideX > constants.guardrailRight)) hit.axis = 'y';
+    const leftBoundary = isLocal(world) ? localRoad.left+extent.x : constants.guardrailLeft;
+    const rightBoundary = isLocal(world) ? localRoad.right-extent.x : constants.guardrailRight;
+    if (hit.axis === 'x' && (sideX < leftBoundary || sideX > rightBoundary)) hit.axis = 'y';
     const freshSideImpact = !world.lastContact || world.lastContact.id !== v.id ||
       finite(world.elapsedTime) - world.lastContact.time > .4;
     if (hit.axis === 'x') {
@@ -353,6 +405,6 @@
     return { vehicleId: v.id, relativeSpeed: Math.hypot(signedSpeed * Math.sin(angle),
       signedSpeed * Math.cos(angle) - v.direction * v.speed), side: hit.axis === 'x' };
   }
-  return Object.freeze({ constants, densityPresets, createState, setDensity, step, limitAt, signsAround, getSnapshot,
+  return Object.freeze({ constants, densityPresets, createState, setDensity, step, limitAt, nextLimit, signsAround, getSnapshot,
     getLaneRecommendation, resolveContact });
 });

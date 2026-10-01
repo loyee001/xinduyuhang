@@ -9,9 +9,12 @@
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23101512'/%3E%3Cpath d='M8 23V9h10a5 5 0 0 1 0 10H8m9-1 7 5' fill='none' stroke='%23d3fa76' stroke-width='3'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="./style.css">
   <script src="./physics.js" defer></script>
+  <script src="./road.js" defer></script>
   <script src="./traffic.js" defer></script>
   <script src="./lane-control.js" defer></script>
   <script src="./simulator.js" defer></script>
+  <script src="./commands.js" defer></script>
+  <script src="./autopilot.js" defer></script>
   <script src="./app.js" defer></script>
 </head>
 <body>
@@ -35,13 +38,18 @@
               <div class="map-view" id="map-view" hidden><svg id="route-map" viewBox="0 0 640 360" role="img" aria-label="小车本次模拟行驶轨迹"><defs><pattern id="small-grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M 32 0 L 0 0 0 32" fill="none" stroke="#26372d" stroke-width="0.8"/></pattern><pattern id="large-grid" width="160" height="160" patternUnits="userSpaceOnUse"><rect width="160" height="160" fill="url(#small-grid)"/><path d="M 160 0 L 0 0 0 160" fill="none" stroke="#354b3a" stroke-width="1"/></pattern></defs><rect width="640" height="360" fill="#141f19"/><rect width="640" height="360" fill="url(#large-grid)"/><g id="map-origin" transform="translate(320 260)"><circle r="5" fill="#b9c6be"/><text x="12" y="23" fill="#8b9a90" font-size="14">起点</text></g><polyline id="route-trail" points="320,180" fill="none" stroke="#d3fa76" stroke-width="2.5" stroke-linejoin="round"/><g id="map-rover" transform="translate(320 180)"><circle r="25" fill="#d3fa76" opacity=".07"/><circle r="15" fill="#d3fa76" opacity=".12"/><path d="M0 -11 8 9 0 5 -8 9Z" fill="#d3fa76"/></g><text x="24" y="334" fill="#a5b4aa" font-size="13">最近 480 m 行驶轨迹</text><text x="602" y="34" fill="#d3fa76" font-size="14">N ↑</text></svg><div class="map-label">本次行驶 <strong id="map-distance">0.00 m</strong></div></div>
               <div class="camera-offline" id="camera-offline" hidden><i data-icon="wifi-off"></i><strong>模拟连接已断开</strong><span>重新连接后继续驾驶</span></div>
             </div>
-            <div class="camera-footer"><span><span class="tiny-dot"></span>实时车流 · 高速公路 · 三车道</span><span class="mono" id="session-clock">00:00</span></div>
+            <div class="camera-footer"><span id="road-scene-caption"><span class="tiny-dot"></span>实时车流 · 高速公路 · 三车道</span><span class="mono" id="session-clock">00:00</span></div>
           </div>
           <div class="shoulder-alert" id="shoulder-alert" role="alert" hidden><i data-icon="octagon"></i><div><strong id="shoulder-alert-title">已进入应急车道 · 紧急制动</strong><span id="shoulder-alert-detail">车辆正在按物理过程减速，请等待停稳。</span></div></div>
           <div class="road-awareness" aria-label="路况与限速">
             <div class="road-limit"><span class="speed-sign" id="road-limit-sign" aria-label="道路限速120公里每小时">120</span><div><span>道路限速 · km/h</span><strong id="road-speed-status">限速内</strong><small id="next-road-limit">前方路段限速 100 km/h</small></div></div>
             <div class="traffic-awareness"><span id="traffic-direction-label">同车道前车</span><strong id="traffic-gap">—</strong><small id="traffic-status">周围车流运行中</small></div>
           </div>
+          <section class="road-events" id="road-events" data-solid="false" aria-label="道路规则与出口">
+            <div class="road-rule"><span class="road-event-icon" aria-hidden="true">⇢</span><div><span class="road-event-label">道路规则</span><strong id="road-rule-title">虚线 · 可按条件变道</strong><p id="road-rule-detail">前方实线路段禁止变道，驶过后恢复。</p></div></div>
+            <div class="exit-preview"><span class="exit-badge" aria-hidden="true">EXIT ↗</span><div><strong id="exit-name">前方出口</strong><p id="exit-detail">根据行驶位置更新出口距离</p></div></div>
+            <button id="exit-action" disabled>从下一个出口驶离高速</button>
+          </section>
           <section class="lane-advice" id="lane-advice" data-status="unavailable" aria-labelledby="lane-advice-title">
             <div class="lane-advice-heading"><span class="lane-advice-symbol" id="lane-advice-icon" aria-hidden="true">↑</span><div><span class="lane-advice-eyebrow">实时变道建议</span><h2 id="lane-advice-title">起步后评估车流</h2></div><span class="lane-advice-tag">辅助建议</span></div>
             <p id="lane-advice-reason">结合前后车距和接近速度，寻找更通畅的相邻车道。</p>
@@ -65,7 +73,7 @@
           <p class="demo-note"><i data-icon="info"></i>本地物理模拟 · 未连接真实车辆</p>
         </section>
         <section class="control-panel" aria-label="驾驶控制">
-          <div class="mode-tabs" role="tablist" aria-label="控制方式"><button class="mode-tab active" id="manual-tab" role="tab" aria-selected="true" aria-controls="manual-panel"><i data-icon="gamepad"></i>手动驾驶</button><button class="mode-tab" id="ai-tab" role="tab" aria-selected="false" aria-controls="ai-panel" tabindex="-1"><i data-icon="sparkles"></i>AI 助手<span class="tab-tag">BETA</span></button></div>
+          <div class="mode-tabs" role="tablist" aria-label="控制方式"><button class="mode-tab active" id="manual-tab" role="tab" aria-selected="true" aria-controls="manual-panel"><i data-icon="gamepad"></i>手动驾驶</button><button class="mode-tab" id="ai-tab" role="tab" aria-selected="false" aria-controls="ai-panel" tabindex="-1"><i data-icon="sparkles"></i>AI 助手</button><button class="mode-tab" id="auto-tab" role="tab" aria-selected="false" aria-controls="auto-panel" tabindex="-1"><i data-icon="shield"></i>自动驾驶</button></div>
           <div id="manual-panel" role="tabpanel" aria-labelledby="manual-tab">
             <div class="control-heading"><span>油门与变道</span><span class="subtle">点按变一条 · 自动回正居中</span></div>
             <div class="gear-control"><div class="gear-options" role="group" aria-label="行驶挡位"><button id="gear-forward" class="selected" aria-pressed="true">前进 <b>D</b></button><button id="gear-reverse" aria-pressed="false">倒车 <b>R</b></button></div><span id="gear-status">D · 前进</span></div><p class="gear-hint" id="gear-hint">换挡时先减速至停稳，再切换行驶方向</p>
@@ -78,18 +86,28 @@
             <button class="ai-shortcut" id="ai-shortcut"><span class="shortcut-icon"><i data-icon="sparkles"></i></span><span>让 AI 完成一次制动测试<small>加速至目标速度，再测量刹车距离</small></span><i data-icon="arrow-up-right"></i></button>
           </div>
           <div id="ai-panel" role="tabpanel" aria-labelledby="ai-tab" hidden>
-            <div class="ai-intro"><span class="ai-orb"><i data-icon="sparkles"></i></span><h2>测试车辆的物理表现</h2><p>周围车流实时模拟。先查看计划，AI 按物理模型加速和制动。</p></div>
-            <div class="suggestions"><button data-command="加速到30米每秒然后刹车"><i data-icon="gauge"></i>30 m/s 测试</button><button data-command="加速到100米每秒然后刹车"><i data-icon="gauge"></i>路段限速测试</button><button data-command="前进200米"><i data-icon="route"></i>前进 200 米</button><button data-command="倒车10米"><i data-icon="chevron-down"></i>倒车 10 米</button></div>
-            <form id="command-form"><label class="sr-only" for="command-input">给小车的指令</label><div class="command-composer"><textarea id="command-input" rows="2" maxlength="120" placeholder="例如：加速到 50 米每秒，然后刹车"></textarea><div class="composer-footer"><span>本地指令演示</span><button type="submit" id="send-command" aria-label="解析指令"><i data-icon="arrow-up"></i></button></div></div></form>
-            <div class="ai-feedback" id="ai-feedback" role="status" aria-live="polite">支持前进、倒车与制动测试；超速自动减速到路段限速。</div>
-            <div class="task-card" id="task-card" hidden><div class="task-title"><span><i data-icon="route"></i>行动计划</span><span id="task-badge">待确认</span></div><ol id="task-steps"></ol><div class="task-progress"><span id="task-progress-fill"></span></div><button class="primary-button" id="task-action"><i data-icon="play"></i><span>开始执行</span></button></div>
+            <div class="ai-intro"><span class="ai-orb"><i data-icon="sparkles"></i></span><h2>一句话，安排一段驾驶</h2><p>距离、变道、调速、等待、倒车与出口可以组合。先查看计划，再确认执行。</p></div>
+            <div class="suggestions"><button data-command="直行500米后向左变道并制动"><i data-icon="route"></i>直行 → 变道 → 制动</button><button data-command="以60公里每小时行驶300米然后停车"><i data-icon="gauge"></i>60 km/h 行驶 300 米</button><button data-command="从下一个出口驶离高速"><i data-icon="arrow-up-right"></i>驶离高速 → 普通道路</button><button data-command="倒车10米"><i data-icon="chevron-down"></i>倒车 10 米</button></div>
+            <form id="command-form"><label class="sr-only" for="command-input">给小车的指令</label><div class="command-composer"><textarea id="command-input" rows="3" maxlength="240" placeholder="例如：直行500米后向左变道并制动"></textarea><div class="composer-footer"><span>本地指令识别 · 最多 8 步</span><button type="submit" id="send-command" aria-label="解析指令"><i data-icon="arrow-up"></i></button></div></div></form>
+            <div class="ai-feedback" id="ai-feedback" role="status" aria-live="polite">遇实线会等待允许变道后继续；单独驶离出口后沿普通道路巡航，可下达停车指令。</div>
+            <div class="task-card" id="task-card" hidden><div class="task-title"><span><i data-icon="route"></i>行动计划</span><span id="task-badge">待确认</span></div><ol id="task-steps"></ol><p class="task-waiting" id="task-waiting" role="status" aria-live="polite" hidden></p><div class="task-progress"><span id="task-progress-fill"></span></div><button class="primary-button" id="task-action"><i data-icon="play"></i><span>开始执行</span></button></div>
           </div>
+          <div id="auto-panel" role="tabpanel" aria-labelledby="auto-tab" hidden>
+            <div class="auto-intro"><span class="auto-pill">AUTOPILOT / 模拟驾驶</span><h2>把驾驶交给小车。</h2><p>自动起步、控速、跟车与变道，遇到实线等待，驶出高速后继续行驶。</p></div>
+            <div class="auto-route-label">选择行程</div>
+            <div class="auto-routes" role="group" aria-label="自动驾驶行程"><button data-auto-route="cruise" class="selected" aria-pressed="true"><i data-icon="route"></i><strong>沿道路巡航</strong><small>自动判断路况，持续行驶</small></button><button data-auto-route="exit" aria-pressed="false"><i data-icon="arrow-up-right"></i><strong>下个出口驶离</strong><small>自动靠右，接入普通道路</small></button></div>
+            <div class="auto-status" id="auto-status-card"><span class="auto-indicator"></span><div><strong id="auto-status-title">自动驾驶待命</strong><p id="auto-status-reason" role="status" aria-live="polite">选择行程后点击启动，车辆将自动控制油门和刹车。</p></div></div>
+            <div class="auto-controls" aria-label="自动驾驶控制状态"><span>油门<strong id="auto-throttle">待命</strong></span><span>制动<strong id="auto-brake">待命</strong></span><span>目标车速<strong id="auto-speed">自动匹配</strong></span><span>转向<strong id="auto-steering">自动居中</strong></span></div>
+            <button class="primary-button" id="auto-start"><i data-icon="play"></i>启动自动驾驶</button><button class="normal-brake-button" id="auto-stop" hidden><i data-icon="stop"></i>结束自动驾驶并停车</button>
+            <p class="auto-note">高速限速和路段长度随机生成，前方降速会提前制动。拥堵时自动停车，前车驶离后继续跟随。键盘或手动操作可随时接管，急停后不会自行重启。</p>
+          </div>
+          <div class="keyboard-legend" aria-label="键盘驾驶快捷键"><span><kbd>A</kbd><kbd>D</kbd> / ← → 变道</span><span><kbd>W</kbd><kbd>S</kbd> / ↑ ↓ 油门、刹车</span><span><kbd>R</kbd> 换挡</span><span><kbd>空格</kbd> 制动</span><small>AI / 自动驾驶均可用键盘接管 · 输入指令时不触发驾驶</small></div>
         </section>
       </div>
     </main>
     <footer class="safety-bar"><div class="safety-inner"><div class="safety-state"><span class="safety-symbol" id="safety-symbol"><i data-icon="shield"></i></span><span><strong id="safety-title">小车已就绪</strong><small id="safety-description">手动控制 · 等待指令</small></span></div><button class="emergency-button" id="emergency-stop"><i data-icon="octagon"></i><span>紧急制动</span></button><button class="reset-button" id="reset-estop" hidden><i data-icon="refresh"></i>解除制动锁定</button></div></footer>
   </div>
-  <dialog class="sheet" id="device-dialog"><div class="sheet-header"><h2>车辆与物理模型</h2><button class="icon-button" data-close="device-dialog" aria-label="关闭设备信息"><i data-icon="x"></i></button></div><div class="device-identity"><span class="device-mark"><i data-icon="gamepad"></i></span><div><strong>ROVER–01</strong><span>高速制动实验车</span></div><span class="demo-badge">简化车辆模型</span></div><dl class="device-details"><div><dt>连接状态</dt><dd id="device-status">模拟连接正常</dd></div><div><dt>速度上限</dt><dd>100 m/s · 360 km/h</dd></div><div><dt>质量 / 轴距</dt><dd>1,400 kg / 2.7 m</dd></div><div><dt>路面摩擦系数</dt><dd id="device-grip">0.85</dd></div><div><dt>驱动峰值功率</dt><dd>650 kW</dd></div><div><dt>画面帧率</dt><dd id="device-fps">测量中</dd></div><div><dt>站点往返延迟</dt><dd id="device-rtt">测量中</dd></div><div><dt>模拟电量 / 功率</dt><dd id="device-power">86.0% / 0.0 kW</dd></div></dl><p class="sheet-note">平直道路上的简化车辆模型，包含空气阻力、滚动阻力、轮胎附着和转向。预计急刹距离按当前速度、路面和全力直线制动计算，不包含驾驶者反应距离。松开油门后滑行，踩刹车后仍有移动距离。车流量可选较少、中等、拥挤。路段限速 120 / 100 / 80 km/h，超速自动制动至限速并释放刹车。D / R 换挡先制动至停稳；倒车上限 5 m/s，并切换至倒车视角。左右键每次切换一条相邻车道，车辆会自动回正居中；方向按道路左右定义。右侧应急车道会触发提示和全力制动。停稳后可解除锁定，重新踩油门返回右车道。护栏接触本身仍只产生碰撞和摩擦阻力。</p><button class="secondary-button" id="toggle-connection">断开模拟连接</button><button class="text-button" id="reset-session">重置模拟（回到起点）</button></dialog>
+  <dialog class="sheet" id="device-dialog"><div class="sheet-header"><h2>车辆与物理模型</h2><button class="icon-button" data-close="device-dialog" aria-label="关闭设备信息"><i data-icon="x"></i></button></div><div class="device-identity"><span class="device-mark"><i data-icon="gamepad"></i></span><div><strong>ROVER–01</strong><span>高速制动实验车</span></div><span class="demo-badge">简化车辆模型</span></div><dl class="device-details"><div><dt>连接状态</dt><dd id="device-status">模拟连接正常</dd></div><div><dt>速度上限</dt><dd>100 m/s · 360 km/h</dd></div><div><dt>质量 / 轴距</dt><dd>1,400 kg / 2.7 m</dd></div><div><dt>路面摩擦系数</dt><dd id="device-grip">0.85</dd></div><div><dt>驱动峰值功率</dt><dd>650 kW</dd></div><div><dt>画面帧率</dt><dd id="device-fps">测量中</dd></div><div><dt>站点往返延迟</dt><dd id="device-rtt">测量中</dd></div><div><dt>模拟电量 / 功率</dt><dd id="device-power">86.0% / 0.0 kW</dd></div></dl><p class="sheet-note">平直道路上的简化车辆模型，包含空气阻力、滚动阻力、轮胎附着和转向。预计急刹距离按当前速度、路面和全力直线制动计算，不包含驾驶者反应距离。松开油门后滑行，踩刹车后仍有移动距离。车流量可选较少、中等、拥挤。高速路段随机长短、随机限速 120 / 100 / 80 km/h，同一位置的限速保持稳定。自动驾驶提前减速、跟车、选择安全车道；手动驾驶超速时也会自动制动至限速。D / R 换挡先制动至停稳；倒车上限 5 m/s，并切换至倒车视角。A / D 或左右方向键每次切换一条相邻车道，车辆会自动回正居中；W / S 或上下键控制油门和刹车。实线路段禁止变道，可按出口提示沿匝道驶离高速。右侧应急车道会触发提示和全力制动。停稳后可解除锁定，重新踩油门返回右车道。护栏接触本身仍只产生碰撞和摩擦阻力。</p><button class="secondary-button" id="toggle-connection">断开模拟连接</button><button class="text-button" id="reset-session">重置模拟（回到起点）</button></dialog>
   <dialog class="sheet" id="log-dialog"><div class="sheet-header"><h2>操作记录</h2><button class="icon-button" data-close="log-dialog" aria-label="关闭操作记录"><i data-icon="x"></i></button></div><p class="sheet-note">本次会话的操作记录，刷新页面后清空。</p><ol class="activity-log" id="activity-log"></ol></dialog>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 </body>

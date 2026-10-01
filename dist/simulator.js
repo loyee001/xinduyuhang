@@ -1,6 +1,6 @@
 /* Meter-scale highway renderer. Pose x/y maps to world X/Z; heading is
-   clockwise from +Z. Static scenery repeats every 400 m; traffic and speed
-   signs keep absolute positions and are rebased by the same render origin. */
+   clockwise from +Z. Scenery repeats every 400 m; traffic, road markings,
+   exits and signs retain world positions through every camera rebase. */
 (() => {
   'use strict';
 
@@ -56,18 +56,28 @@
   // fonts, image downloads or external graphics dependencies.
   const FONT = {
     'A':['01110','10001','10001','11111','10001','10001','10001'],
+    'E':['11111','10000','10000','11110','10000','10000','11111'],
     'G':['01111','10000','10000','10111','10001','10001','01110'],
     'H':['10001','10001','10001','11111','10001','10001','10001'],
     'I':['111','010','010','010','010','010','111'],
     'O':['01110','10001','10001','10001','10001','10001','01110'],
+    'M':['10001','11011','10101','10101','10001','10001','10001'],
+    'P':['11110','10001','10001','11110','10000','10000','10000'],
     'S':['01111','10000','10000','01110','00001','00001','11110'],
+    'T':['11111','00100','00100','00100','00100','00100','00100'],
     'W':['10001','10001','10001','10101','10101','10101','01010'],
+    'X':['10001','10001','01010','00100','01010','10001','10001'],
     'Y':['10001','10001','01010','00100','00100','00100','00100'],
     '0':['01110','10001','10011','10101','11001','10001','01110'],
     '1':['010','110','010','010','010','010','111'],
     '2':['01110','10001','00001','00010','00100','01000','11111'],
+    '3':['11110','00001','00001','01110','00001','00001','11110'],
+    '4':['10010','10010','10010','11111','00010','00010','00010'],
+    '5':['11111','10000','10000','11110','00001','00001','11110'],
     '6':['01110','10000','10000','11110','10001','10001','01110'],
-    '8':['01110','10001','10001','01110','10001','10001','01110']
+    '7':['11111','00001','00010','00100','01000','01000','01000'],
+    '8':['01110','10001','10001','01110','10001','10001','01110'],
+    '9':['01110','10001','10001','01111','00001','00001','01110']
   };
   function lettering(target, text, centerX, bottom, z, height, color = COLORS.white) {
     const pixel = height / 7;
@@ -105,9 +115,135 @@
     }
   }
 
-  function buildHighway() {
+  function clearSections(start, end, blocked) {
+    const sections = [];
+    let cursor = start;
+    for (const interval of blocked) {
+      if (interval.end <= cursor || interval.start >= end) continue;
+      if (interval.start > cursor) sections.push([cursor, Math.min(end, interval.start)]);
+      cursor = Math.max(cursor, interval.end);
+      if (cursor >= end) break;
+    }
+    if (cursor < end) sections.push([cursor, end]);
+    return sections;
+  }
+  function exitSign(target, exit, worldY, origin) {
+    const x = 11.3, z = worldY - origin, front = z - .11;
+    box(target,x,0,z,.14,4.5,.14,COLORS.steel);
+    box(target,x,3.05,z,3.85,1.45,.18,COLORS.green);
+    lettering(target,`EXIT ${exit.number}`,x,3.85,front,.37);
+    lettering(target,`${Math.max(0,Math.round(exit.start-worldY))}M`,x-.35,3.32,front,.33);
+    polygon(target,[[x+1,3.2,front],[x+1.15,3.2,front],[x+1.6,3.64,front],[x+1.45,3.64,front]],COLORS.white);
+    polygon(target,[[x+1.2,3.64,front],[x+1.62,3.75,front],[x+1.62,3.32,front]],COLORS.white);
+  }
+  const localGeometry = () => window.RoverRoad?.localRoad || { speedLimitKmh:50,laneCenter:29,oncomingLaneCenter:25.5,width:7,halfLaneWidth:1.75 };
+  function localSpeedSign(target, worldY, origin) {
+    const settings = localGeometry(), x = settings.laneCenter+settings.halfLaneWidth+1.3, z = worldY-origin;
+    box(target,x,0,z,.09,2.8,.09,COLORS.steel);
+    disc(target,x,2.7,z-.015,.55,rgb('#d4493f'));
+    disc(target,x,2.7,z-.025,.44,COLORS.white);
+    lettering(target,String(settings.speedLimitKmh),x,2.5,z-.035,.39,COLORS.dark);
+  }
+  function buildLocalRoad(target, origin, route, start=-1600, end=2000) {
+    const settings = localGeometry(), left = settings.oncomingLaneCenter-settings.halfLaneWidth;
+    const right = settings.laneCenter+settings.halfLaneWidth, middle = (left+right)/2;
+    const connection = route?.rampEnd ?? -Infinity, begin = Math.max(start,connection-120-origin);
+    for (let z = begin; z < end; z += 20) {
+      const z2 = Math.min(z+20,end);
+      // The last 120 m widens gently from the exit lane into a two-way road.
+      const edge = (at, side) => {
+        const t = Math.max(0,Math.min(1,(at+origin-(connection-120))/120));
+        return side < 0 ? 26.5+(left-26.5)*t : 31.5+(right-31.5)*t;
+      };
+      const l1 = Number.isFinite(connection) ? edge(z,-1) : left, r1 = Number.isFinite(connection) ? edge(z,1) : right;
+      const l2 = Number.isFinite(connection) ? edge(z2,-1) : left, r2 = Number.isFinite(connection) ? edge(z2,1) : right;
+      polygon(target,[[l1,.008,z],[r1,.008,z],[r2,.008,z2],[l2,.008,z2]],COLORS.road,1.2,1);
+      if (z+origin < connection) continue;
+      for (const x of [middle-.13,middle+.13]) ground(target,x-.045,x+.045,z,z2,.022,COLORS.amber,2);
+      for (const x of [left,right]) {
+        const outside = x === left ? x-2.15 : x+2.15;
+        ground(target,Math.min(x,outside),Math.max(x,outside),z,z2,.085,rgb('#b2b0a1'),1.3);
+        box(target,x,.008,(z+z2)/2,.13,.13,z2-z,rgb('#d5d2be'),2);
+        for (let zz = z; zz < z2; zz += 4) ground(target,Math.min(x,outside),Math.max(x,outside),zz,zz+.035,.09,rgb('#999d90'),2);
+      }
+    }
+    const firstWorld = Math.ceil(Math.max(origin+start,connection+25)/64)*64;
+    for (let y = firstWorld; y < origin+end; y += 64) {
+      const z = y-origin, block = Math.floor(y/64), height = 3.2+((block%3+3)%3)*.8;
+      for (const side of [-1,1]) {
+        const x = side < 0 ? left-1.35 : right+1.35;
+        box(target,x,0,z,.11,5.4,.11,COLORS.steelDark);
+        box(target,x-side*.52,5.3,z,1.1,.12,.15,COLORS.steelDark);
+        box(target,x-side*.9,5.24,z,.42,.08,.23,rgb('#fff0ba'));
+        const buildingX = side < 0 ? left-7.1 : right+7.1;
+        const facade = (block+side)%2 ? rgb('#b6b2a0') : rgb('#a6b2a7');
+        box(target,buildingX,0,z+18,7.2,height,14,facade);
+        box(target,buildingX,height,z+18,7.5,.22,14.3,rgb('#65756d'));
+        for (const dx of [-2,0,2]) {
+          box(target,buildingX+dx,1.4,z+10.98,1,.95,.04,rgb('#46696f'));
+          box(target,buildingX+dx,1.4,z+25.02,1,.95,.04,rgb('#46696f'));
+        }
+        const nearSide = buildingX-side*3.62;
+        for (const dz of [14,18,22]) box(target,nearSide,1.4,z+dz,.04,.95,1.15,rgb('#46696f'));
+      }
+      for (const [x,direction] of [[settings.laneCenter,1],[settings.oncomingLaneCenter,-1]]) {
+        const point = (side,along) => [x+side,.026,z+along*direction];
+        polygon(target,[point(-.09,-2),point(.09,-2),point(.09,1),point(-.09,1)],COLORS.paint,2);
+        polygon(target,[point(-.5,.8),point(0,2.3),point(.5,.8)],COLORS.paint,2);
+      }
+      if (((block%5)+5)%5 === 0) localSpeedSign(target,y+24,origin);
+    }
+    if (route && route.rampEnd+30 >= origin+start && route.rampEnd+30 <= origin+end) localSpeedSign(target,route.rampEnd+30,origin);
+  }
+  function buildExits(target, exits, origin) {
+    const road = window.RoverRoad;
+    if (!road) return;
+    for (const exit of exits) {
+      for (const y of [exit.start-600,exit.start-300,exit.entryStart-30]) exitSign(target,exit,y,origin);
+      const half = exit.width / 2;
+      // The final part belongs to the widening connection to the local road.
+      const pavementEnd = exit.rampEnd-120;
+      for (let y = exit.entryStart; y < pavementEnd; y += 10) {
+        const y2 = Math.min(y+10,pavementEnd), x1 = road.centerForExit(exit,y), x2 = road.centerForExit(exit,y2);
+        const z1 = y-origin, z2 = y2-origin;
+        const strip = (left,right,height,color,layer=1) => polygon(target,
+          [[x1+left,height,z1],[x1+right,height,z1],[x2+right,height,z2],[x2+left,height,z2]],color,layer,1);
+        strip(-half-.6,half+.6,.004,COLORS.shoulder,1.1);
+        strip(-half,half,.005,COLORS.road,1.2);
+        // The left boundary only starts outside the highway so a joining ramp
+        // never draws a solid diagonal across the main right-hand travel lane.
+        if (x1-half > ROAD.emergencyEnd) strip(-half,-half+.12,.018,COLORS.paint,2);
+        if (x1+half > ROAD.emergencyEnd) strip(half-.12,half,.018,COLORS.paint,2);
+        if (y > exit.entryStart+110 && y < exit.entryStart+200) {
+          const left = ROAD.emergencyEnd+.25, right = x1-half-.25;
+          if (right > left) ground(target,left,right,z1,z1+.4,.02,COLORS.paint,2);
+        }
+        if (x1-half > ROAD.guardrailRight+.5) {
+          for (const side of [-1,1]) {
+            const edge1 = x1+side*(half+.5), edge2 = x2+side*(half+.5);
+            polygon(target,[[edge1,.65,z1],[edge2,.65,z2],[edge2,.87,z2],[edge1,.87,z1]],COLORS.steel);
+          }
+        }
+      }
+      // A lane-shaped arrow follows the branch; chevrons distinguish its
+      // paved entrance from the amber emergency shoulder alongside it.
+      for (let y = exit.entryStart+30; y < exit.rampEnd-120; y += 65) {
+        const x = road.centerForExit(exit,y), z = y-origin;
+        const slope = (road.centerForExit(exit,y+2)-road.centerForExit(exit,y-2))/4;
+        const point = (side,along) => [x+side+slope*along,.028,z+along];
+        polygon(target,[point(-.1,-2),point(.1,-2),point(.1,1),point(-.1,1)],COLORS.paint,2);
+        polygon(target,[point(-.7,.8),point(0,3),point(.7,.8)],COLORS.paint,2);
+      }
+    }
+  }
+  function buildHighway(origin = 0, route = null) {
     const target = mesh();
     const start = -1600, end = 2000;
+    const events = window.RoverRoad?.eventsAround(origin+200,2100) || { solids: [], exits: [] };
+    if (route) events.exits = [route];
+    const solids = events.solids.map(zone => ({ start:zone.start-origin, end:zone.end-origin }));
+    const openings = events.exits.map(exit => ({ start:exit.openingStart-origin, end:exit.openingEnd-origin }));
+    const openingAt = z => openings.some(opening => z >= opening.start && z <= opening.end);
     // Short ground strips preserve fog and perspective near the horizon.
     for (let z = start; z < end; z += 50) {
       ground(target,-2000,2000,z,z+50,-.07,COLORS.grass,0);
@@ -115,58 +251,86 @@
       ground(target,-ROAD.shoulderEdge,ROAD.emergencyEnd,z,z+50,0,COLORS.shoulder,1,1);
       ground(target,ROAD.emergencyStart,ROAD.emergencyEnd,z,z+50,.002,rgb('#686b62'),1,1);
       ground(target,-ROAD.halfWidth,ROAD.halfWidth,z,z+50,.003,COLORS.road,1,1);
-      for (const x of [-ROAD.halfWidth,ROAD.halfWidth]) ground(target,x-.085,x+.085,z,z+50,.012,COLORS.paint,2);
-      ground(target,ROAD.emergencyEnd-.1,ROAD.emergencyEnd,z,z+50,.013,COLORS.amber,2);
+      ground(target,-ROAD.halfWidth-.085,-ROAD.halfWidth+.085,z,z+50,.012,COLORS.paint,2);
+      for (const [a,b] of clearSections(z,z+50,openings)) {
+        ground(target,ROAD.halfWidth-.085,ROAD.halfWidth+.085,a,b,.012,COLORS.paint,2);
+        ground(target,ROAD.emergencyEnd-.1,ROAD.emergencyEnd,a,b,.013,COLORS.amber,2);
+      }
       // A parallel opposing carriageway, beyond the planted central reservation.
       ground(target,-29.1,-14.9,z,z+50,0,COLORS.shoulder,1,1);
       ground(target,-27.625,-16.375,z,z+50,.003,COLORS.road,1,1);
       for (const x of [-27.625,-16.375]) ground(target,x-.08,x+.08,z,z+50,.012,COLORS.paint,2);
       for (const x of [ROAD.guardrailLeft,ROAD.guardrailRight,-14.6,-29.4]) {
-        box(target,x,0,z+25,.34,.37,50,COLORS.steelDark);
-        box(target,x,.62,z+25,.13,.23,50,COLORS.steel);
-        box(target,x,.6,z+25,.14,.045,50,COLORS.steelDark);
+        for (const [a,b] of x === ROAD.guardrailRight ? clearSections(z,z+50,openings) : [[z,z+50]]) {
+          box(target,x,0,(a+b)/2,.34,.37,b-a,COLORS.steelDark);
+          box(target,x,.62,(a+b)/2,.13,.23,b-a,COLORS.steel);
+          box(target,x,.6,(a+b)/2,.14,.045,b-a,COLORS.steelDark);
+        }
       }
     }
     for (let z = start; z < end; z += 16) {
-      for (const x of [-1.875,1.875,-20.125,-23.875]) ground(target,x-.075,x+.075,z,z+6,.014,COLORS.paint,2);
+      for (const x of [-20.125,-23.875]) ground(target,x-.075,x+.075,z,z+6,.014,COLORS.paint,2);
+      for (const [a,b] of clearSections(z,z+6,solids)) {
+        for (const x of [-1.875,1.875]) ground(target,x-.075,x+.075,a,b,.014,COLORS.paint,2);
+      }
+    }
+    for (const zone of solids) for (let z = Math.max(start,zone.start); z < Math.min(end,zone.end); z += 40) {
+      for (const x of [-1.875,1.875]) ground(target,x-.075,x+.075,z,Math.min(z+40,zone.end,end),.014,COLORS.paint,2);
     }
     for (let z = start; z < end; z += 12.5) {
-      for (const x of [ROAD.guardrailLeft,ROAD.guardrailRight]) box(target,x,0,z,.12,.77,.13,COLORS.steelDark);
+      for (const x of [ROAD.guardrailLeft,ROAD.guardrailRight]) if (x !== ROAD.guardrailRight || !openingAt(z)) box(target,x,0,z,.12,.77,.13,COLORS.steelDark);
     }
     for (let z = start; z < end; z += 50) {
       for (const x of [-8.2,9.7]) {
+        if (x > 0 && openingAt(z)) continue;
         box(target,x,0,z,.16,1.05,.16,COLORS.white);
         box(target,x,.65,z-.09,.18,.27,.02,COLORS.dark);
         box(target,x,.72,z-.105,.09,.11,.022,x < 0 ? COLORS.amber : COLORS.red);
       }
       // Rumble-strip insets along the hard shoulder provide near-field motion.
-      for (const x of [-6,6]) for (let dz = 0; dz < 50; dz += 5) ground(target,x-.17,x+.17,z+dz,z+dz+.16,.008,COLORS.steelDark,2);
+      for (const x of [-6,6]) for (let dz = 0; dz < 50; dz += 5) if (x < 0 || !openingAt(z+dz)) ground(target,x-.17,x+.17,z+dz,z+dz+.16,.008,COLORS.steelDark,2);
       // The 3 m paved emergency lane is outside the solid white edge line.
       // Cross-hatching by the outer rail and SOS boards distinguish it from
       // a fourth travel lane without filling the usable stopping surface.
-      for (let dz = 0; dz < 50; dz += 8) polygon(target,
+      for (let dz = 0; dz < 50; dz += 8) if (!openingAt(z+dz)) polygon(target,
         [[8.1,.015,z+dz],[8.5,.015,z+dz+1],[8.5,.015,z+dz+1.5],[8.1,.015,z+dz+.5]],COLORS.amber,2);
     }
     for (let z = start; z < end; z += ROAD.repeat) {
-      gantry(target,z+200);
-      box(target,10,0,z+110,.12,2.6,.12,COLORS.steel);
-      box(target,10,2.1,z+110,1.55,1.02,.13,COLORS.amber);
-      lettering(target,'SOS',10,2.38,z+109.92,.44,COLORS.dark);
+      if (!openingAt(z+200)) gantry(target,z+200);
+      if (!openingAt(z+110)) {
+        box(target,10,0,z+110,.12,2.6,.12,COLORS.steel);
+        box(target,10,2.1,z+110,1.55,1.02,.13,COLORS.amber);
+        lettering(target,'SOS',10,2.38,z+109.92,.44,COLORS.dark);
+      }
       hill(target,480,z+150,670,470,120,COLORS.hillsFar);
       hill(target,-520,z+290,660,500,155,COLORS.hillsFar);
       hill(target,310,z+65,340,290,72,COLORS.hills);
       hill(target,-355,z+310,320,310,91,COLORS.hills);
       // Low roadside planting, kept well outside the driving surface.
       for (const [x,dz,h] of [[24,45,5],[-41,135,6],[34,280,4.4],[-43,340,5.5]]) {
+        if (x > 0 && events.exits.some(exit => z+dz+origin >= exit.entryStart && z+dz+origin <= exit.rampEnd && Math.abs(x-window.RoverRoad.centerForExit(exit,z+dz+origin)) < 6)) continue;
         box(target,x,0,z+dz,.22,h*.58,.22,COLORS.dark);
         hill(target,x,z+dz,4.5,4.5,h,COLORS.hills);
       }
     }
+    buildExits(target,events.exits,origin);
+    // Unselected exits still have a visible continuation. Once a route is
+    // selected, only that connection is drawn so later exits cannot overlap it.
+    for (const exit of events.exits) buildLocalRoad(target,origin,exit,start,route ? end : Math.min(end,exit.rampEnd+700-origin));
     target.data = new Float32Array(target.vertices);
     target.vertices = null;
     return target;
   }
-  const highway = buildHighway();
+  function buildLocalWorld(origin, route) {
+    const target = mesh(), start = -1600, end = 2000;
+    for (let z = start; z < end; z += 50) ground(target,-2000,2000,z,z+50,-.07,COLORS.grass,0);
+    // Entering local-road mode is a lasting scene transition. Its road runs
+    // in both directions, even if reverse travel passes the old ramp station.
+    buildLocalRoad(target,origin,null,start,end);
+    target.data = new Float32Array(target.vertices);
+    target.vertices = null;
+    return target;
+  }
 
   const vehicleTemplates = new Map();
   function buildVehicleTemplate(vehicle, level) {
@@ -244,7 +408,9 @@
     polygon(target,points,color);
   }
   function speedSign(target,sign,origin) {
-    const x = 10, z = sign.y-origin;
+    const exit = window.RoverRoad?.getState(sign.y).activeExit;
+    const center = exit ? window.RoverRoad.centerForExit(exit,sign.y) : 0;
+    const x = exit && Math.abs(center-10) < 4 ? center+exit.width/2+1.5 : 10, z = sign.y-origin;
     box(target,x,0,z,.12,3.6,.12,COLORS.steel);
     disc(target,x,3.55,z+.012,.88,COLORS.steelDark);
     disc(target,x,3.55,z-.02,.88,rgb('#d4493f'));
@@ -257,6 +423,10 @@
     stats.visibleTraffic = 0;
     for (const vehicle of pose.traffic || []) {
       if (![vehicle.x,vehicle.y].every(Number.isFinite)) continue;
+      if (pose.localRoad) {
+        const local = localGeometry();
+        if (vehicle.x < local.oncomingLaneCenter-local.halfLaneWidth || vehicle.x > local.laneCenter+local.halfLaneWidth) continue;
+      }
       const dx = vehicle.x-pose.x, dz = vehicle.y-pose.y;
       const depth = dx*sin+dz*cos, side = dx*cos-dz*sin;
       const margin = vehicle.length || 8;
@@ -283,7 +453,7 @@
         for (const side of [-1,1]) box(target,vehicle.x+side*vehicle.width*.34,.62,z-direction*(vehicle.length/2+.022),.4,.21,.024,rgb('#ff7155'));
       }
     }
-    const signs = pose.roadSigns || window.RoverTraffic?.signsAround(pose.y) || [];
+    const signs = pose.localRoad ? [] : pose.roadSigns || window.RoverTraffic?.signsAround(pose.y) || [];
     for (const sign of signs) speedSign(target,sign,origin);
     return target;
   }
@@ -355,6 +525,7 @@
   }
 
   function createCamera(canvas) {
+    let highwayOrigin = 0, sceneKey = 'highway:none', highway = buildHighway(highwayOrigin);
     let gl = null, context = null, program = null, staticBuffer = null, guideBuffer = null, trafficBuffer = null, skyBuffer = null;
     let width = 0, height = 0, frames = 0, totalFrames = 0, frameStart = performance.now(), disposed = false;
     let locations;
@@ -489,7 +660,20 @@
       draw(pose,now = performance.now()) {
         if (disposed || gl?.isContextLost() || ![pose.x,pose.y,pose.heading].every(Number.isFinite)) return false;
         const origin = Math.floor(pose.y/ROAD.repeat)*ROAD.repeat, localY = pose.y-origin;
+        const route = pose.exitRoute || null, nextSceneKey = `${pose.localRoad ? 'local' : 'highway'}:${route?.id || 'none'}`;
+        if (origin !== highwayOrigin || nextSceneKey !== sceneKey) {
+          highwayOrigin = origin;
+          sceneKey = nextSceneKey;
+          highway = pose.localRoad ? buildLocalWorld(origin,route) : buildHighway(origin,route);
+          if (gl) {
+            gl.bindBuffer(gl.ARRAY_BUFFER,staticBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER,highway.data,gl.STATIC_DRAW);
+          }
+        }
         stats.worldOrigin = origin;
+        stats.roadType = pose.localRoad ? 'local' : route ? 'exit' : 'highway';
+        stats.roadSolid = !pose.localRoad && Boolean(window.RoverRoad?.getState(pose.y).solid);
+        stats.nearbyExits = pose.localRoad ? 0 : route ? 1 : window.RoverRoad?.eventsAround(pose.y,ROAD.far).exits.length || 0;
         stats.cameraHeading = viewHeading(pose);
         const guide = buildBrakingGuide(pose,origin,stats);
         const traffic = buildTraffic(pose,origin,stats,!gl);
