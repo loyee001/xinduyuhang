@@ -85,6 +85,8 @@ function createDOM() {
 
 function loadApp(windowOverrides = {}) {
   const document = createDOM();
+  const modelTools = new Map();
+  document.modelContext = { registerTool(tool) { modelTools.set(tool.name, tool); } };
   const listeners = new Map();
   let now = 0, timer = 0;
   const window = {
@@ -101,7 +103,7 @@ function loadApp(windowOverrides = {}) {
   };
   Object.assign(window, windowOverrides);
   const context = vm.createContext({
-    window, document, console, performance: { now: () => now },
+    window, document, console, AbortController, performance: { now: () => now },
     location: { protocol: 'file:' },
     requestAnimationFrame() { return ++timer; },
     setTimeout() { return ++timer; }, clearTimeout() {}
@@ -123,7 +125,7 @@ function loadApp(windowOverrides = {}) {
     return node;
   };
   return {
-    app, document, ui,
+    app, document, ui, modelTools,
     advance(seconds) {
       app.advanceElapsed(seconds);
       now += seconds * 1000;
@@ -158,20 +160,23 @@ function assertNoAutomaticBrake(app) {
   assert.equal(app.car.braking, false);
 }
 
-test('a left guardrail contact alone does not emergency brake and lane assistance recovers', () => {
+test('a guardrail impact freezes the scene at contact and requests a restart without faking a full stop', () => {
   const driver = loadApp(), { app } = driver;
   app.world.vehicles = [];
   Object.assign(app.car, { x: -6.44, heading: -15, speed: 30 });
   app.state.laneTarget = 0;
   driver.key('keydown', 'ArrowUp');
   driver.advance(0.3);
-  assert.ok(app.car.wallContactCount > 0);
+  assert.equal(app.car.wallContactCount, 1);
+  assert.equal(app.state.collision.kind, 'guardrail');
   assert.equal(app.state.estop, false);
-  assert.equal(app.state.controls.get('kArrowUp'), 'throttle');
+  assert.equal(app.state.controls.size, 0);
+  assert.ok(app.car.speed > 0 && app.car.speed < 30, 'the paused impact keeps its physical velocity');
+  assert.equal(driver.ui('collision-dialog').open, true);
+  const atImpact = JSON.stringify({ car: app.car, world: app.world, trail: app.state.trail });
   driver.advance(10);
-  assert.ok(Math.abs(app.car.x + 3.75) < 0.08);
-  assert.equal(app.car.wallContact, null);
-  assertNoAutomaticBrake(app);
+  assert.equal(JSON.stringify({ car: app.car, world: app.world, trail: app.state.trail }), atImpact);
+  assert.equal(app.readState().collision.kind, 'guardrail');
 });
 
 test('road-limit crossings apply gradual braking, retain throttle, and release at the limit', () => {
@@ -268,18 +273,198 @@ test('actual traffic advances in both directions and reset rebuilds the initial 
   assert.equal(app.readState().trafficCount, 78);
 });
 
-test('real traffic contact loses speed but retains the held throttle and available controls', () => {
+test('real traffic contact loses speed once, clears held throttle and freezes all traffic', () => {
   const driver = loadApp(), { app } = driver;
   const leader = app.world.vehicles.find(v => v.lane === 1 && v.y > 0);
   Object.assign(app.car, { x: 0, y: leader.y - 5, speed: 33 });
   driver.setTarget(100);
   driver.key('keydown', 'ArrowUp');
   driver.advance(0.5);
-  assert.ok(app.world.contacts > 0);
+  assert.equal(app.world.contacts, 1);
   assert.ok(app.car.speed > 0 && app.car.speed < 33);
-  assert.equal(app.state.controls.get('kArrowUp'), 'throttle');
-  assert.equal(app.state.lastInput.throttle, 1);
-  assertNoAutomaticBrake(app);
+  assert.equal(app.state.collision.kind, 'vehicle');
+  assert.equal(app.state.controls.size, 0);
+  assert.equal(app.state.lastInput.throttle, 0);
+  assert.equal(app.state.estop, false);
+  assert.equal(driver.ui('collision-dialog').open, true);
+  const atImpact = JSON.stringify({ car: app.car, world: app.world });
+  driver.advance(60);
+  assert.equal(JSON.stringify({ car: app.car, world: app.world }), atImpact);
+  assert.equal(app.world.contacts, 1, 'a held overlap cannot record repeated crashes while paused');
+});
+
+function causeVehicleCollision(driver, { reverse = false, local = false } = {}) {
+  const { app } = driver, y = local ? app.car.y : 900, x = local ? 29 : 0;
+  Object.assign(app.car, { x, y, heading: 0, steer: 0, speed: reverse ? 5 : 25,
+    gear: reverse ? 'reverse' : 'forward' });
+  app.state.requestedGear = app.car.gear;
+  app.state.laneTarget = 1;
+  const lead = adviceVehicle(local ? 0 : 1, y + (reverse ? -5 : 5), 0, 999);
+  lead.x = x;
+  app.world.vehicles = [lead];
+  driver.advance(2);
+  assert.equal(app.state.collision?.kind, 'vehicle', 'the fixture must produce a real traffic collision');
+  return app.state.collision;
+}
+
+test('reverse contact also pauses the simulation and restart restores a stopped forward vehicle', () => {
+  const driver = loadApp(), { app, ui } = driver;
+  causeVehicleCollision(driver, { reverse: true });
+  assert.equal(app.car.gear, 'reverse');
+  assert.equal(app.readState().collision.kind, 'vehicle');
+  ui('collision-restart').onclick();
+  assert.equal(app.state.collision, null);
+  assert.equal(app.readState().collision, null);
+  assert.equal(ui('collision-dialog').open, false);
+  assert.equal(app.car.gear, 'forward');
+  assert.equal(app.state.requestedGear, 'forward');
+  assert.equal(app.car.x, 0);
+  assert.equal(app.car.y, 0);
+  assert.equal(app.car.speed, 0);
+  assert.equal(app.car.distance, 0);
+  assert.equal(app.world.contacts, 0);
+  driver.advance(5);
+  assert.equal(app.car.speed, 0, 'restart must wait for a fresh driving action');
+  assert.equal(app.car.y, 0);
+});
+
+test('collision cancels manual input, a compound AI task and automatic driving in every control mode', () => {
+  for (const mode of ['manual', 'ai', 'auto']) {
+    const driver = loadApp(), { app, ui } = driver;
+    app.world.vehicles = [];
+    if (mode === 'manual') driver.key('keydown', 'KeyW');
+    if (mode === 'ai') {
+      ui('ai-tab').onclick();
+      app.submitCommand('直行500米后向左变道并制动');
+      app.startPlan();
+      assert.equal(app.state.plan.status, 'running');
+    }
+    if (mode === 'auto') startAutomatic(driver);
+    causeVehicleCollision(driver);
+    assert.equal(app.state.mode, mode);
+    assert.equal(app.state.controls.size, 0, mode);
+    assert.equal(app.state.autodrive.active, false, mode);
+    assert.equal(app.state.exitCruise, false, mode);
+    assert.notEqual(app.state.plan?.status, 'running', mode);
+    assert.equal(app.state.lastInput.throttle, 0, mode);
+    ui('collision-restart').onclick();
+    assert.equal(app.state.mode, mode, 'restart keeps the selected control panel');
+    driver.advance(3);
+    assert.equal(app.car.speed, 0, mode + ' must not resume the previous driving owner');
+    assert.equal(app.state.autodrive.active, false);
+    assert.equal(app.state.plan, null);
+  }
+});
+
+test('paused collisions reject touch, keyboard, horn, route, density and WebMCP driving commands', () => {
+  const driver = loadApp(), { app, ui, document, modelTools } = driver;
+  const collision = causeVehicleCollision(driver);
+  const frozen = JSON.stringify({ car: app.car, world: app.world });
+  const hornCount = app.state.horn.count, lane = app.state.laneTarget, density = app.state.trafficDensity;
+  driver.key('keydown', 'KeyW');
+  driver.key('keydown', 'ArrowLeft');
+  document.querySelectorAll('[data-drive]').find(button => button.dataset.drive === 'throttle')
+    .onpointerdown({ button: 0, pointerId: 33, preventDefault() {} });
+  ui('horn-button').onclick();
+  ui('gear-reverse').onclick();
+  ui('auto-start').onclick();
+  ui('lane-right').onclick();
+  app.requestExit();
+  document.querySelectorAll('[data-density]').find(button => button.dataset.density === 'dense').onclick();
+  assert.equal(app.submitCommand('前进20米').status, 'blocked');
+  app.startPlan();
+  assert.equal(modelTools.get('stage_rover_simulation_command').execute({ command: '直行50米后停车' }).status, 'blocked');
+  assert.equal(modelTools.get('change_rover_simulation_lane').execute({ direction: 'left' }).accepted, false);
+  modelTools.get('emergency_stop_rover_simulation').execute({});
+  driver.advance(20);
+  assert.equal(app.state.collision, collision, 'blocked actions cannot replace the first collision');
+  assert.equal(JSON.stringify({ car: app.car, world: app.world }), frozen);
+  assert.equal(app.state.controls.size, 0);
+  assert.equal(app.state.autodrive.active, false);
+  assert.notEqual(app.state.plan?.status, 'ready');
+  assert.equal(app.state.horn.count, hornCount);
+  assert.equal(app.state.laneTarget, lane);
+  assert.equal(app.state.trafficDensity, density);
+  assert.equal(app.state.requestedGear, 'forward');
+  assert.equal(ui('collision-dialog').open, true);
+});
+
+test('the collision dialog cannot be dismissed by Escape or clicking outside its content', () => {
+  const driver = loadApp(), { ui } = driver;
+  causeVehicleCollision(driver);
+  const dialog = ui('collision-dialog');
+  let prevented = false;
+  dialog.oncancel({ preventDefault() { prevented = true; } });
+  assert.equal(prevented, true, 'native Escape cancellation must be prevented');
+  dialog.getBoundingClientRect = () => ({ left: 10, right: 200, top: 10, bottom: 200 });
+  dialog.onclick?.({ target: dialog, clientX: 0, clientY: 0 });
+  assert.equal(dialog.open, true);
+});
+
+test('collision restart preserves driving preferences while clearing locks, inputs, timers and impact data', () => {
+  for (const connected of [true, false]) {
+    const driver = loadApp(), { app, ui, document } = driver;
+    ui('wet-road').onclick();
+    driver.setTarget(19);
+    document.querySelectorAll('[data-density]').find(button => button.dataset.density === 'low').onclick();
+    ui('ai-tab').onclick();
+    // An existing brake lock can still end in a collision before its physical
+    // braking distance is exhausted. Restart begins a new run, unlike reset.
+    ui('emergency-stop').onclick();
+    app.state.connected = connected;
+    causeVehicleCollision(driver);
+    assert.equal(app.state.estop, true);
+    assert.equal(app.state.wet, true);
+    ui('collision-restart').onclick();
+    assert.equal(app.state.connected, connected);
+    assert.equal(app.state.mode, 'ai');
+    assert.equal(app.state.speedLimit, 19);
+    assert.equal(app.state.trafficDensity, 'low');
+    assert.equal(app.state.wet, true);
+    assert.equal(app.world.vehicles.length, 42);
+    assert.equal(app.state.estop, false);
+    assert.equal(app.state.serviceBrake, 0);
+    assert.equal(app.state.failsafe, false);
+    assert.equal(app.state.lastInput.throttle, 0);
+    assert.equal(app.state.lastInput.brake, 0);
+    assert.equal(app.state.lastInput.steering, 0);
+    assert.equal(app.state.brakeAnchor, null);
+    assert.equal(app.state.contactUntil, 0);
+    assert.equal(app.car.elapsedTime, 0);
+    assert.equal(app.world.elapsedTime, 0);
+    assert.equal(app.world.contacts, 0);
+    assert.equal(app.car.wallContactCount, 0);
+    assert.equal(app.state.laneTarget, 1);
+    assert.equal(app.state.shiftPending, false);
+    assert.equal(app.state.shoulderAlert, false);
+    assert.equal(app.state.shoulderRecovery, false);
+    assert.equal(app.state.horn.count, 0);
+    assert.equal(app.state.horn.status, 'idle');
+    driver.advance(1);
+    assert.equal(app.car.speed, 0);
+  }
+});
+
+test('collision during ordinary-road cruise clears its route on restart and waits for fresh input', () => {
+  const driver = localRoadCruise(), { app, ui } = driver;
+  assert.equal(app.state.exitCruise, true);
+  causeVehicleCollision(driver, { local: true });
+  assert.equal(app.state.exitCruise, false);
+  ui('collision-restart').onclick();
+  assert.equal(app.state.exitActive, null);
+  assert.equal(app.state.exitCompleted, false);
+  assert.equal(app.state.exitCruise, false);
+  assert.equal(app.readState().roadType, 'highway');
+  assert.equal(app.state.horn.count, 0);
+  driver.key('keydown', 'KeyW', true);
+  driver.advance(1);
+  assert.equal(app.car.speed, 0, 'a key still held from the old run is not a new driving action');
+  driver.key('keyup', 'KeyW');
+  driver.key('keydown', 'KeyW');
+  driver.advance(1);
+  assert.ok(app.car.speed > 0);
+  assert.ok(app.car.y > 0);
+  assert.equal(app.state.collision, null);
 });
 
 test('a 100 m/s AI request transparently tests at the road limit and records a real stop', () => {
