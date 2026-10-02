@@ -79,7 +79,8 @@ function createDOM() {
     addEventListener(name, callback) {
       if (!listeners.has(name)) listeners.set(name, []);
       listeners.get(name).push(callback);
-    }
+    },
+    dispatch(name) { for (const callback of listeners.get(name) || []) callback({type:name}); }
   };
 }
 
@@ -89,6 +90,7 @@ function loadApp(windowOverrides = {}) {
   document.modelContext = { registerTool(tool) { modelTools.set(tool.name, tool); } };
   const listeners = new Map();
   let now = 0, timer = 0;
+  const drawn = [];
   const window = {
     addEventListener(name, callback) {
       if (!listeners.has(name)) listeners.set(name, []);
@@ -97,7 +99,7 @@ function loadApp(windowOverrides = {}) {
     RoverSimulator: {
       createCamera(canvas) {
         assert.equal(canvas.tagName, 'CANVAS');
-        return { stats: { fps: 30, frames: 0, backend: 'test camera' }, pause() {}, draw() { return true; } };
+        return { stats: { fps: 30, frames: 0, backend: 'test camera' }, pause() {}, draw(pose) { drawn.push(JSON.parse(JSON.stringify(pose))); return true; } };
       }
     }
   };
@@ -117,7 +119,7 @@ function loadApp(windowOverrides = {}) {
     get world() { return trafficWorld; },
     get road() { return window.RoverRoad; },
     get traffic() { return window.RoverTraffic; },
-    advanceElapsed, render, readState, parseCommand, submitCommand, startPlan, requestExit
+    advanceElapsed, render, readState, parseCommand, submitCommand, startPlan, requestExit, tick
   })`, context);
   const ui = id => {
     const node = document.getElementById(id);
@@ -125,7 +127,8 @@ function loadApp(windowOverrides = {}) {
     return node;
   };
   return {
-    app, document, ui, modelTools,
+    app, document, ui, modelTools, drawn,
+    frame(seconds) { now += seconds * 1000; app.tick(now); },
     advance(seconds) {
       app.advanceElapsed(seconds);
       now += seconds * 1000;
@@ -169,12 +172,15 @@ test('a guardrail impact freezes the scene at contact and requests a restart wit
   driver.advance(0.3);
   assert.equal(app.car.wallContactCount, 1);
   assert.equal(app.state.collision.kind, 'guardrail');
+  assert.ok(app.state.collisionEffect.peakHeight >= 1.8 && app.state.collisionEffect.peakHeight < 2.6,
+    'even a scrape visibly lifts the whole car, but uses lateral impact speed to keep below a head-on launch');
   assert.equal(app.state.estop, false);
   assert.equal(app.state.controls.size, 0);
   assert.ok(app.car.speed > 0 && app.car.speed < 30, 'the paused impact keeps its physical velocity');
-  assert.equal(driver.ui('collision-dialog').open, true);
+  assert.ok(!driver.ui('collision-dialog').open, 'show the brief impact animation before the result');
   const atImpact = JSON.stringify({ car: app.car, world: app.world, trail: app.state.trail });
   driver.advance(10);
+  assert.equal(driver.ui('collision-dialog').open, true);
   assert.equal(JSON.stringify({ car: app.car, world: app.world, trail: app.state.trail }), atImpact);
   assert.equal(app.readState().collision.kind, 'guardrail');
 });
@@ -286,23 +292,24 @@ test('real traffic contact loses speed once, clears held throttle and freezes al
   assert.equal(app.state.controls.size, 0);
   assert.equal(app.state.lastInput.throttle, 0);
   assert.equal(app.state.estop, false);
-  assert.equal(driver.ui('collision-dialog').open, true);
+  assert.ok(!driver.ui('collision-dialog').open);
   const atImpact = JSON.stringify({ car: app.car, world: app.world });
   driver.advance(60);
+  assert.equal(driver.ui('collision-dialog').open, true);
   assert.equal(JSON.stringify({ car: app.car, world: app.world }), atImpact);
   assert.equal(app.world.contacts, 1, 'a held overlap cannot record repeated crashes while paused');
 });
 
-function causeVehicleCollision(driver, { reverse = false, local = false } = {}) {
+function causeVehicleCollision(driver, { reverse = false, local = false, seconds = 6, speed = reverse ? 5 : 25 } = {}) {
   const { app } = driver, y = local ? app.car.y : 900, x = local ? 29 : 0;
-  Object.assign(app.car, { x, y, heading: 0, steer: 0, speed: reverse ? 5 : 25,
+  Object.assign(app.car, { x, y, heading: 0, steer: 0, speed,
     gear: reverse ? 'reverse' : 'forward' });
   app.state.requestedGear = app.car.gear;
   app.state.laneTarget = 1;
   const lead = adviceVehicle(local ? 0 : 1, y + (reverse ? -5 : 5), 0, 999);
   lead.x = x;
   app.world.vehicles = [lead];
-  driver.advance(2);
+  driver.advance(seconds);
   assert.equal(app.state.collision?.kind, 'vehicle', 'the fixture must produce a real traffic collision');
   return app.state.collision;
 }
@@ -2054,4 +2061,274 @@ test('automatic startup cannot override an emergency lock or drive out of the em
     assert.equal(app.state.autodrive.active, false, 'releasing emergency stop never resumes automatic control');
     assert.equal(app.car.speed, 0);
   }
+});
+
+test('highway entrances create real timed arrivals and refresh the roadside preview', () => {
+  const driver = loadApp(), { app, ui } = driver;
+  const entrance = app.road.getState(0).nextEntrance;
+  app.world.vehicles = [];
+  app.car.y = entrance.start - 200;
+  driver.advance(0.1);
+  assert.equal(ui('entrance-preview').hidden, false);
+  assert.equal(ui('entrance-name').textContent, entrance.name);
+  assert.match(ui('entrance-detail').textContent, /前方 390 m/);
+  assert.match(ui('entrance-status').textContent, /沿入口匝道接近/);
+  const first = app.world.vehicles.find(vehicle => vehicle.fromEntrance);
+  assert.ok(first && first.x > 8.625, 'an arrival starts outside the motorway, on the feeder');
+  driver.advance(32);
+  assert.ok(app.readState().merging.arrivals >= 2, 'traffic keeps entering in separate timed waves');
+  assert.ok(app.readState().merging.completed >= 1, 'a clear ramp joins the live right lane');
+  assert.equal(first.lane, 2);
+  assert.equal(first.x, 3.75);
+  assert.equal(app.state.collision, null);
+  app.car.y = entrance.end + 1;
+  app.render();
+  assert.notEqual(ui('entrance-name').textContent, entrance.name, 'passing one entrance previews the next');
+});
+
+test('an entrance queue freezes on collision and restarting clears its vehicles and counters', () => {
+  const driver = loadApp(), { app, ui } = driver;
+  app.world.vehicles = [];
+  app.car.y = app.road.getState(0).nextEntrance.start - 200;
+  driver.advance(0.1);
+  assert.equal(app.readState().merging.activeCount, 1);
+  Object.assign(app.car, { x:-6.44, heading:-15, speed:30 });
+  app.state.laneTarget = 0;
+  driver.key('keydown', 'ArrowUp');
+  driver.advance(0.3);
+  assert.equal(app.state.collision.kind, 'guardrail');
+  assert.match(ui('entrance-status').textContent, /本局已结束/);
+  const frozen = JSON.stringify(app.world);
+  driver.advance(30);
+  assert.equal(JSON.stringify(app.world), frozen);
+  ui('collision-restart').onclick();
+  const snapshot = app.readState().merging;
+  assert.equal(snapshot.arrivals, 0);
+  assert.equal(snapshot.completed, 0);
+  assert.equal(snapshot.activeCount, 0);
+  assert.ok(app.world.vehicles.every(vehicle => !vehicle.fromEntrance));
+  assert.equal(app.car.y, 0);
+  assert.equal(app.car.speed, 0);
+});
+
+test('selecting an exit hides highway entrance notices and does not spawn them on the local road', () => {
+  const driver = loadApp(), { app, ui } = driver;
+  app.world.vehicles = [];
+  Object.assign(app.car, { x:3.75, y:900, speed:20 });
+  app.state.laneTarget = 2;
+  startAutomatic(driver, 'exit');
+  advanceUntil(driver, () => !!app.state.exitActive, 5);
+  assert.equal(ui('entrance-preview').hidden, true);
+  advanceUntil(driver, () => app.state.exitCompleted, 120);
+  assert.equal(ui('entrance-preview').hidden, true);
+  driver.advance(30);
+  assert.ok(app.car.y > app.road.getState(0).nextEntrance.start);
+  assert.equal(app.readState().roadType, 'local');
+  assert.equal(app.readState().merging.arrivals, 0);
+  assert.equal(app.readState().merging.activeCount, 0);
+});
+
+test('collision animation advances its visual clock while the impact and traffic stay frozen', () => {
+  const driver=loadApp(),{app,ui,drawn}=driver;
+  app.state.map=true;ui('map-view').hidden=false;
+  causeVehicleCollision(driver,{seconds:.05});
+  assert.equal(app.state.map,false,'a collision must be visible even when the map was selected');
+  assert.equal(ui('map-view').hidden,true);
+  assert.equal(app.readState().collisionAnimation.active,true);
+  assert.ok(!ui('collision-dialog').open);
+  const frozen=JSON.stringify({car:app.car,world:app.world,collision:app.state.collision});
+  driver.frame(.12);
+  assert.ok(drawn.at(-1).collisionEffect.elapsed>0);
+  assert.ok(drawn.at(-1).collisionEffect.elapsed<drawn.at(-1).collisionEffect.duration);
+  driver.key('keydown','KeyW');driver.key('keydown','ArrowRight');
+  assert.equal(app.state.controls.size,0);
+  let shows=0;
+  ui('collision-dialog').showModal=function(){
+    shows++;this.open=true;
+    const effect=drawn.at(-1).collisionEffect;
+    assert.equal(effect.elapsed,effect.duration,'the settled frame is drawn before the modal');
+  };
+  driver.frame(app.state.collisionEffect.duration);
+  assert.equal(ui('collision-dialog').open,true);
+  assert.equal(app.readState().collisionAnimation.active,false);
+  assert.equal(JSON.stringify({car:app.car,world:app.world,collision:app.state.collision}),frozen);
+  driver.frame(1);
+  assert.equal(shows,1,'completed frames do not reopen the modal repeatedly');
+});
+
+test('every collision lifts the whole car clearly while stronger impacts stay bounded', () => {
+  const gentle=loadApp(),strong=loadApp(),reverse=loadApp();
+  causeVehicleCollision(gentle,{speed:3});
+  causeVehicleCollision(strong,{speed:33});
+  causeVehicleCollision(reverse,{reverse:true});
+  assert.ok(gentle.app.state.collisionEffect.peakHeight<strong.app.state.collisionEffect.peakHeight);
+  for(const driver of [gentle,strong,reverse]){
+    const effect=driver.app.state.collisionEffect;
+    assert.ok(effect.peakHeight>=1.8&&effect.peakHeight<=3.8);
+    assert.ok(effect.flightTime>=1.2&&effect.flightTime<=1.8);
+    assert.ok(effect.duration>effect.flightTime+effect.slideTime&&effect.duration<4.7);
+    assert.ok(Math.abs(effect.pitchDeg)<=12&&Math.abs(effect.rollDeg)<=9);
+  }
+  assert.ok(reverse.app.state.collisionEffect.pitchDeg<0);
+  assert.equal(reverse.app.state.collisionEffect.travelHeading,180);
+  assert.equal(reverse.app.state.collisionEffect.impactEnd,'rear');
+  assert.equal(strong.app.state.collisionEffect.travelHeading,0);
+  assert.equal(strong.app.state.collisionEffect.impactEnd,'front');
+  assert.ok(gentle.app.state.collisionEffect.launchSpeed<strong.app.state.collisionEffect.launchSpeed);
+  assert.ok(strong.app.state.collisionEffect.launchSpeed<=18);
+});
+
+test('collision phases show forward flight, landing slide and wreck smoke before the restart dialog', () => {
+  const driver=loadApp(),{app,ui}=driver;
+  causeVehicleCollision(driver,{seconds:.05});
+  const effect=app.state.collisionEffect;
+  const frozen=JSON.stringify({car:app.car,world:app.world});
+  assert.match(ui('camera-status').textContent,/腾空前冲/);
+  driver.advance(effect.flightTime-effect.elapsed+.05);
+  assert.match(ui('camera-status').textContent,/落地滑行/);
+  assert.ok(!ui('collision-dialog').open);
+  driver.advance(effect.flightTime+effect.slideTime-effect.elapsed+.05);
+  assert.match(ui('camera-status').textContent,/受损冒烟/);
+  assert.ok(!ui('collision-dialog').open,'smoke gets a visible dwell before the modal');
+  driver.advance(effect.duration-effect.elapsed+.05);
+  assert.equal(ui('collision-dialog').open,true);
+  assert.match(ui('camera-status').textContent,/车辆受损/);
+  assert.equal(JSON.stringify({car:app.car,world:app.world}),frozen);
+});
+
+test('reduced motion renders a static collision result immediately', () => {
+  const driver=loadApp({matchMedia:query=>({matches:query==='(prefers-reduced-motion: reduce)'})});
+  causeVehicleCollision(driver,{seconds:.05});
+  assert.equal(driver.ui('collision-dialog').open,true);
+  assert.equal(driver.app.readState().collisionAnimation.active,false);
+  assert.equal(driver.drawn.at(-1).collisionEffect.reducedMotion,true);
+});
+
+test('backgrounding and losing the camera during a hop always expose restart without advancing physics', () => {
+  for(const interruption of ['visibilitychange','pagehide','rover-camera-lost']){
+    const driver=loadApp();causeVehicleCollision(driver,{seconds:.05});
+    const frozen=JSON.stringify({car:driver.app.car,world:driver.app.world});
+    if(interruption==='visibilitychange'){
+      driver.document.hidden=true;driver.document.dispatch(interruption);
+    }else driver.dispatch(interruption);
+    assert.equal(driver.ui('collision-dialog').open,true,interruption);
+    assert.equal(driver.app.readState().collisionAnimation.active,false);
+    assert.equal(JSON.stringify({car:driver.app.car,world:driver.app.world}),frozen);
+  }
+});
+
+test('failed animation frames do not leave a collision without a restart dialog', () => {
+  for(const throwing of [false,true]){
+    const driver=loadApp({RoverSimulator:{createCamera(){return {
+      stats:{fps:30,frames:0,backend:'test camera'},pause(){},
+      draw(){if(throwing)throw new Error('expected test camera failure');return false;}
+    };}}});
+    causeVehicleCollision(driver,{seconds:.05});
+    driver.frame(.12);
+    assert.equal(driver.ui('collision-dialog').open,true);
+    assert.equal(driver.app.readState().collisionAnimation.active,false);
+  }
+});
+
+test('resetting during a collision animation clears the visual effect and cannot reopen an old result', () => {
+  const driver=loadApp();causeVehicleCollision(driver,{seconds:.05});
+  driver.ui('reset-session').onclick();
+  driver.frame(3);
+  assert.equal(driver.app.state.collision,null);
+  assert.equal(driver.app.state.collisionEffect,null);
+  assert.ok(!driver.ui('collision-dialog').open);
+  assert.equal(driver.app.car.speed,0);
+  assert.equal(driver.ui('camera-panel').classList.contains('collision-animating'),false);
+});
+
+test('returning from background and resizing redraw the landed collision pose', () => {
+  const driver=loadApp();causeVehicleCollision(driver,{seconds:.05});driver.frame(.1);
+  const airborne=driver.drawn.at(-1).collisionEffect;
+  assert.ok(airborne.elapsed<airborne.flightTime);
+  driver.document.hidden=true;driver.document.dispatch('visibilitychange');
+  driver.document.hidden=false;driver.document.dispatch('visibilitychange');driver.frame(.1);
+  assert.equal(driver.drawn.at(-1).collisionEffect.elapsed,driver.app.state.collisionEffect.duration);
+  const frames=driver.drawn.length;
+  driver.dispatch('resize');driver.frame(.1);
+  assert.equal(driver.drawn.length,frames+1);
+  assert.equal(driver.drawn.at(-1).collisionEffect.elapsed,driver.app.state.collisionEffect.duration);
+});
+
+test('replaying the short collision animation keeps the world frozen and returns to the restart dialog', () => {
+  const driver=loadApp();causeVehicleCollision(driver);
+  const frozen=JSON.stringify({car:driver.app.car,world:driver.app.world});
+  driver.ui('collision-replay').onclick();
+  driver.ui('collision-dialog').onclose();
+  assert.ok(!driver.ui('collision-dialog').open);
+  assert.equal(driver.app.readState().collisionAnimation.active,true);
+  driver.frame(.15);
+  assert.ok(driver.drawn.at(-1).collisionEffect.elapsed>0);
+  driver.frame(driver.app.state.collisionEffect.duration);
+  assert.equal(driver.ui('collision-dialog').open,true);
+  assert.equal(JSON.stringify({car:driver.app.car,world:driver.app.world}),frozen);
+  driver.ui('collision-restart').onclick();
+  assert.equal(driver.app.state.collisionEffect,null);
+  assert.equal(driver.app.car.speed,0);
+});
+
+test('exit traffic is selected from ordinary right-lane cars and the card follows real route phases', () => {
+  const driver=loadApp(),{app,ui}=driver;
+  Object.assign(app.car,{y:900,x:0,speed:0});
+  app.world.vehicles=Array.from({length:8},(_,index)=>adviceVehicle(2,660+index*45,12,700+index));
+  driver.advance(.1);
+  const selected=app.readState().exiting;
+  assert.ok(selected.activeCount>0&&selected.activeCount<8);
+  assert.match(ui('exit-traffic-status').textContent,/减速准备驶离/);
+  assert.equal(ui('exit-traffic-status').hidden,false);
+  advanceUntil(driver,()=>app.readState().exiting.list.some(vehicle=>vehicle.status==='ramp'),45,.25);
+  assert.match(ui('exit-traffic-status').textContent,/沿匝道驶离/);
+  const exiting=app.world.vehicles.find(vehicle=>vehicle.exitRoute?.status==='ramp');
+  driver.advance(4);
+  assert.ok(exiting.x>3.75&&exiting.y>exiting.exitRoute.event.entryStart,'the card describes real curved travel');
+  assert.equal(app.car.x,0);assert.equal(app.car.y,900);
+  ui('reset-session').onclick();
+  assert.equal(app.readState().exiting.activeCount,0);
+  assert.equal(app.readState().exiting.completed,0);
+  assert.match(ui('exit-traffic-status').textContent,/部分右车道车辆/);
+});
+
+test('AI exit cruise follows a stopped leader around the curved ramp instead of overlooking its shifted x', () => {
+  const driver=loadApp(),{app}=driver,exit=driver.app.road.getState(900).nextExit;
+  const y=1250,x=app.road.centerForExit(exit,y),frontY=y+20;
+  const heading=Math.atan2(app.road.centerForExit(exit,y+1)-x,1)*180/Math.PI;
+  Object.assign(app.car,{x,y,heading,speed:10});
+  app.state.exitActive=exit;app.state.exitCruise=true;app.state.mode='ai';app.state.laneTarget=2;
+  const leader=adviceVehicle(2,frontY,0,999);
+  Object.assign(leader,{x:app.road.centerForExit(exit,frontY),exitRoute:{event:exit,status:'ramp',wet:false}});
+  app.world.vehicles=[leader];
+  driver.advance(.1);
+  assert.ok(app.state.lastInput.brake>0,'AI must brake for a same-ramp leader even beyond the current x corridor');
+  assert.ok(app.car.speed<10&&app.car.speed>0);
+  assert.equal(app.readState().nearestAhead.id,999);
+  driver.advance(5);
+  assert.equal(app.state.collision,null);
+  assert.ok(app.car.y<leader.y-6);
+});
+
+test('following exit traffic onto the ordinary road preserves nearby cars without a transition teleport', () => {
+  const driver=loadApp(),{app,ui}=driver,exit=driver.app.road.getState(900).nextExit;
+  Object.assign(app.car,{x:29,y:exit.rampEnd-.04,speed:10,heading:0});
+  app.state.exitActive=exit;app.state.exitCruise=true;app.state.mode='ai';app.state.laneTarget=2;
+  const leader=adviceVehicle(2,exit.rampEnd+35,12,999);
+  Object.assign(leader,{x:29,exitRoute:{event:exit,status:'local',wet:false}});
+  const follower=adviceVehicle(2,exit.rampEnd-40,9,998);
+  Object.assign(follower,{x:29,exitRoute:{event:exit,status:'ramp',wet:false}});
+  app.world.vehicles=[leader,follower];
+  const before=leader.y;
+  driver.advance(.1);
+  assert.equal(app.state.exitCompleted,true);
+  assert.equal(app.readState().roadType,'local');
+  assert.equal(app.world.vehicles.find(vehicle=>vehicle.id===999),leader);
+  assert.equal(app.world.vehicles.find(vehicle=>vehicle.id===998),follower);
+  assert.ok(leader.y>before&&leader.y<before+2);
+  assert.equal(app.readState().nearestAhead.id,999);
+  assert.equal(ui('exit-traffic-status').hidden,true);
+  driver.advance(2);
+  assert.ok(leader.y>before+10);
+  assert.equal(app.state.collision,null);
 });

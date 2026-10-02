@@ -920,3 +920,375 @@ test('a yielding car reserves braking plus completion room before a solid, then 
   assert.equal(lead.laneChange,null,'not permanently stranded across lanes after the obstacle clears');
   assert.equal(lead.lane,2); assert.equal(lead.x,3.75); assert.ok(lead.y < 350);
 });
+
+const entranceRoad = require('../dist/road.js');
+const firstEntrance = entranceRoad.eventsAround(1800,1000).entrances[0];
+function entranceFixture({ wet = false, density = 'medium' } = {}) {
+  const ego = { x:0, y:firstEntrance.start-100, speed:0, heading:0, gear:'forward' };
+  const state = { ...world([]), density, roadType:'highway' };
+  const options = { roadModel:entranceRoad, merging:true, wet };
+  traffic.step(state,ego,1/120,options);
+  return { state, ego, options, arrival:state.vehicles[0] };
+}
+
+test('entrance arrivals repeat in simulation time, use unique IDs, and remain bounded', () => {
+  const { state,ego,options,arrival } = entranceFixture();
+  assert.ok(arrival.fromEntrance);
+  assert.ok(arrival.x > 17.9);
+  const firstId = arrival.id;
+  for (let i=0;i<119;i++) traffic.step(state,ego,.1,options);
+  assert.equal(state.entranceArrivals,1);
+  for (let i=0;i<10;i++) traffic.step(state,ego,.1,options);
+  assert.equal(state.entranceArrivals,2);
+  assert.ok(state.vehicles[1].id > firstId);
+  for (let i=0;i<1400;i++) traffic.step(state,ego,.1,options);
+  assert.ok(state.vehicles.length <= traffic.constants.maxEntranceVehicles);
+  assert.equal(new Set(state.vehicles.map(v=>v.id)).size,state.vehicles.length);
+  assert.ok(state.entranceArrivals > 2);
+});
+
+test('entrance scanning is cached and arrivals are opt-in on highway only', () => {
+  let scans=0;
+  const roadModel={...entranceRoad,eventsAround(...args){scans++;return entranceRoad.eventsAround(...args);}};
+  const ego={x:0,y:0,speed:0};
+  const state=world([]);
+  for(let i=0;i<120;i++) traffic.step(state,ego,1/120,{roadModel,merging:true});
+  assert.ok(scans <= 3);
+  assert.equal(state.vehicles.length,0);
+  for(const options of [{roadModel},{roadModel,merging:false},{merging:true}]) {
+    const noSpawns=world([]);
+    traffic.step(noSpawns,{...ego,y:firstEntrance.start},10,options);
+    assert.equal(noSpawns.vehicles.length,0);
+    assert.equal(traffic.getSnapshot(noSpawns,ego).merging.activeCount,0);
+  }
+  const local={...world([]),roadType:'local'};
+  traffic.step(local,{x:29,y:firstEntrance.start},10,{roadModel,merging:true});
+  assert.equal(local.vehicles.length,0);
+});
+
+test('a clear entrance accelerates and joins smoothly in dry and wet conditions', () => {
+  for(const wet of [false,true]) {
+    const {state,ego,options,arrival}=entranceFixture({wet});
+    state.nextEntranceArrival=Infinity;
+    let previous={...arrival}, reserved=false;
+    for(let i=0;i<400 && arrival.entranceMerge;i++) {
+      traffic.step(state,ego,.1,{...options,merging:false});
+      assert.ok(arrival.y >= previous.y);
+      assert.ok(arrival.x <= previous.x + 1e-8);
+      assert.ok(Math.abs(arrival.x-previous.x) < .4,'no lateral teleport');
+      assert.ok(Math.abs(arrival.speed-previous.speed) < .51,'physical acceleration and braking');
+      assert.ok(Math.abs(arrival.heading) < 10);
+      assert.equal(arrival.x,entranceRoad.centerForEntrance(firstEntrance,arrival.y));
+      reserved ||= Boolean(arrival.entranceMerge?.committed && arrival.x===7.125);
+      previous={...arrival};
+    }
+    assert.equal(arrival.entranceMerge,null);
+    assert.equal(arrival.lane,2);
+    assert.equal(arrival.x,3.75);
+    assert.ok(reserved,'right lane is reserved before lateral overlap');
+    assert.equal(traffic.getSnapshot(state,ego).merging.completed,1);
+  }
+});
+
+test('blocked arrivals stop before the taper without blocking mainline and resume after a gap opens', () => {
+  for(const wet of [false,true]) {
+    const {state,ego,options,arrival}=entranceFixture({wet});
+    const blocker=vehicle({id:9,lane:2,x:3.75,y:firstEntrance.mergeStart+8,speed:0,cruiseFactor:0});
+    state.vehicles.push(blocker);
+    for(let i=0;i<300;i++) {
+      const speed=arrival.speed;
+      traffic.step(state,ego,.1,{...options,merging:false});
+      assert.ok(Math.abs(arrival.speed-speed)<.51,'queue stop uses physical braking');
+    }
+    assert.equal(arrival.entranceMerge.committed,false);
+    assert.equal(arrival.entranceMerge.status,'waiting');
+    assert.ok(arrival.speed < .1);
+    assert.ok(arrival.y < firstEntrance.mergeStart-8);
+    assert.equal(arrival.x,7.125);
+    const onlyArrival={...state,vehicles:[arrival]};
+    assert.equal(traffic.getSnapshot(onlyArrival,{x:3.75,y:arrival.y-20}).nearestAhead,null);
+    state.vehicles=[arrival];
+    for(let i=0;i<500 && arrival.entranceMerge;i++) traffic.step(state,ego,.1,{...options,merging:false});
+    assert.equal(arrival.lane,2);
+    assert.equal(arrival.entranceMerge,null);
+  }
+});
+
+test('arrival admission predicts a fast rear ego and its reserved destination lane', () => {
+  for(const wet of [false,true]) for(const egoLaneTarget of [null,2]) {
+    const {state,ego,options,arrival}=entranceFixture({wet});
+    arrival.y=firstEntrance.accelerationStart;arrival.x=7.125;arrival.speed=18;
+    Object.assign(ego,{x:egoLaneTarget===2?0:3.75,y:arrival.y-120,speed:40});
+    traffic.step(state,ego,.1,{...options,merging:false,egoLaneTarget});
+    assert.equal(arrival.entranceMerge.committed,false);
+    assert.equal(arrival.entranceMerge.status,'waiting');
+  }
+  const {state,ego,options,arrival}=entranceFixture();
+  arrival.y=firstEntrance.accelerationStart;arrival.x=7.125;arrival.speed=18;
+  Object.assign(ego,{x:0,y:arrival.y-120,speed:40});
+  traffic.step(state,ego,.1,{...options,merging:false,egoLaneTarget:null});
+  assert.equal(arrival.entranceMerge.committed,true,'ego on a different lane does not block admission');
+});
+
+test('a newly unsafe committed merge brakes while retaining its corridor reservation', () => {
+  const {state,ego,options,arrival}=entranceFixture();
+  arrival.y=firstEntrance.mergeStart+35;arrival.x=entranceRoad.centerForEntrance(firstEntrance,arrival.y);
+  arrival.speed=20;arrival.entranceMerge.committed=true;
+  const blocker=vehicle({id:4,lane:2,x:3.75,y:arrival.y+80,speed:0,cruiseFactor:0});
+  state.vehicles.push(blocker);
+  const before={...arrival};
+  traffic.step(state,ego,.5,{...options,merging:false});
+  assert.equal(arrival.entranceMerge.committed,true);
+  assert.equal(arrival.entranceMerge.status,'waiting');
+  assert.ok(arrival.speed < before.speed);
+  assert.ok(arrival.speed >= before.speed-2.51);
+  assert.equal(arrival.x,entranceRoad.centerForEntrance(firstEntrance,arrival.y));
+  const snapshot=traffic.getSnapshot(state,{x:3.75,y:before.y-40});
+  assert.equal(snapshot.nearestAhead.id,arrival.id);
+  assert.equal(snapshot.merging.waitingCount,1);
+});
+
+test('density reset clears entrance cars and offscreen arrivals retire rather than teleport', () => {
+  const {state,ego,options,arrival}=entranceFixture();
+  const original={x:arrival.x,y:arrival.y};
+  traffic.step(state,{...ego,y:ego.y+10000},.1,{...options,merging:false});
+  assert.ok(!state.vehicles.includes(arrival));
+  assert.ok(Math.abs(arrival.y-original.y)<3);
+  assert.ok(Math.abs(arrival.x-original.x)<1);
+  const reset=entranceFixture();
+  const oldId=reset.arrival.id;
+  traffic.setDensity(reset.state,reset.ego,'dense');
+  assert.equal(reset.state.vehicles.length,174);
+  assert.ok(reset.state.vehicles.every(v=>!v.fromEntrance));
+  assert.equal(traffic.getSnapshot(reset.state,reset.ego).merging.arrivals,0);
+  for(let i=0;i<40;i++) traffic.step(reset.state,reset.ego,.1,reset.options);
+  assert.ok(reset.state.vehicles.some(v=>v.fromEntrance && v.id>oldId));
+});
+
+test('swept collision catches an arrival moving across the ego corridor', () => {
+  const {state,arrival}=entranceFixture();
+  arrival.previousX=6.9;arrival.previousY=0;arrival.x=4.5;arrival.y=0;arrival.heading=-5;
+  const previous={x:3.75,y:-2,speed:20,heading:0,gear:'forward'},ego={...previous,y:2};
+  assert.ok(traffic.resolveContact(state,ego,previous));
+  assert.equal(state.contacts,1);
+});
+
+test('committed entrance traffic is included in NPC following and lane advice before physical overlap', () => {
+  const {state,ego,options,arrival}=entranceFixture();
+  arrival.y=firstEntrance.mergeStart;arrival.x=7.125;arrival.speed=10;
+  arrival.entranceMerge.committed=true;
+  const follower=vehicle({id:2,x:3.75,lane:2,y:arrival.y-45,speed:25});
+  state.vehicles.push(follower);
+  const advice=traffic.getLaneRecommendation(state,{x:0,y:arrival.y-20,speed:15,heading:0},{desiredSpeed:20});
+  assert.equal(advice.lanes[2].safe,false);
+  traffic.step(state,ego,.5,{...options,merging:false});
+  assert.ok(follower.speed < 25,'follower responds while entering car remains outside lane');
+  assert.ok(arrival.x > 6.9);
+});
+
+test('completed arrivals become ordinary right-lane vehicles and can safely respond to a horn', () => {
+  const {state,ego,options,arrival}=entranceFixture();
+  for(let i=0;i<400 && arrival.entranceMerge;i++) traffic.step(state,ego,.1,{...options,merging:false});
+  assert.equal(arrival.lane,2);
+  for(let i=0;i<60;i++) traffic.step(state,ego,.1,{...options,merging:false});
+  const driver={x:3.75,y:arrival.y-80,speed:arrival.speed,heading:0,gear:'forward'};
+  const outcome=traffic.requestYield(state,driver,{canChangeLane:()=>true});
+  assert.equal(outcome.status,'yielding');
+  assert.equal(outcome.vehicleId,arrival.id);
+  assert.equal(outcome.targetLane,1);
+});
+
+test('queued entrance arrivals reserve the mainline in order and all recover after congestion clears', () => {
+  const ego={x:0,y:firstEntrance.start-100,speed:0,heading:0,gear:'forward'};
+  const state=traffic.createState(ego,{density:'medium'});
+  const options={roadModel:entranceRoad,merging:true,wet:false};
+  for(let i=0;i<5400;i++) traffic.step(state,ego,1/30,options);
+  const queued=state.vehicles.filter(v=>v.entranceMerge).sort((a,b)=>b.y-a.y);
+  assert.ok(queued.length>=2,'reproduce a multi-car ramp queue under congestion');
+  assert.ok(queued.slice(1).every(v=>!v.entranceMerge.committed),'followers cannot take the head car’s gap');
+  state.vehicles=state.vehicles.filter(v=>v.fromEntrance);
+  const queuedIds=queued.map(v=>v.id);
+  const completedBefore=state.entranceCompleted;
+  for(let i=0;i<3600;i++) traffic.step(state,ego,1/30,{...options,merging:false});
+  assert.ok(state.entranceCompleted>=completedBefore+queuedIds.length,'every waiting arrival exits the recovered ramp queue');
+  assert.ok(state.vehicles.filter(v=>queuedIds.includes(v.id)).every(v=>v.lane===2 && !v.entranceMerge));
+});
+
+const firstExit=entranceRoad.eventsAround(1000,1000).exits.find(event=>event.number===1);
+function exitFixture({wet=false,density='medium',speed=27}={}) {
+  const ego={x:0,y:firstExit.entryStart-400,speed:0,heading:0,gear:'forward'};
+  const options={roadModel:entranceRoad,exiting:true,wet};
+  for(let id=0;id<3;id++) {
+    const departure=vehicle({id,lane:2,x:3.75,y:firstExit.entryStart-440,speed,cruiseFactor:.88});
+    const state={...world([departure]),density,roadType:'highway'};
+    traffic.step(state,ego,1/120,options);
+    if(departure.exitRoute)return{state,ego,options,departure};
+  }
+  throw new Error('No deterministic exit preference found');
+}
+
+test('only a stable subset of right-lane traffic chooses exits with enough braking distance', () => {
+  const selected=[];
+  for(let id=0;id<9;id++) {
+    const departure=vehicle({id,lane:2,x:3.75,y:firstExit.entryStart-440,speed:27});
+    const state=world([departure]),ego={x:0,y:departure.y,speed:0};
+    traffic.step(state,ego,.1,{roadModel:entranceRoad,exiting:true});
+    if(departure.exitRoute)selected.push(id);
+  }
+  assert.equal(selected.length,3,'one-third exit preferences preserve through traffic');
+  const id=selected[0];
+  for(const change of [{lane:1,x:0},{lane:0,x:-3.75},{direction:-1},{y:firstExit.entryStart-50,speed:30}]) {
+    const departure=vehicle({id,lane:2,x:3.75,y:firstExit.entryStart-440,speed:27,...change});
+    const state=world([departure]);
+    traffic.step(state,{x:-3.75,y:firstExit.entryStart-400,speed:0},.1,{roadModel:entranceRoad,exiting:true});
+    assert.equal(departure.exitRoute,undefined);
+  }
+  for(const options of [{roadModel:entranceRoad},{roadModel:entranceRoad,exiting:false},{exiting:true}]) {
+    const departure=vehicle({id,lane:2,x:3.75,y:firstExit.entryStart-440,speed:27});
+    const state=world([departure]);
+    traffic.step(state,{x:0,y:departure.y,speed:0},.1,options);
+    assert.equal(departure.exitRoute,undefined);
+  }
+});
+
+test('departing NPCs brake physically, follow the curved slip road, and continue on the ordinary road', () => {
+  for(const wet of [false,true])for(const density of ['low','medium','dense']) {
+    const {state,ego,options,departure}=exitFixture({wet,density});
+    let entered=false,local=false,prior={...departure},peakEntrySpeed=0;
+    for(let i=0;i<2500 && !local;i++) {
+      traffic.step(state,ego,.1,{...options,exiting:false});
+      assert.ok(departure.y>=prior.y);
+      assert.ok(Math.abs(departure.speed-prior.speed)<.51,'velocity never snaps to the speed limit');
+      assert.ok(Math.abs(departure.x-prior.x)<.4,'position follows a continuous curve');
+      assert.ok(Math.abs(departure.heading)<6);
+      assert.equal(departure.x,entranceRoad.centerForExit(firstExit,departure.y));
+      if(departure.y>=firstExit.entryStart){entered=true;peakEntrySpeed=Math.max(peakEntrySpeed,departure.speed);}
+      local=departure.exitRoute?.status==='local';prior={...departure};
+    }
+    assert.ok(entered && local,`density=${density}, wet=${wet}`);
+    assert.ok(peakEntrySpeed<firstExit.speedLimitKmh/3.6+.15);
+    const arrivedY=departure.y;
+    for(let i=0;i<60;i++)traffic.step(state,ego,.1,{...options,exiting:false});
+    assert.ok(departure.y>arrivedY+20,'the ramp end does not stop or remove the vehicle');
+    assert.equal(departure.x,29);
+    assert.ok(state.vehicles.includes(departure));
+    assert.equal(traffic.getSnapshot(state,ego).exiting.completed,1);
+  }
+});
+
+test('exit vehicles release the highway corridor after their bodies leave it', () => {
+  const {state,ego,options,departure}=exitFixture();
+  departure.y=firstExit.entryStart+140;
+  departure.x=entranceRoad.centerForExit(firstExit,departure.y);
+  departure.exitRoute.status='ramp';
+  departure.previousX=departure.x;
+  const view=traffic.getSnapshot(state,{x:3.75,y:departure.y-30,speed:10});
+  assert.equal(view.nearestAhead,null);
+  assert.equal(traffic.getLaneRecommendation(state,{x:0,y:departure.y-30,speed:10},{desiredSpeed:10}).lanes[2].frontGap,null);
+  const follower=vehicle({id:99,lane:2,x:3.75,y:departure.y-30,speed:15,cruiseFactor:1});
+  state.vehicles.push(follower);
+  traffic.step(state,ego,.5,{...options,exiting:false});
+  assert.ok(follower.speed>=15,'the mainline is not held by a distant ramp car');
+  const before={x:departure.x,y:departure.y-6,speed:20,heading:0,gear:'forward'},contactEgo={...before,y:departure.y};
+  assert.ok(traffic.resolveContact(state,contactEgo,before),'the vehicle remains a real collision body');
+});
+
+test('departing traffic follows a stopped ego around the exit curve on dry and wet roads', () => {
+  for(const wet of [false,true]) {
+    const {state,options,departure}=exitFixture({wet});
+    departure.y=firstExit.entryStart+120;departure.x=entranceRoad.centerForExit(firstExit,departure.y);
+    departure.speed=11;departure.exitRoute.status='ramp';
+    const ego={x:entranceRoad.centerForExit(firstExit,firstExit.entryStart+210),y:firstExit.entryStart+210,speed:0,heading:0,gear:'forward'};
+    assert.ok(Math.abs(ego.x-departure.x)>4,'the stopped ego is around the bend');
+    for(let i=0;i<400;i++)traffic.step(state,ego,.1,{...options,exiting:false});
+    assert.ok(departure.y<ego.y-4.5);
+    assert.ok(departure.speed<.1);
+  }
+});
+
+test('two vehicles taking the same exit preserve their following gap around the curve', () => {
+  const {state,ego,options,departure}=exitFixture();
+  departure.y=firstExit.entryStart+100;departure.x=entranceRoad.centerForExit(firstExit,departure.y);departure.speed=11;
+  const leader=vehicle({id:90,lane:2,y:departure.y+75,x:entranceRoad.centerForExit(firstExit,departure.y+75),speed:0,cruiseFactor:0,
+    exitRoute:{event:firstExit,status:'ramp'}});
+  state.vehicles.push(leader);
+  for(let i=0;i<400;i++)traffic.step(state,ego,.1,{...options,exiting:false,wet:true});
+  assert.ok(leader.y-departure.y>7);
+  assert.ok(departure.speed<.1);
+});
+
+test('exit-path snapshots see the next curved-route car without confusing highway traffic', () => {
+  const {state,options,departure}=exitFixture();
+  departure.y=firstExit.entryStart+230;departure.x=entranceRoad.centerForExit(firstExit,departure.y);departure.exitRoute.status='ramp';
+  const y=firstExit.entryStart+120,ego={x:entranceRoad.centerForExit(firstExit,y),y,speed:10,heading:0,exitRoute:firstExit};
+  state.vehicles.push(vehicle({id:99,lane:2,x:3.75,y:y+25,speed:20}));
+  const snapshot=traffic.getSnapshot(state,ego);
+  assert.equal(snapshot.nearestAhead.id,departure.id);
+  assert.equal(snapshot.exiting.nearest.exitId,firstExit.id);
+  assert.ok(Math.abs(ego.x-departure.x)>5);
+});
+
+test('ordinary-road transition preserves nearby departing cars and reuses their exact poses without overcrowding', () => {
+  for(const density of ['low','medium','dense']) {
+    const {state,options,departure}=exitFixture({density});
+    departure.x=29;departure.y=firstExit.rampEnd+70;departure.exitRoute.status='local';departure.speed=12;
+    const behind=vehicle({id:990,lane:2,y:firstExit.entryStart+300,x:entranceRoad.centerForExit(firstExit,firstExit.entryStart+300),speed:11,
+      exitRoute:{event:firstExit,status:'ramp'}});
+    state.vehicles.push(behind);
+    const ego={x:29,y:firstExit.rampEnd+1,speed:11,heading:0,gear:'forward'};
+    const poses=[departure,behind].map(v=>({x:v.x,y:v.y,speed:v.speed,id:v.id}));
+    const next=traffic.transitionToLocal(state,ego,firstExit);
+    assert.equal(next.roadType,'local');assert.equal(next.density,density);
+    assert.ok(next.vehicles.includes(departure) && next.vehicles.includes(behind));
+    assert.deepEqual([departure,behind].map(v=>({x:v.x,y:v.y,speed:v.speed,id:v.id})),poses);
+    assert.equal(departure.exitRoute,null);assert.equal(behind.exitRoute.localTraffic,true);
+    assert.ok(next.vehicles.some(v=>v.direction<0));
+    assert.ok(next.vehicles.length<=traffic.densityPresets[density].countPerLane*2);
+    assert.equal(new Set(next.vehicles.map(v=>v.id)).size,next.vehicles.length);
+    for(const v of next.vehicles.filter(v=>v.direction>0 && v!==departure && v!==behind))assert.ok(Math.abs(v.y-departure.y)>(v.length+departure.length)/2+3);
+    for(let i=0;i<1500 && behind.exitRoute;i++) {
+      ego.y+=1.1;
+      traffic.step(next,ego,.1,{...options,exiting:false});
+    }
+    assert.equal(behind.exitRoute,null);assert.equal(behind.lane,0);assert.equal(behind.x,29);
+  }
+});
+
+test('departing NPCs only recycle outside the viewing region, and density reset cancels old routes', () => {
+  const {state,ego,options,departure}=exitFixture();
+  departure.y=firstExit.rampEnd+10;departure.x=29;departure.exitRoute.status='local';
+  traffic.step(state,{...ego,y:departure.y-100},.1,{...options,exiting:false});
+  assert.equal(departure.x,29);assert.ok(departure.exitRoute);
+  traffic.step(state,{...ego,y:departure.y+5000},.1,{...options,exiting:false});
+  assert.equal(departure.x,3.75);assert.equal(departure.exitRoute,null);
+  assert.ok(Math.abs(departure.y-(ego.y+5000))>1000);
+  const fresh=exitFixture();traffic.setDensity(fresh.state,fresh.ego,'dense');
+  assert.equal(fresh.state.vehicles.length,174);
+  assert.ok(fresh.state.vehicles.every(v=>!v.exitRoute));
+  assert.equal(traffic.getSnapshot(fresh.state,fresh.ego).exiting.activeCount,0);
+});
+
+test('exit commitments reject horn lane changes and zero elapsed time freezes the whole departure', () => {
+  const {state,ego,options,departure}=exitFixture();
+  const driver={x:3.75,y:departure.y-75,speed:departure.speed,heading:0,gear:'forward'};
+  assert.equal(traffic.requestYield(state,driver,{canChangeLane:()=>true}).status,'cooldown');
+  assert.equal(departure.laneChange,undefined);
+  const before=JSON.stringify(state);
+  traffic.step(state,ego,0,options);
+  assert.equal(JSON.stringify(state),before);
+});
+
+test('dense exit recycling keeps both retirement and replacement beyond the rendered road horizon', () => {
+  const {state,options,departure}=exitFixture({density:'dense'});
+  departure.x=29;departure.y=firstExit.rampEnd+10;departure.exitRoute.status='local';
+  const ego={x:0,y:departure.y-1200,speed:0,heading:0};
+  traffic.step(state,ego,.1,{...options,exiting:false});
+  assert.equal(departure.x,29,'visible departure is retained beyond the normal dense recycle range');
+  ego.y=departure.y+2500;
+  traffic.step(state,ego,.1,{...options,exiting:false});
+  assert.equal(departure.x,3.75);
+  assert.ok(Math.abs(departure.y-ego.y)>1500,'replacement appears outside the 1500m renderer horizon');
+  const recycledY=departure.y;
+  traffic.step(state,ego,.1,{...options,exiting:false});
+  assert.ok(Math.abs(departure.y-recycledY)<4,'normal dense recycling must not immediately teleport the replacement back into view');
+});

@@ -256,3 +256,108 @@ test('the app can throttle costly recommendation checks without throttling immed
   assert.equal(recommendations, 1);
   assert.equal(considered.laneDirection, -1);
 });
+
+test('autopilot anticipates committed entrance traffic before body overlap and ignores a waiting ramp', () => {
+  const entry=road.eventsAround(1800,1000).entrances[0];
+  const arrival=vehicle({x:7.125,lane:6,y:entry.mergeStart,speed:10,
+    entranceMerge:{event:entry,committed:true,status:'merging'}});
+  const ego=car({x:3.75,y:arrival.y-40,speed:20});
+  const options={allowLaneChange:false,laneTarget:2};
+  const anticipates=pilot.evaluate(world([arrival]),ego,options);
+  assert.ok(anticipates.brake>0);
+  assert.ok(anticipates.targetSpeed<15);
+  const waiting=pilot.evaluate(world([{...arrival,entranceMerge:{...arrival.entranceMerge,committed:false,status:'waiting'}}]),ego,options);
+  const empty=pilot.evaluate(world([]),ego,options);
+  assert.deepEqual(waiting,empty,'waiting outside the live lane does not obstruct highway traffic');
+  const enteringLane=pilot.evaluate(world([arrival]),car({x:0,y:ego.y,speed:20}),{...options,laneChanging:true});
+  assert.ok(enteringLane.brake>0,'ego destination reservation watches the incoming merger too');
+});
+
+test('dry and wet autopilot follows a real entrance maneuver through completion without contact', () => {
+  const event=road.eventsAround(1800,1000).entrances[0];
+  for(const wet of [false,true]) {
+    const ego=Object.assign(physics.createState(),car({x:3.75,y:event.accelerationStart-110,speed:18}));
+    const arrival=vehicle({id:1000,x:7.125,previousX:7.125,lane:6,y:event.accelerationStart,
+      previousY:event.accelerationStart,speed:19,heading:0,cruiseFactor:.88,fromEntrance:true,
+      entranceMerge:{event,committed:true,status:'merging',wet}});
+    const state=world([arrival]);
+    let closest=Infinity;
+    for(let i=0;i<2400;i++) {
+      const previous={...ego};
+      const decision=pilot.evaluate(state,ego,{wet,laneTarget:2,allowLaneChange:false});
+      physics.step(ego,{...decision,steering:0,wet},1/120);
+      traffic.step(state,ego,1/120,{roadModel:road,merging:false,wet});
+      assert.equal(traffic.resolveContact(state,ego,previous),null);
+      closest=Math.min(closest,arrival.y-ego.y-(arrival.length/2+2.25));
+    }
+    assert.equal(arrival.entranceMerge,null);
+    assert.ok(closest>7,`wet=${wet}, gap=${closest}`);
+    assert.ok(ego.y>event.mergeStart);
+  }
+});
+
+test('an exit leader is followed around the curve before reaching the current x corridor', () => {
+  const exit=road.getState(1000).nextExit,y=exit.entryStart+160;
+  const ego=car({x:road.centerForExit(exit,y),y,speed:40/3.6});
+  const leader=vehicle({x:road.centerForExit(exit,y+42),y:y+42,speed:0,lane:2,
+    exitRoute:{event:exit,status:'ramp'}});
+  assert.ok(leader.x-ego.x>3,'the leading car has already turned out of the straight corridor');
+  const options={roadType:'ramp',exitRoute:exit};
+  const decision=pilot.evaluate(world([leader]),ego,options);
+  assert.ok(decision.brake>0);assert.ok(decision.targetSpeed<ego.speed);
+  assert.equal(decision.laneDirection,0);
+  const empty=pilot.evaluate(world([]),ego,options);
+  for(const unrelated of [
+    {...leader,x:3.75,exitRoute:null},
+    {...leader,x:3.75},
+    {...leader,exitRoute:{event:{...exit,id:'different-exit'},status:'ramp'}},
+    {...leader,y:y-20,x:road.centerForExit(exit,y-20)}
+  ]) assert.deepEqual(pilot.evaluate(world([unrelated]),ego,options),empty,
+    'a separate highway lane, other route or car behind does not block the ramp');
+});
+
+test('turning exit trucks remain physical obstacles only while their body overlaps the highway', () => {
+  const ego=car({x:3.75,y:1200,speed:20});
+  const truck=vehicle({x:6.2,y:1220,speed:0,lane:2,heading:5.15,width:2.35,length:8.4,
+    exitRoute:{event:road.getState(1000).nextExit,status:'ramp'}});
+  const options={laneTarget:2,allowLaneChange:false};
+  assert.equal(pilot.evaluate(world([truck]),ego,options).brake,1,
+    'the angled rear of the truck still occupies the right lane');
+  assert.deepEqual(pilot.evaluate(world([{...truck,x:7}]),ego,options),
+    pilot.evaluate(world([]),ego,options),'fully separated exit traffic releases the highway');
+});
+
+test('same-exit following continues across the ordinary-road handoff', () => {
+  const exit=road.getState(1000).nextExit;
+  const ego=car({x:29,y:exit.rampEnd-15,speed:40/3.6});
+  const leader=vehicle({x:29,y:exit.rampEnd+15,speed:0,lane:0});
+  for(const exitRoute of [null,{event:exit,status:'local'}]) {
+    const decision=pilot.evaluate(world([{...leader,exitRoute}]),ego,{roadType:'ramp',exitRoute:exit});
+    assert.ok(decision.brake>0);assert.ok(decision.targetSpeed<ego.speed);
+  }
+  const local=pilot.evaluate(world([leader]),{...ego,y:exit.rampEnd+1},{roadType:'local',exitRoute:exit});
+  assert.equal(local.brake,1);assert.equal(local.laneDirection,0);
+});
+
+test('dry and wet ramp following physically parks behind a stopped curved-path leader without contact', () => {
+  const exit=road.getState(1000).nextExit,y=exit.entryStart+160;
+  for(const wet of [false,true]) {
+    const heading=Math.atan2(road.centerForExit(exit,y+1)-road.centerForExit(exit,y-1),2)*180/Math.PI;
+    const ego=Object.assign(physics.createState(),car({x:road.centerForExit(exit,y),y,heading,speed:40/3.6}));
+    const leader=vehicle({x:road.centerForExit(exit,y+42),y:y+42,speed:0,lane:2,
+      heading:5,exitRoute:{event:exit,status:'ramp'}});
+    const state=world([leader]),before=JSON.stringify(leader);
+    let nearest=Infinity;
+    for(let i=0;i<1800;i++) {
+      const previous={...ego},decision=pilot.evaluate(state,ego,{roadType:'ramp',exitRoute:exit,wet});
+      const lookahead=1.5*Math.max(5.5,ego.speed*(wet?1.7:1.4));
+      const steering=lane.steeringFor(ego,road.centerForExit(exit,ego.y+lookahead),{wet});
+      physics.step(ego,{...decision,steering,wet,guardrails:false},1/120);
+      assert.equal(traffic.resolveContact(state,ego,previous),null);
+      nearest=Math.min(nearest,leader.y-ego.y-4.5);
+    }
+    assert.equal(ego.speed,0,`wet=${wet} fully stops behind the queue`);
+    assert.ok(nearest>7,`wet=${wet}, closest gap=${nearest}`);
+    assert.equal(JSON.stringify(leader),before,'the controller never moves the observed NPC');
+  }
+});
