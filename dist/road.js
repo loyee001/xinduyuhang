@@ -33,31 +33,43 @@
       openingEnd: entryStart + 260, rampEnd, width: constants.rampWidth,
       speedLimitKmh: constants.rampLimitKmh, signStart: start - 600 };
   }
+  function entranceInCell(index) {
+    const start = index * constants.cellLength + 1950 + variation(index, 491) % 61;
+    const number = ((index % 99) + 99) % 99 + 1;
+    return { id: `entrance-${index}`, number, name: `${number} 号入口`, start,
+      rampStart: start, accelerationStart: start + 110, mergeStart: start + 190,
+      mergeEnd: start + 370, end: start + 400, openingStart: start + 60,
+      openingEnd: start + 400, signStart: start - 500, width: 3 };
+  }
   function eventsAround(y, radius = 1600) {
     y = coordinate(y);
     radius = clamp(Math.abs(coordinate(radius)), 0, 20000);
     const low = y - radius, high = y + radius;
     const first = Math.floor((low - 2000) / constants.cellLength);
     const last = Math.floor((high + 600) / constants.cellLength);
-    const solids = [], exits = [];
+    const solids = [], exits = [], entrances = [];
     for (let index = first; index <= last; index++) {
-      const solid = solidInCell(index), exit = exitInCell(index);
+      const solid = solidInCell(index), exit = exitInCell(index), entrance = entranceInCell(index);
       if (solid.end >= low && solid.start <= high) solids.push(solid);
       if (exit.rampEnd >= low && exit.signStart <= high) exits.push(exit);
+      if (entrance.end >= low && entrance.signStart <= high) entrances.push(entrance);
     }
-    return { solids, exits };
+    return { solids, exits, entrances };
   }
   function getState(y) {
     y = coordinate(y);
-    const { solids, exits } = eventsAround(y, constants.cellLength * 2);
+    const { solids, exits, entrances } = eventsAround(y, constants.cellLength * 2);
     const activeSolid = solids.find(zone => y >= zone.start && y <= zone.end) || null;
     const activeExit = exits.find(exit => y >= exit.entryStart && y <= exit.rampEnd) || null;
     const nextSolid = solids.find(zone => zone.start > y);
     const nextExit = exits.find(exit => exit.entryEnd >= y);
+    const activeEntrance = entrances.find(entrance => y >= entrance.start && y <= entrance.end) || null;
+    const nextEntrance = entrances.find(entrance => entrance.end >= y);
     return { solid: Boolean(activeSolid), activeSolid,
       nextSolid: nextSolid ? { ...nextSolid, distance: nextSolid.start - y } : null,
       nextExit: nextExit ? { ...nextExit, distance: Math.max(0, nextExit.start - y) } : null,
-      activeExit };
+      activeExit, activeEntrance,
+      nextEntrance: nextEntrance ? { ...nextEntrance, distance: Math.max(0, nextEntrance.start - y) } : null };
   }
   function canChangeLane(y, { speed = 0, gear = 'forward', targetSpeed = speed } = {}) {
     y = coordinate(y);
@@ -81,5 +93,15 @@
     const t = clamp((coordinate(y) - exit.entryStart) / constants.rampBendLength, 0, 1);
     return 3.75 + 25.25 * t * t * (3 - 2 * t);
   }
-  return Object.freeze({ constants, localRoad, eventsAround, getState, canChangeLane, centerForExit });
+  function centerForEntrance(entrance, y) {
+    if (!entrance || !Number.isFinite(entrance.start)) return 3.75;
+    const position = coordinate(y);
+    if (position < entrance.accelerationStart) {
+      const t = clamp((position - entrance.start) / (entrance.accelerationStart - entrance.start), 0, 1);
+      return 18 + (7.125 - 18) * t * t * (3 - 2 * t);
+    }
+    const t = clamp((position - entrance.mergeStart) / (entrance.mergeEnd - entrance.mergeStart), 0, 1);
+    return 7.125 + (3.75 - 7.125) * t * t * (3 - 2 * t);
+  }
+  return Object.freeze({ constants, localRoad, eventsAround, getState, canChangeLane, centerForExit, centerForEntrance });
 });

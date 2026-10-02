@@ -85,3 +85,17 @@
 #collision-restart{width:100%;min-height:50px;justify-content:center;touch-action:manipulation}
 .collision-dialog .collision-note{margin-top:15px;font-size:11px;color:#92a08b}.collision-ended{border-color:#cb8d73}
 @media(max-width:360px){.collision-dialog{padding:23px 18px 18px}.collision-dialog h2{font-size:25px}.collision-metrics dd{font-size:17px}}
+
+/* Roadside entrances share the route card without adding another control. */
+.entrance-preview{display:flex;align-items:flex-start;gap:10px;margin-top:13px;padding-top:13px;border-top:1px solid #38463c}
+.entrance-preview>div{flex:1;min-width:0}.entrance-badge{flex:none;padding:6px 7px;border:1px solid #657664;border-radius:6px;background:#27382a;color:#cbdcb9;font-size:11px;white-space:nowrap}
+.entrance-preview #entrance-status{display:block;font-size:11px;line-height:1.6;color:#9dac9d;margin-top:5px;overflow-wrap:anywhere}
+.entrance-preview.nearby .entrance-badge{border-color:#a18b4f;background:#38321f;color:#f4dfa3}
+.entrance-preview.joining #entrance-name,.entrance-preview.joining #entrance-status{color:#f4dfa3}
+@media(max-width:800px){.entrance-preview{gap:8px;margin-top:11px;padding-top:11px}.entrance-preview #entrance-status{font-size:10px}.entrance-badge{font-size:10px;padding:5px 6px}}
+.collision-animating .camera-shade{background:linear-gradient(180deg,#07110b18 0%,transparent 65%,#07100c77 100%)}
+.collision-animating #camera-status{font-size:12px}
+/* Keep the full airborne body and its ground shadow visible on phones. */
+.collision-ended .camera-viewport{aspect-ratio:4/3;min-height:260px}
+#exit-traffic-status{display:block;margin-top:6px;color:#a5b59f;font-size:11px;line-height:1.65;overflow-wrap:anywhere}
+#exit-traffic-status[hidden]{display:none}

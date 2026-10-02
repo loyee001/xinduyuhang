@@ -9,7 +9,7 @@
   const constants = Object.freeze({ laneWidth: 3.75, zoneLength: 1000, signSpacing: 500,
     recycleDistance: 2050, spawnDistance: 1750, minGap: 3, headway: 1.5, maxSubstep: 1 / 30,
     guardrailCenter: 6.45, guardrailLeft: -6.45, guardrailRight: 7.95,
-    hornRange: 100, hornCooldown: 2.5, yieldSeconds: 4 });
+    hornRange: 100, hornCooldown: 2.5, yieldSeconds: 4, maxEntranceVehicles: 8 });
   const densityPresets = Object.freeze({
     low: Object.freeze({ label: '较少', countPerLane: 7, vehicleCount: 42, spacing: 590, headway: 1.8,
       speedFactor: 1, recycleDistance: 2200, spawnDistance: 1900 }),
@@ -77,7 +77,8 @@
   const travelDirection = ego => ego.gear === 'reverse' ? -1 : 1;
   function createState(ego = {}, { density = 'medium', roadType = 'highway', roadStart } = {}) {
     const world = { vehicles: [], density: densityFor(density), roadType:roadType === 'local' ? 'local' : 'highway',
-      roadStart:Number.isFinite(roadStart) ? roadStart : null, elapsedTime: 0, contacts: 0 };
+      roadStart:Number.isFinite(roadStart) ? roadStart : null, elapsedTime: 0, contacts: 0,
+      nextEntranceId:1000, nextEntranceArrival:0, entranceArrivals:0, entranceCompleted:0, exitSelected:0, exitCompleted:0 };
     populate(world, ego, true);
     return world;
   }
@@ -128,6 +129,9 @@
     world.lastContact = null;
     world.hornUntil = 0;
     world.lastYield = null;
+    world.nextEntranceArrival = finite(world.elapsedTime) + 3;
+    world.entranceArrivals = 0; world.entranceCompleted = 0;
+    world.exitSelected = 0; world.exitCompleted = 0; world.nextExitScan = 0;
     return world;
   }
   function egoExtents(ego) {
@@ -140,11 +144,15 @@
     return { x:vehicle.width / 2 * Math.abs(Math.cos(angle)) + vehicle.length / 2 * Math.abs(Math.sin(angle)),
       y:vehicle.length / 2 * Math.abs(Math.cos(angle)) + vehicle.width / 2 * Math.abs(Math.sin(angle)) };
   }
-  const occupiedLanes = vehicle => vehicle.laneChange ?
+  const occupiedLanes = vehicle => vehicle.exitRoute ?
+    [`exit:${vehicle.exitRoute.event.id}`, ...(Math.abs(vehicle.x - localLanes[0]) < vehicleExtents(vehicle).x + .93 + .2 ? ['local-forward'] : []), ...(vehicle.exitRoute.localTraffic ?
+      (Math.abs(vehicle.x - localLanes[0]) < vehicleExtents(vehicle).x + .93 + .2 ? [0] : []) :
+      (Math.abs(vehicle.x - lanes[2]) < vehicleExtents(vehicle).x + .93 + .2 ? [2] : []))] : vehicle.entranceMerge ?
+    (vehicle.entranceMerge.committed ? [6, 2] : [6]) : vehicle.laneChange ?
     [vehicle.laneChange.fromLane, vehicle.laneChange.targetLane] : [vehicle.lane];
   const overlapsCorridor = (vehicle, x, halfWidth = .93, margin = 0) =>
     Math.abs(vehicle.x - x) < halfWidth + vehicleExtents(vehicle).x + margin ||
-    Boolean(vehicle.laneChange && occupiedLanes(vehicle).some(lane =>
+    Boolean((vehicle.laneChange || vehicle.entranceMerge?.committed) && occupiedLanes(vehicle).some(lane =>
       Math.abs(lanes[lane] - x) < halfWidth + vehicle.width / 2 + margin));
   function yieldLaneSafe(world, vehicle, ego, lane, wet, horizon) {
     const speed = Math.max(0, vehicle.speed), headway = wet ? 1.6 : 1.1;
@@ -199,7 +207,7 @@
       overlapsCorridor(vehicle, ego.x, extent.x)).sort((a, b) => a.y - b.y)[0];
     if (!lead) return answer('unavailable', '前方 100 米内没有可提醒的同向车辆');
     if (lead.speed < 2) return answer('blocked', '前车车速较低，起步并有足够空间后才能安全避让', lead);
-    if (lead.laneChange || finite(lead.yieldCooldownUntil) > finite(world.elapsedTime))
+    if (lead.laneChange || lead.entranceMerge || lead.exitRoute || finite(lead.yieldCooldownUntil) > finite(world.elapsedTime))
       return answer('cooldown', '前车正在避让或刚完成变道，请保持安全距离', lead);
     if (!yieldRoadAllowed(canChangeLane, lead)) return answer('blocked', '前车处于实线或临近实线路段，暂时无法避让', lead);
     const duration = constants.yieldSeconds + (wet ? 1 : 0);
@@ -256,16 +264,217 @@
       vehicle.laneChange = null;
     }
   }
+  function spawnEntranceTraffic(world, ego, options) {
+    const road = options.roadModel;
+    if (!options.merging || isLocal(world) || typeof road?.eventsAround !== 'function' ||
+      typeof road?.centerForEntrance !== 'function' ||
+      finite(world.elapsedTime) < finite(world.nextEntranceArrival) ||
+      finite(world.elapsedTime) < finite(world.nextEntranceScan)) return;
+    world.nextEntranceScan = finite(world.elapsedTime) + .5;
+    const arrivals = world.vehicles.filter(vehicle => vehicle.fromEntrance);
+    if (arrivals.length >= constants.maxEntranceVehicles) return;
+    const entrances = road.eventsAround(finite(ego.y), 1000)?.entrances || [];
+    const entry = entrances.filter(event => event.start >= finite(ego.y) - 300 && event.start <= finite(ego.y) + 650)
+      .sort((a, b) => Math.abs(a.start - finite(ego.y)) - Math.abs(b.start - finite(ego.y)))
+      .find(event => !arrivals.some(vehicle => vehicle.entranceMerge?.event.id === event.id &&
+        vehicle.y - event.start < 40));
+    if (!entry) return;
+    const x = road.centerForEntrance(entry, entry.start), y = entry.start;
+    // Keep all IDs unique, including caller-provided traffic fixtures.
+    const id = Math.max(1000, finite(world.nextEntranceId, 1000),
+      ...world.vehicles.map(vehicle => finite(vehicle.id) + 1));
+    world.nextEntranceId = id + 1;
+    const vehicle = { id, lane:6, x, previousX:x, y, previousY:y, direction:1,
+      heading:0, previousHeading:0, speed:12, cruiseFactor:.88, length:4.5,
+      width:1.85, height:1.5, kind:'car', color:paint[id % paint.length], braking:false,
+      fromEntrance:true, entranceMerge:{ event:entry, committed:false, status:'approaching', wet:Boolean(options.wet) } };
+    // The vehicle starts at the physical feeder mouth, never inside ego.
+    if (Math.abs(x - finite(ego.x)) < egoExtents(ego).x + vehicle.width / 2 + 2 &&
+      Math.abs(y - finite(ego.y)) < egoExtents(ego).y + vehicle.length / 2 + 15) return;
+    world.vehicles.push(vehicle);
+    world.entranceArrivals = finite(world.entranceArrivals) + 1;
+    world.nextEntranceArrival = finite(world.elapsedTime) + ({ low:16, medium:12, dense:8 }[densityFor(world.density)]);
+  }
+  function entranceGapSafe(world, vehicle, ego, options, remaining) {
+    const wet = vehicle.entranceMerge.wet, speed = Math.max(0, vehicle.speed);
+    const headway = wet ? 2 : 1.4, braking = wet ? 2.4 : 4.5;
+    const horizon = clamp(remaining / Math.max(12, speed), 2, 14);
+    const cruise = Math.min(25, limitAt(vehicle.y) / 3.6 * .88);
+    const accelerationTime = Math.min(horizon, Math.max(0, cruise - speed) / 1.6);
+    const projectedTravel = speed * horizon + .8 * accelerationTime * accelerationTime +
+      Math.max(0, cruise - speed) * (horizon - accelerationTime);
+    const obstacles = world.vehicles.filter(other => other !== vehicle && overlapsCorridor(other, lanes[2], vehicle.width / 2, .15));
+    const extent = egoExtents(ego);
+    const egoReservesRight = options.egoLaneTarget === 2 || Math.abs(finite(ego.x) - lanes[2]) < extent.x + vehicle.width / 2 + .2;
+    if (egoReservesRight) obstacles.push({ y:finite(ego.y), length:extent.y * 2,
+      speed:travelDirection(ego) * Math.max(0, finite(ego.speed)) * Math.cos(finite(ego.heading) * Math.PI / 180), direction:1 });
+    for (const other of obstacles) {
+      const offset = other.y - vehicle.y, gap = Math.abs(offset) - (vehicle.length + other.length) / 2;
+      const otherSpeed = other.speed * other.direction;
+      if (gap < 7) return false;
+      if (offset >= 0) {
+        const stoppingGap = Math.max(0, (speed * speed - Math.max(0, otherSpeed) ** 2) / (2 * braking));
+        if (gap < 7 + speed * headway + stoppingGap ||
+          gap + otherSpeed * horizon - projectedTravel < 7 + Math.max(speed, cruise) * headway) return false;
+      } else {
+        const stoppingGap = Math.max(0, (otherSpeed * otherSpeed - speed * speed) / (2 * braking));
+        if (gap < 7 + Math.max(0, otherSpeed) * headway + stoppingGap ||
+          gap + (speed - otherSpeed) * horizon < 7 + Math.max(0, otherSpeed) * headway) return false;
+      }
+    }
+    return true;
+  }
+  function prepareEntranceMerge(world, vehicle, ego, options) {
+    const entry = vehicle.entranceMerge;
+    if (!entry) return;
+    entry.wet = Boolean(options.wet);
+    const remaining = Math.max(0, entry.event.mergeEnd - vehicle.y);
+    const near = vehicle.y >= entry.event.accelerationStart;
+    if (!near) { entry.status = 'approaching'; return; }
+    // Only the head of this ramp queue may reserve the live lane. A tail
+    // reservation would reject the head's rear-gap check, while that tail
+    // is itself following the stopped head: neither could ever proceed.
+    const queuedAhead = world.vehicles.some(other => other !== vehicle && other.y > vehicle.y &&
+      other.entranceMerge?.event.id === entry.event.id);
+    if (queuedAhead && !entry.committed) { entry.status = 'waiting'; return; }
+    const safe = entranceGapSafe(world, vehicle, ego, options, remaining);
+    if (!entry.committed) {
+      if (safe) { entry.committed = true; entry.status = 'merging'; }
+      else entry.status = 'waiting';
+    } else {
+      // Before entering the taper a newly unsafe gap can be relinquished.
+      // Once moving into the live lane, retain its reservation while braking
+      // along the curved path; stopped cars cannot translate sideways.
+      const stopping = vehicle.speed * vehicle.speed / (2 * (entry.wet ? 2.4 : 4.5)) + 5;
+      if (!safe && vehicle.y + stopping < entry.event.mergeStart - 8) {
+        entry.committed = false; entry.status = 'waiting';
+      } else entry.status = safe ? 'merging' : 'waiting';
+    }
+  }
+  function advanceEntrancePose(world, vehicle, previousY, dt, road) {
+    const entry = vehicle.entranceMerge;
+    if (!entry || typeof road?.centerForEntrance !== 'function') return;
+    const previousX = vehicle.x;
+    vehicle.x = road.centerForEntrance(entry.event, vehicle.y);
+    vehicle.heading = Math.atan2(vehicle.x - previousX, Math.max(.00001, vehicle.y - previousY)) * 180 / Math.PI;
+    if (vehicle.y >= entry.event.mergeEnd) {
+      vehicle.lane = 2; vehicle.x = lanes[2]; vehicle.heading = 0;
+      vehicle.entranceMerge = null;
+      vehicle.yieldCooldownUntil = finite(world.elapsedTime) + 5;
+      world.entranceCompleted = finite(world.entranceCompleted) + 1;
+    }
+  }
+  function entranceSnapshot(world, ego) {
+    const list = world.vehicles.filter(vehicle => vehicle.entranceMerge).map(vehicle => ({
+      id:vehicle.id, entranceId:vehicle.entranceMerge.event.id, entranceName:vehicle.entranceMerge.event.name,
+      status:vehicle.entranceMerge.status, committed:vehicle.entranceMerge.committed,
+      distance:vehicle.y - finite(ego.y), speedKmh:vehicle.speed * 3.6 }));
+    return { activeCount:list.length, waitingCount:list.filter(item => item.status === 'waiting').length,
+      mergingCount:list.filter(item => item.committed).length, arrivals:finite(world.entranceArrivals),
+      completed:finite(world.entranceCompleted),
+      nearest:list.slice().sort((a,b) => Math.abs(a.distance) - Math.abs(b.distance))[0] || null, list };
+  }
+  function chooseExitTraffic(world, ego, options) {
+    const road = options.roadModel;
+    if (!options.exiting || isLocal(world) || typeof road?.eventsAround !== 'function' ||
+      typeof road?.centerForExit !== 'function' || finite(world.elapsedTime) < finite(world.nextExitScan)) return;
+    world.nextExitScan = finite(world.elapsedTime) + .5;
+    const exits = road.eventsAround(finite(ego.y), 1800).exits || [];
+    for (const vehicle of world.vehicles) {
+      if (vehicle.direction !== 1 || vehicle.lane !== 2 || vehicle.laneChange || vehicle.entranceMerge || vehicle.exitRoute) continue;
+      const event = exits.find(exit => vehicle.y >= exit.entryStart - 450 && vehicle.y < exit.entryStart - 45);
+      if (!event || vehicle.lastExitConsidered === event.id) continue;
+      vehicle.lastExitConsidered = event.id;
+      // Stable route preferences select only part of the ordinary right-lane
+      // traffic. Existing vehicles take the slip road; no car appears there.
+      if ((vehicle.id + roadHash(Math.floor(event.start), 0x635b729d)) % 3 !== 0) continue;
+      const rampSpeed = event.speedLimitKmh / 3.6, deceleration = options.wet ? 1.6 : 2.5;
+      const reserve = Math.max(0, (vehicle.speed * vehicle.speed - rampSpeed * rampSpeed) / (2 * deceleration)) + vehicle.speed * 1.5 + 15;
+      if (event.entryStart - vehicle.y < reserve) continue;
+      vehicle.exitRoute = { event, status:'approaching', wet:Boolean(options.wet) };
+      world.exitSelected = finite(world.exitSelected) + 1;
+    }
+  }
+  function exitTargetSpeed(vehicle, options) {
+    const route = vehicle.exitRoute, event = route.event;
+    route.wet = Boolean(options.wet);
+    if (vehicle.y >= event.rampEnd) return localRoad.speedLimitKmh / 3.6;
+    const rampSpeed = event.speedLimitKmh / 3.6;
+    if (vehicle.y >= event.entryStart) return rampSpeed;
+    const buffer = 12 + vehicle.speed * 1.5, deceleration = route.wet ? 1.6 : 2.5;
+    return Math.sqrt(rampSpeed * rampSpeed + 2 * deceleration * Math.max(0, event.entryStart - vehicle.y - buffer));
+  }
+  function advanceExitPose(world, vehicle, previousY, road) {
+    const route = vehicle.exitRoute;
+    if (!route || typeof road?.centerForExit !== 'function') return;
+    const previousX = vehicle.x;
+    vehicle.x = road.centerForExit(route.event, vehicle.y);
+    vehicle.heading = Math.atan2(vehicle.x - previousX, Math.max(.00001, vehicle.y - previousY)) * 180 / Math.PI;
+    if (vehicle.y >= route.event.rampEnd) {
+      if (route.status !== 'local') world.exitCompleted = finite(world.exitCompleted) + 1;
+      route.status = 'local'; vehicle.x = localLanes[0]; vehicle.heading = 0;
+      if (isLocal(world)) { vehicle.exitRoute = null; vehicle.lane = 0; }
+    } else route.status = vehicle.y >= route.event.entryStart ? 'ramp' : 'approaching';
+  }
+  function exitSnapshot(world, ego) {
+    const list = world.vehicles.filter(vehicle => vehicle.exitRoute).map(vehicle => ({
+      id:vehicle.id, exitId:vehicle.exitRoute.event.id, exitName:vehicle.exitRoute.event.name,
+      status:vehicle.exitRoute.status, x:vehicle.x, y:vehicle.y,
+      distance:vehicle.y - finite(ego.y), speedKmh:vehicle.speed * 3.6 }));
+    return { activeCount:list.filter(item=>item.status!=='local').length,
+      departedCount:list.filter(item=>item.status==='local').length, completed:finite(world.exitCompleted),
+      nearest:list.slice().sort((a,b)=>Math.abs(a.distance)-Math.abs(b.distance))[0] || null, list };
+  }
+  function transitionToLocal(world, ego, exit) {
+    const next = createState(ego,{density:world?.density,roadType:'local',roadStart:exit?.rampEnd});
+    if (!world || !exit) return next;
+    const preset = presetFor(next);
+    const retained = world.vehicles.filter(vehicle => vehicle.exitRoute?.event.id === exit.id &&
+      Math.abs(vehicle.y - finite(ego.y)) <= preset.recycleDistance)
+      .sort((a,b)=>Math.abs(a.y-finite(ego.y))-Math.abs(b.y-finite(ego.y)))
+      .slice(0,preset.countPerLane);
+    const retainedIds = new Set(retained.map(vehicle=>vehicle.id));
+    let uniqueId = Math.max(1000, finite(world.nextEntranceId), ...world.vehicles.map(vehicle=>finite(vehicle.id)+1));
+    let seeds = next.vehicles.filter(vehicle => vehicle.direction < 0 || !retained.some(other =>
+      Math.abs(vehicle.y-other.y) < (vehicle.length+other.length)/2 + Math.max(10, other.speed*preset.headway)));
+    const maxSeeds = preset.countPerLane*2 - retained.length;
+    while (seeds.length > maxSeeds) {
+      const candidates = seeds.filter(vehicle=>vehicle.direction>0).sort((a,b)=>Math.abs(b.y-finite(ego.y))-Math.abs(a.y-finite(ego.y)));
+      if (!candidates.length) break;
+      seeds.splice(seeds.indexOf(candidates[0]),1);
+    }
+    for (const vehicle of seeds) { while(retainedIds.has(uniqueId)) uniqueId++; vehicle.id=uniqueId++; }
+    for (const vehicle of retained) {
+      vehicle.lane = 0;
+      vehicle.exitRoute.localTraffic = true;
+      if (vehicle.exitRoute.status === 'local') vehicle.exitRoute = null;
+      vehicle.fromEntrance = false;
+    }
+    next.vehicles = [...seeds,...retained];
+    next.nextEntranceId = uniqueId;
+    next.elapsedTime = finite(world.elapsedTime);
+    next.exitCompleted = finite(world.exitCompleted);
+    return next;
+  }
   function recycle(world, ego) {
     const preset = presetFor(world);
+    // Entrance arrivals have a real source. Retire distant arrivals instead
+    // of teleporting the same car back onto its ramp or into another lane.
+    world.vehicles = world.vehicles.filter(vehicle => !vehicle.fromEntrance ||
+      Math.abs(vehicle.y - ego.y) <= (vehicle.exitRoute ? Math.max(2200, preset.recycleDistance) : preset.recycleDistance));
     for (const vehicle of world.vehicles) {
       const offset = vehicle.y - ego.y;
-      if (Math.abs(offset) <= preset.recycleDistance) continue;
+      if (vehicle.fromEntrance) continue;
+      // Departing vehicles remain observable for the full slip road even
+      // with the shorter recycling range used by dense motorway traffic.
+      const wideRecycle = Boolean(vehicle.exitRoute || vehicle.exitRecycled);
+      const recycleRange = wideRecycle ? Math.max(2200, preset.recycleDistance) : preset.recycleDistance;
+      if (Math.abs(offset) <= recycleRange) continue;
       // Dense traffic has a shorter distant recycling window, keeping its
       // visible queue dense without requiring hundreds of additional cars.
       // Candidates are always far from ego and cannot overlap another NPC.
       const side = offset < 0 ? 1 : -1;
-      let candidate = ego.y + side * preset.spawnDistance;
+      let candidate = ego.y + side * (wideRecycle ? Math.max(1900, preset.spawnDistance) : preset.spawnDistance);
       let attempts = 0;
       const clearGap = Math.min(85, preset.spacing * .6), stride = clearGap + 10;
       while (world.vehicles.some(other => other !== vehicle && occupiedLanes(other).includes(vehicle.lane) &&
@@ -273,6 +482,8 @@
       if (attempts > 40) continue;
       vehicle.y = vehicle.previousY = candidate;
       vehicle.laneChange = null;
+      if (vehicle.exitRoute) vehicle.exitRecycled = true;
+      vehicle.exitRoute = null; vehicle.lastExitConsidered = null;
       vehicle.x = vehicle.previousX = lanesFor(world)[vehicle.lane];
       vehicle.heading = vehicle.previousHeading = vehicle.direction > 0 ? 0 : 180;
       vehicle.yieldCooldownUntil = 0;
@@ -280,23 +491,31 @@
       vehicle.braking = false;
     }
   }
-  function step(world, ego, dt) {
+  function step(world, ego, dt, options = {}) {
     if (!world || !Array.isArray(world.vehicles) || !Number.isFinite(dt) || dt <= 0) return world;
     ego = ego || {};
+    if (options.roadModel) world.roadModel = options.roadModel;
     const egoY = finite(ego.y), egoX = finite(ego.x), extent = egoExtents(ego);
     const egoForwardSpeed = travelDirection(ego) * finite(ego.speed) * Math.cos(finite(ego.heading) * Math.PI / 180);
     const preset = presetFor(world);
+    spawnEntranceTraffic(world, ego, options);
+    chooseExitTraffic(world, ego, options);
     const substeps = Math.ceil(Math.min(dt, 10) / constants.maxSubstep), subDt = Math.min(dt, 10) / substeps;
     for (const vehicle of world.vehicles) {
       vehicle.previousY = vehicle.y; vehicle.previousX = vehicle.x; vehicle.previousHeading = vehicle.heading;
     }
     for (let i = 0; i < substeps; i++) {
-      for (const vehicle of world.vehicles) advanceYield(world, vehicle, ego, subDt);
+      for (const vehicle of world.vehicles) {
+        advanceYield(world, vehicle, ego, subDt);
+        prepareEntranceMerge(world, vehicle, ego, options);
+      }
       // A turning car occupies both lanes until centered. Build predecessor
       // lists once per substep, then move every car exactly once, front first.
       const leaders = new Map();
-      for (let lane = 0; lane < lanesFor(world).length; lane++) {
-        const direction = directionFor(world, lane);
+      const laneGroups = Array.from({length:lanesFor(world).length + (isLocal(world) ? 0 : 1)},(_,lane)=>lane);
+      laneGroups.push(...new Set(world.vehicles.flatMap(vehicle=>occupiedLanes(vehicle)).filter(lane=>typeof lane==='string')));
+      for (const lane of laneGroups) {
+        const direction = typeof lane === 'string' || lane === 6 ? 1 : directionFor(world, lane);
         const group = world.vehicles.filter(vehicle => occupiedLanes(vehicle).includes(lane))
           .sort((a, b) => direction * (b.y - a.y));
         for (let j = 1; j < group.length; j++) {
@@ -315,7 +534,9 @@
               stopAt = leader.y - direction * ((vehicle.length + leader.length) / 2 + constants.minGap);
             }
           }
-          if (overlapsCorridor(vehicle, egoX, extent.x, .2) &&
+          const exitEgoAhead = vehicle.exitRoute && typeof options.roadModel?.centerForExit === 'function' &&
+            Math.abs(egoX - options.roadModel.centerForExit(vehicle.exitRoute.event, egoY)) < extent.x + vehicle.width / 2 + .2;
+          if ((overlapsCorridor(vehicle, egoX, extent.x, .2) || exitEgoAhead) &&
             direction * (egoY - vehicle.y) > 0) {
             const egoGap = direction * (egoY - vehicle.y) - vehicle.length / 2 - extent.y;
             if (egoGap < gap) {
@@ -326,10 +547,25 @@
           const roadSpeed = Math.min(limitFor(world,vehicle.y), limitFor(world,vehicle.y + direction * 95)) / 3.6;
           let desired = roadSpeed * vehicle.cruiseFactor * preset.speedFactor;
           if (vehicle.laneChange?.status === 'waiting') desired = 0;
+          if (vehicle.exitRoute) desired = Math.min(desired, exitTargetSpeed(vehicle, options));
+          const entry = vehicle.entranceMerge;
+          if (entry) {
+            // Match motorway traffic while using the acceleration lane; a
+            // blocked arrival brakes to the waiting line before the taper.
+            desired = Math.min(roadSpeed * .88, entry.committed ? Infinity : 25);
+            if (!entry.committed) {
+              const line = entry.event.mergeStart - 8, remaining = Math.max(0, line - vehicle.y);
+              const deceleration = entry.wet ? 2.4 : 3.5, response = deceleration * 1.5;
+              desired = Math.min(desired, Math.max(0, Math.sqrt(response * response +
+                2 * deceleration * Math.max(0, remaining - 4)) - response));
+              if (remaining < .2) desired = 0;
+              stopAt = stopAt === null ? line : Math.min(stopAt, line);
+            } else if (entry.status === 'waiting') desired = 0;
+          }
           if (Number.isFinite(gap)) {
             // A stopping-distance + time-headway bound makes a slow queue
             // stable, including when the player's car is standing still.
-            const decel = 4.5, head = decel * preset.headway;
+            const decel = vehicle.exitRoute && options.wet ? 2.4 : 4.5, head = decel * (preset.headway + (vehicle.exitRoute && options.wet ? .6 : 0));
             const safe = Math.max(0, Math.sqrt(head * head + leaderSpeed * leaderSpeed +
               2 * decel * Math.max(0, gap - constants.minGap)) - head);
             desired = Math.min(desired, safe);
@@ -337,6 +573,7 @@
           const before = vehicle.speed;
           const startY = vehicle.y;
           vehicle.speed = Math.max(0, before + clamp((desired - before) * 1.2, -5, 1.6) * subDt);
+          if (desired === 0 && vehicle.speed < .03) vehicle.speed = 0;
           vehicle.braking = vehicle.speed < before - .025;
           vehicle.y += direction * (before + vehicle.speed) * .5 * subDt;
           // The geometric final bound prevents tunnelling in very tight queues.
@@ -346,6 +583,8 @@
             vehicle.y = startY + direction * Math.max(0, direction * (stopAt - startY));
             vehicle.speed = Math.min(vehicle.speed, leaderSpeed);
           }
+          advanceEntrancePose(world, vehicle, startY, subDt, options.roadModel);
+          advanceExitPose(world, vehicle, startY, options.roadModel);
       }
       world.elapsedTime += subDt;
     }
@@ -356,7 +595,11 @@
     const x = finite(ego.x), y = finite(ego.y), extent = egoExtents(ego);
     let nearestAhead = null, nearestBehind = null;
     for (const vehicle of world.vehicles) {
-      if (vehicle.direction !== 1 || !overlapsCorridor(vehicle, x, extent.x)) continue;
+      const route = !isLocal(world) && ego.exitRoute;
+      const pathCenter = route && typeof world.roadModel?.centerForExit === 'function' ?
+        world.roadModel.centerForExit(route, vehicle.y) : x;
+      const sameExit = route && vehicle.exitRoute?.event.id === route.id;
+      if (vehicle.direction !== 1 || (!sameExit && !overlapsCorridor(vehicle, pathCenter, extent.x))) continue;
       const distance = Math.max(0, Math.abs(vehicle.y - y) - vehicle.length / 2 - extent.y);
       const item = { id: vehicle.id, lane: vehicle.lane, distance, speedKmh: vehicle.speed * 3.6 };
       if (vehicle.y >= y && (!nearestAhead || distance < nearestAhead.distance)) nearestAhead = item;
@@ -364,7 +607,7 @@
     }
     return { speedLimitKmh: limitFor(world,y), roadType:isLocal(world) ? 'local' : 'highway',
       density: densityFor(world.density), vehicleCount: world.vehicles.length,
-      nearestAhead, nearestBehind, vehicles: world.vehicles,
+      nearestAhead, nearestBehind, vehicles: world.vehicles, merging: entranceSnapshot(world, ego), exiting: exitSnapshot(world, ego),
       roadSigns: signsAround(y).map(sign => isLocal(world) ? { ...sign,limitKmh:localRoad.speedLimitKmh } : sign) };
   }
 
@@ -549,5 +792,5 @@
       signedSpeed * Math.cos(angle) - v.direction * v.speed), side: hit.axis === 'x' };
   }
   return Object.freeze({ constants, densityPresets, createState, setDensity, step, limitAt, nextLimit, signsAround, getSnapshot,
-    getLaneRecommendation, requestYield, resolveContact });
+    getLaneRecommendation, requestYield, resolveContact, transitionToLocal });
 });

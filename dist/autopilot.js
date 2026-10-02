@@ -19,7 +19,7 @@
    */
   function evaluate(world, car, { wet = false, targetSpeed = 100, roadType = 'highway', laneTarget = 1,
     laneChanging = false, shoulderAlert = false, shiftPending = false, locked = false, cooldownUntil = 0,
-    allowLaneChange = true } = {}) {
+    allowLaneChange = true, exitRoute = null } = {}) {
     car = car || {};
     const speed = Math.max(0, finite(car.speed)), y = finite(car.y), x = finite(car.x);
     const stopped = (status, reason) => ({ targetSpeed: 0, brake: 1, throttle: 0, laneDirection: 0, status, reason });
@@ -83,6 +83,13 @@
     let following = false, urgent = false, nearestGap = Infinity;
     for (const vehicle of vehicles) {
       if (![vehicle.x, vehicle.y].every(Number.isFinite)) continue;
+      const vehicleAngle = finite(vehicle.heading, vehicle.direction === -1 ? 180 : 0) * Math.PI / 180;
+      const vehicleWidth = Math.max(.5, finite(vehicle.width, 1.85));
+      const vehicleLength = Math.max(1, finite(vehicle.length, 4.5));
+      const vehicleHalfX = vehicleWidth / 2 * Math.abs(Math.cos(vehicleAngle)) +
+        vehicleLength / 2 * Math.abs(Math.sin(vehicleAngle));
+      const vehicleHalfY = vehicleLength / 2 * Math.abs(Math.cos(vehicleAngle)) +
+        vehicleWidth / 2 * Math.abs(Math.sin(vehicleAngle));
       const occupiedCenters = [vehicle.x];
       // A yielding car reserves both lanes until it finishes. Keep following
       // an outgoing leader and anticipate an incoming car before its body
@@ -93,9 +100,19 @@
             occupiedCenters.push(laneControl.constants.laneCenters[reservedLane]);
         }
       }
-      if (!corridors.some(center => occupiedCenters.some(occupied =>
-        Math.abs(occupied - center) < halfX + Math.max(.5, finite(vehicle.width, 1.85)) / 2 + .2))) continue;
-      const offset = vehicle.y - y, bodyLength = halfY + Math.max(1, finite(vehicle.length, 4.5)) / 2;
+      if (roadType === 'highway' && vehicle.entranceMerge?.committed)
+        occupiedCenters.push(laneControl.constants.laneCenters[2]);
+      // A leader on the same curved ramp may already be several metres to
+      // our right. Watch its route position before its body enters our
+      // current x corridor, including traffic past the ordinary-road join.
+      const sameExit = exitRoute && vehicle.exitRoute?.event?.id === exitRoute.id;
+      const joinedRoad = exitRoute && vehicle.y >= exitRoute.rampEnd;
+      const onExitPath = roadType === 'ramp' && exitRoute && vehicle.direction !== -1 &&
+        (sameExit || joinedRoad) && typeof road.centerForExit === 'function' &&
+        Math.abs(vehicle.x - road.centerForExit(exitRoute, vehicle.y)) < halfX + vehicleHalfX + .2;
+      if (!onExitPath && !corridors.some(center => occupiedCenters.some(occupied =>
+        Math.abs(occupied - center) < halfX + vehicleHalfX + .2))) continue;
+      const offset = vehicle.y - y, bodyLength = halfY + vehicleHalfY;
       if (offset < -bodyLength) continue;
       const gap = offset - bodyLength;
       const frontSpeed = Math.max(0, finite(vehicle.speed)) * (vehicle.direction === -1 ? -1 : 1);

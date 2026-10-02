@@ -1,6 +1,6 @@
 /* Meter-scale highway renderer. Pose x/y maps to world X/Z; heading is
    clockwise from +Z. Scenery repeats every 400 m; traffic, road markings,
-   exits and signs retain world positions through every camera rebase. */
+   exits, entrances and signs retain world positions through every camera rebase. */
 (() => {
   'use strict';
 
@@ -63,6 +63,7 @@
     'O':['01110','10001','10001','10001','10001','10001','01110'],
     'M':['10001','11011','10101','10101','10001','10001','10001'],
     'P':['11110','10001','10001','11110','10000','10000','10000'],
+    'R':['11110','10001','10001','11110','10100','10010','10001'],
     'S':['01111','10000','10000','01110','00001','00001','11110'],
     'T':['11111','00100','00100','00100','00100','00100','00100'],
     'W':['10001','10001','10001','10101','10101','10101','01010'],
@@ -144,7 +145,18 @@
     disc(target,x,2.7,z-.025,.44,COLORS.white);
     lettering(target,String(settings.speedLimitKmh),x,2.5,z-.035,.39,COLORS.dark);
   }
-  function buildLocalRoad(target, origin, route, start=-1600, end=2000) {
+  function entranceOccupies(entrances, x, worldY, halfWidth = 0, halfLength = 0) {
+    const road = window.RoverRoad;
+    return entrances.some(entrance => {
+      if (worldY + halfLength < entrance.start || worldY - halfLength > entrance.end) return false;
+      // The centerline is monotone, so endpoints bound every intermediate x.
+      const near = road.centerForEntrance(entrance,worldY-halfLength);
+      const far = road.centerForEntrance(entrance,worldY+halfLength);
+      return x+halfWidth >= Math.min(near,far)-entrance.width/2-.75 &&
+        x-halfWidth <= Math.max(near,far)+entrance.width/2+.75;
+    });
+  }
+  function buildLocalRoad(target, origin, route, start=-1600, end=2000, entrances=[]) {
     const settings = localGeometry(), left = settings.oncomingLaneCenter-settings.halfLaneWidth;
     const right = settings.laneCenter+settings.halfLaneWidth, middle = (left+right)/2;
     const connection = route?.rampEnd ?? -Infinity, begin = Math.max(start,connection-120-origin);
@@ -176,6 +188,7 @@
         box(target,x-side*.52,5.3,z,1.1,.12,.15,COLORS.steelDark);
         box(target,x-side*.9,5.24,z,.42,.08,.23,rgb('#fff0ba'));
         const buildingX = side < 0 ? left-7.1 : right+7.1;
+        if (entranceOccupies(entrances,buildingX,y+18,3.75,7.2)) continue;
         const facade = (block+side)%2 ? rgb('#b6b2a0') : rgb('#a6b2a7');
         box(target,buildingX,0,z+18,7.2,height,14,facade);
         box(target,buildingX,height,z+18,7.5,.22,14.3,rgb('#65756d'));
@@ -236,14 +249,74 @@
       }
     }
   }
-  function buildHighway(origin = 0, route = null) {
+  function entranceSign(target, entrance, worldY, origin) {
+    const x = 11.3, z = worldY-origin, front = z-.11;
+    box(target,x,0,z,.14,4.5,.14,COLORS.steel);
+    box(target,x,3.05,z,3.85,1.45,.18,COLORS.amber);
+    lettering(target,'MERGE',x-.35,3.85,front,.37,COLORS.dark);
+    lettering(target,`${Math.max(0,Math.round(entrance.mergeStart-worldY))}M`,x-.35,3.32,front,.33,COLORS.dark);
+    // A straight mainline with a branch joining from its right.
+    polygon(target,[[x+1,3.25,front],[x+1.13,3.25,front],[x+1.13,4.02,front],[x+1,4.02,front]],COLORS.dark);
+    polygon(target,[[x+.86,3.92,front],[x+1.06,4.2,front],[x+1.27,3.92,front]],COLORS.dark);
+    polygon(target,[[x+1.04,3.66,front],[x+1.13,3.76,front],[x+1.61,3.38,front],[x+1.53,3.28,front]],COLORS.dark);
+  }
+  function buildEntrances(target, entrances, origin) {
+    const road = window.RoverRoad;
+    if (!road) return;
+    for (const entrance of entrances) {
+      for (const y of [entrance.signStart,entrance.start-150]) entranceSign(target,entrance,y,origin);
+      const half = entrance.width/2;
+      for (let y = entrance.start; y < entrance.mergeEnd; y += 5) {
+        const y2 = Math.min(y+5,entrance.mergeEnd);
+        const x1 = road.centerForEntrance(entrance,y), x2 = road.centerForEntrance(entrance,y2);
+        const z1 = y-origin, z2 = y2-origin;
+        const strip = (left,right,height,color,layer=1) => polygon(target,
+          [[x1+left,height,z1],[x1+right,height,z1],[x2+right,height,z2],[x2+left,height,z2]],color,layer,1);
+        const left1 = Math.max(ROAD.halfWidth,x1-half-.45), left2 = Math.max(ROAD.halfWidth,x2-half-.45);
+        const right1 = Math.max(left1,x1+half+.45), right2 = Math.max(left2,x2+half+.45);
+        polygon(target,[[left1,.006,z1],[right1,.006,z1],[right2,.006,z2],[left2,.006,z2]],COLORS.shoulder,1.1,1);
+        strip(-half,half,.009,COLORS.road,1.2);
+        if (x2-half > ROAD.emergencyEnd) strip(-half,-half+.12,.024,COLORS.paint,2);
+        // Keep diagonal edge paint out of the main travel lane as the ramp
+        // tapers into it. The highway remains an uninterrupted through lane.
+        if (x2+half > ROAD.halfWidth) strip(half-.12,half,.024,COLORS.paint,2);
+        if (y2 <= entrance.openingStart) {
+          for (const side of [-1,1]) {
+            const edge1 = x1+side*(half+.5), edge2 = x2+side*(half+.5);
+            polygon(target,[[edge1,.65,z1],[edge2,.65,z2],[edge2,.87,z2],[edge1,.87,z1]],COLORS.steel);
+          }
+        }
+      }
+      // Dashed separation opens the acceleration lane; arrows point along
+      // the actual curved merge path rather than across a fictitious wall.
+      for (let y = entrance.accelerationStart; y < entrance.mergeEnd-30; y += 16)
+        ground(target,ROAD.halfWidth-.065,ROAD.halfWidth+.065,y-origin,y+6-origin,.025,COLORS.paint,2);
+      for (let y = entrance.start+40; y < entrance.mergeEnd-20; y += 65) {
+        const x = road.centerForEntrance(entrance,y), z = y-origin;
+        const slope = (road.centerForEntrance(entrance,y+2)-road.centerForEntrance(entrance,y-2))/4;
+        const point = (side,along) => [x+side+slope*along,.03,z+along];
+        polygon(target,[point(-.1,-2),point(.1,-2),point(.1,1),point(-.1,1)],COLORS.paint,2);
+        polygon(target,[point(-.65,.8),point(0,3),point(.65,.8)],COLORS.paint,2);
+      }
+    }
+  }
+  function buildHighway(origin = 0, route = null, trafficRoutes = []) {
     const target = mesh();
     const start = -1600, end = 2000;
-    const events = window.RoverRoad?.eventsAround(origin+200,2100) || { solids: [], exits: [] };
-    if (route) events.exits = [route];
+    const events = window.RoverRoad?.eventsAround(origin+200,2100) || { solids: [], exits: [], entrances: [] };
+    events.entrances ||= [];
+    if (route) { events.exits = [route]; events.entrances = []; }
+    else {
+      const existing=new Set(events.exits.map(exit=>exit.id));
+      for(const exit of trafficRoutes)if(!existing.has(exit.id)) {events.exits.push(exit);existing.add(exit.id);}
+      events.exits.sort((a,b)=>a.entryStart-b.entryStart);
+    }
     const solids = events.solids.map(zone => ({ start:zone.start-origin, end:zone.end-origin }));
-    const openings = events.exits.map(exit => ({ start:exit.openingStart-origin, end:exit.openingEnd-origin }));
+    const openings = [...events.exits,...events.entrances]
+      .map(event => ({ start:event.openingStart-origin, end:event.openingEnd-origin })).sort((a,b)=>a.start-b.start);
     const openingAt = z => openings.some(opening => z >= opening.start && z <= opening.end);
+    const entranceSignAt = z => events.entrances.some(entrance =>
+      Math.abs(z+origin-entrance.signStart)<8 || Math.abs(z+origin-(entrance.start-150))<8);
     // Short ground strips preserve fog and perspective near the horizon.
     for (let z = start; z < end; z += 50) {
       ground(target,-2000,2000,z,z+50,-.07,COLORS.grass,0);
@@ -296,7 +369,7 @@
         [[8.1,.015,z+dz],[8.5,.015,z+dz+1],[8.5,.015,z+dz+1.5],[8.1,.015,z+dz+.5]],COLORS.amber,2);
     }
     for (let z = start; z < end; z += ROAD.repeat) {
-      if (!openingAt(z+200)) gantry(target,z+200);
+      if (!openingAt(z+200) && !entranceSignAt(z+200)) gantry(target,z+200);
       if (!openingAt(z+110)) {
         box(target,10,0,z+110,.12,2.6,.12,COLORS.steel);
         box(target,10,2.1,z+110,1.55,1.02,.13,COLORS.amber);
@@ -308,15 +381,19 @@
       hill(target,-355,z+310,320,310,91,COLORS.hills);
       // Low roadside planting, kept well outside the driving surface.
       for (const [x,dz,h] of [[24,45,5],[-41,135,6],[34,280,4.4],[-43,340,5.5]]) {
-        if (x > 0 && events.exits.some(exit => z+dz+origin >= exit.entryStart && z+dz+origin <= exit.rampEnd && Math.abs(x-window.RoverRoad.centerForExit(exit,z+dz+origin)) < 6)) continue;
+        if (x > 0 && (events.exits.some(exit => z+dz+origin >= exit.entryStart && z+dz+origin <= exit.rampEnd && Math.abs(x-window.RoverRoad.centerForExit(exit,z+dz+origin)) < 6) ||
+          entranceOccupies(events.entrances,x,z+dz+origin,2.5,2.5))) continue;
         box(target,x,0,z+dz,.22,h*.58,.22,COLORS.dark);
         hill(target,x,z+dz,4.5,4.5,h,COLORS.hills);
       }
     }
     buildExits(target,events.exits,origin);
+    buildEntrances(target,events.entrances,origin);
     // Unselected exits still have a visible continuation. Once a route is
     // selected, only that connection is drawn so later exits cannot overlap it.
-    for (const exit of events.exits) buildLocalRoad(target,origin,exit,start,route ? end : Math.min(end,exit.rampEnd+700-origin));
+    const activeTrafficRoutes=new Set(trafficRoutes.map(exit=>exit.id));
+    for (const exit of events.exits) buildLocalRoad(target,origin,exit,start,
+      route||activeTrafficRoutes.has(exit.id)?end:Math.min(end,exit.rampEnd+700-origin),events.entrances);
     target.data = new Float32Array(target.vertices);
     target.vertices = null;
     return target;
@@ -408,9 +485,13 @@
     polygon(target,points,color);
   }
   function speedSign(target,sign,origin) {
-    const exit = window.RoverRoad?.getState(sign.y).activeExit;
+    const roadState = window.RoverRoad?.getState(sign.y), exit = roadState?.activeExit;
     const center = exit ? window.RoverRoad.centerForExit(exit,sign.y) : 0;
-    const x = exit && Math.abs(center-10) < 4 ? center+exit.width/2+1.5 : 10, z = sign.y-origin;
+    let x = exit && Math.abs(center-10) < 4 ? center+exit.width/2+1.5 : 10;
+    const entrance = roadState?.activeEntrance;
+    if (entrance && entranceOccupies([entrance],x,sign.y,1,.1))
+      x = window.RoverRoad.centerForEntrance(entrance,sign.y)+entrance.width/2+1.5;
+    const z = sign.y-origin;
     box(target,x,0,z,.12,3.6,.12,COLORS.steel);
     disc(target,x,3.55,z+.012,.88,COLORS.steelDark);
     disc(target,x,3.55,z-.02,.88,rgb('#d4493f'));
@@ -460,6 +541,276 @@
     }
     const signs = pose.localRoad ? [] : pose.roadSigns || window.RoverTraffic?.signsAround(pose.y) || [];
     for (const sign of signs) speedSign(target,sign,origin);
+    return target;
+  }
+
+  const boundedNumber = (value, fallback, min, max) =>
+    Math.max(min,Math.min(max,Number.isFinite(Number(value)) ? Number(value) : fallback));
+  function sampleCollisionEffect(effect) {
+    const resting = {height:0,pitch:0,roll:0,travelDistance:0,travelSpeed:0,phase:'settled',damage:effect?.reducedMotion?1:0,smoke:effect?.reducedMotion?1:0,smokeTime:1.2};
+    if (!effect || effect.reducedMotion) return resting;
+    const peak = boundedNumber(effect.peakHeight,2.6,0,4);
+    const requestedFlight = boundedNumber(effect.flightTime,2*Math.sqrt(2*peak/9.81),.1,3);
+    const requestedSlide = boundedNumber(effect.slideTime,.8,0,3);
+    const smokeDwell = boundedNumber(effect.smokeDwell,1.2,0,5);
+    const duration = boundedNumber(effect.duration,requestedFlight+requestedSlide+smokeDwell,.1,10);
+    const elapsed = boundedNumber(effect.elapsed,0,0,duration);
+    const flightTime = Math.min(requestedFlight,duration),slideTime=Math.min(requestedSlide,Math.max(0,duration-flightTime));
+    const launchSpeed=boundedNumber(effect.launchSpeed,0,0,60),flightElapsed=Math.min(elapsed,flightTime);
+    const landingSpeed=launchSpeed*.65,flightDistance=launchSpeed*flightTime*.825;
+    let travelDistance=launchSpeed*flightElapsed-.5*(launchSpeed*.35/flightTime)*flightElapsed*flightElapsed;
+    let travelSpeed=launchSpeed*(1-.35*flightElapsed/flightTime);
+    if(elapsed>=flightTime) {
+      const t=Math.min(Math.max(0,elapsed-flightTime),slideTime);
+      travelDistance=flightDistance+(slideTime>0?landingSpeed*(t-.5*t*t/slideTime):0);
+      travelSpeed=slideTime>0?landingSpeed*(1-t/slideTime):0;
+    }
+    const sample={...resting,travelDistance,travelSpeed:Math.max(0,travelSpeed),damage:Math.min(1,.55+peak*.11),
+      smoke:Math.min(1,.22+elapsed*.95),smokeTime:elapsed};
+    // Very small impacts also get proportionally smaller angles, keeping all
+    // wheels above the pavement instead of rotating the body through it.
+    const tiltScale = Math.min(1,peak/.6);
+    const pitch = boundedNumber(effect.pitchDeg,8,-12,12)*tiltScale;
+    const roll = boundedNumber(effect.rollDeg,5,-9,9)*tiltScale;
+    if(elapsed>=duration)return {...sample,travelSpeed:0};
+    if (elapsed < flightTime) {
+      const t = elapsed/flightTime, tilt = Math.sin(Math.PI*t);
+      return {...sample,height:4*peak*t*(1-t),pitch:pitch*tilt||0,roll:roll*tilt||0,phase:'airborne'};
+    }
+    return {...sample,phase:elapsed<flightTime+slideTime?'sliding':'smoking'};
+  }
+  const collisionMotionRules=new WeakMap();
+  function motionRules(pose) {
+    const effect=pose.collisionEffect;
+    if(!effect)return {scale:1};
+    if(collisionMotionRules.has(effect))return collisionMotionRules.get(effect);
+    const rules={scale:1},contact=(pose.traffic||[]).find(vehicle=>vehicle.id===effect.contactVehicleId);
+    if(contact&&!effect.reducedMotion) {
+      const heading=boundedNumber(effect.travelHeading,viewHeading(pose),-1e8,1e8)*Math.PI/180,sin=Math.sin(heading),cos=Math.cos(heading);
+      const extent=vehicle=>{
+        const angle=(Number.isFinite(vehicle.heading)?vehicle.heading:vehicle.direction<0?180:0)*Math.PI/180-heading;
+        const length=(vehicle.length||(vehicle.kind==='truck'?8.3:4.5))/2,width=(vehicle.width||(vehicle.kind==='truck'?2.35:1.85))/2;
+        return {along:Math.abs(Math.cos(angle))*length+Math.abs(Math.sin(angle))*width,
+          side:Math.abs(Math.cos(angle))*width+Math.abs(Math.sin(angle))*length};
+      };
+      const contactExtent=extent(contact),dx=contact.x-pose.x,dz=contact.y-pose.y;
+      const ahead=dx*sin+dz*cos,initialGap=Math.max(0,ahead-contactExtent.along-2.25);
+      const finalDistance=sampleCollisionEffect({...effect,elapsed:1e9}).travelDistance;
+      const landingDistance=sampleCollisionEffect({...effect,elapsed:boundedNumber(effect.flightTime,1.45,.1,3)}).travelDistance;
+      if(ahead>0&&Math.abs(dx*cos-dz*sin)<contactExtent.side+1&&finalDistance>initialGap&&
+          landingDistance<ahead+contactExtent.along+2.25) {
+        let room=Infinity;
+        for(const other of pose.traffic||[]) {
+          if(other===contact)continue;
+          const dx=other.x-contact.x,dz=other.y-contact.y,forward=dx*sin+dz*cos,otherExtent=extent(other);
+          if(forward<=0||Math.abs(dx*cos-dz*sin)>=contactExtent.side+otherExtent.side+.08)continue;
+          room=Math.min(room,Math.max(0,forward-contactExtent.along-otherExtent.along-.12));
+        }
+        rules.contactId=contact.id;rules.initialGap=initialGap;
+        rules.scale=Math.min(1,(initialGap+room)/finalDistance);
+      }
+    }
+    collisionMotionRules.set(effect,rules);return rules;
+  }
+  function collisionSample(pose) {
+    const sample=sampleCollisionEffect(pose.collisionEffect),rules=motionRules(pose);
+    return {...sample,travelDistance:sample.travelDistance*rules.scale,travelSpeed:sample.travelSpeed*rules.scale};
+  }
+  function collisionTravel(pose,sample=collisionSample(pose)) {
+    const heading=boundedNumber(pose.collisionEffect?.travelHeading,viewHeading(pose),-1e8,1e8)*Math.PI/180;
+    return {x:Math.sin(heading)*sample.travelDistance,y:Math.cos(heading)*sample.travelDistance};
+  }
+  function collisionTraffic(pose,sample=collisionSample(pose)) {
+    const rules=motionRules(pose);
+    if(rules.contactId===undefined)return pose.traffic||[];
+    const shift=Math.max(0,sample.travelDistance-rules.initialGap),offset=collisionTravel(pose,{travelDistance:shift});
+    return (pose.traffic||[]).map(vehicle=>vehicle.id===rules.contactId?{...vehicle,x:vehicle.x+offset.x,y:vehicle.y+offset.y}:vehicle);
+  }
+  const collisionViews = new WeakMap();
+  function vehicleBlocksView(vehicle,from,to) {
+    const angle = (Number.isFinite(vehicle.heading) ? vehicle.heading : vehicle.direction<0 ? 180 : 0)*Math.PI/180;
+    const sin = Math.sin(angle), cos = Math.cos(angle);
+    const local = point=>{const dx=point[0]-vehicle.x,dz=point[2]-vehicle.y;return [dx*cos-dz*sin,point[1],dx*sin+dz*cos];};
+    const start=local(from),end=local(to),truck=vehicle.kind==='truck';
+    const width=(Number(vehicle.width)||(truck?2.35:1.85))/2+.08;
+    const length=(Number(vehicle.length)||(truck?8.3:4.5))/2+.08;
+    const low=[-width,0,-length],high=[width,truck?3.32:1.55,length];
+    let near=0,far=1;
+    for(let axis=0;axis<3;axis++) {
+      const delta=end[axis]-start[axis];
+      if(Math.abs(delta)<1e-8) {if(start[axis]<low[axis]||start[axis]>high[axis])return false;continue;}
+      const a=(low[axis]-start[axis])/delta,b=(high[axis]-start[axis])/delta;
+      near=Math.max(near,Math.min(a,b));far=Math.min(far,Math.max(a,b));
+      if(near>far)return false;
+    }
+    return far>=0&&near<=1;
+  }
+  function collisionCamera(pose,aspect=1.3) {
+    if (!pose.collisionEffect) return {...pose,cameraHeight:ROAD.cameraHeight,cameraPitch:0,collisionViewClear:true};
+    const motion=collisionTravel(pose),follow=view=>({...pose,...view,x:view.x+motion.x,y:view.y+motion.y,gear:'forward',traffic:collisionTraffic(pose)});
+    const framingAspect=Math.min(aspect,1),cached=collisionViews.get(pose.collisionEffect);
+    if(cached&&cached.framingAspect<=framingAspect+.001)return follow(cached);
+    const angle=viewHeading(pose)*Math.PI/180,sin=Math.sin(angle),cos=Math.cos(angle);
+    const peak=pose.collisionEffect.reducedMotion?0:boundedNumber(pose.collisionEffect.peakHeight,2.6,0,4);
+    const extraHeight=Math.max(0,peak-1),distanceScale=1+extraHeight*.09;
+    const targetHeight=2.5+peak*.5;
+    const roadCenter=pose.localRoad?localGeometry().laneCenter:0;
+    const preference=(pose.x-roadCenter)*cos>0?-1:1;
+    const candidates=[
+      [preference*3.2,8.6,3.7],[-preference*3.2,8.6,3.7],
+      [preference*6,5.5,4.2],[-preference*6,5.5,4.2],
+      [preference*6.5,1,4.8],[-preference*6.5,1,4.8],
+      [preference*4.5,-7,4.2],[-preference*4.5,-7,4.2],
+      [preference*6.5,1,6.6],[-preference*6.5,1,6.6],
+      [preference*6.5,1,9.2],[-preference*6.5,1,9.2],
+      [preference*6.5,1,11.8],[-preference*6.5,1,11.8],
+    ];
+    const yaw=pose.heading*Math.PI/180,bodySin=Math.sin(yaw),bodyCos=Math.cos(yaw);
+    const framePoints=[];
+    for(const x of [-1.35,1.35])for(const z of [-2.9,2.9])for(const height of [0,peak+1.9])
+      framePoints.push([pose.x+x*bodyCos+z*bodySin,height,pose.y-x*bodySin+z*bodyCos]);
+    for(const x of [-1.4,1.4])for(const z of [-.5,3])for(const height of [.8,peak+5.25])
+      framePoints.push([pose.x+x*bodyCos+z*bodySin,height,pose.y-x*bodySin+z*bodyCos]);
+    function fitsFrame(view) {
+      const yaw=view.heading*Math.PI/180,sinYaw=Math.sin(yaw),cosYaw=Math.cos(yaw);
+      const sinPitch=Math.sin(view.cameraPitch),cosPitch=Math.cos(view.cameraPitch);
+      return framePoints.every(([x,height,z])=>{
+        const dx=x-view.x,dz=z-view.y,dy=height-view.cameraHeight,flat=dx*sinYaw+dz*cosYaw;
+        const depth=flat*cosPitch-dy*sinPitch;
+        const horizontal=(dx*cosYaw-dz*sinYaw)*FOCAL/(framingAspect*depth);
+        const vertical=(dy*cosPitch+flat*sinPitch)*FOCAL/depth+.1;
+        return depth>NEAR&&Math.abs(horizontal)<.9&&Math.abs(vertical)<.9;
+      });
+    }
+    const targets=[[0,1.1,0],[0,1.48,0],[-.65,1.05,-1.2],[.65,1.05,-1.2],[-.65,1.05,1.2],[.65,1.05,1.2]]
+      .map(([x,height,z])=>[pose.x+x*bodyCos+z*bodySin,height,pose.y-x*bodySin+z*bodyCos]);
+    const effect=pose.collisionEffect,flight=boundedNumber(effect.flightTime,1.45,.1,3),slide=boundedNumber(effect.slideTime,.8,0,3);
+    const travelSamples=[0,flight*.5,flight,flight+slide*.5,flight+slide]
+      .map(elapsed=>{const sample=sampleCollisionEffect({...effect,elapsed});sample.travelDistance*=motionRules(pose).scale;
+        const offset=collisionTravel(pose,sample);
+        return {...offset,height:sample.height,traffic:collisionTraffic(pose,sample).filter(vehicle=>
+          Number.isFinite(vehicle.x)&&Number.isFinite(vehicle.y)&&Math.hypot(vehicle.x-pose.x-offset.x,vehicle.y-pose.y-offset.y)<30)};});
+    let selected=null,bestScore=-1;
+    for(let index=0;index<candidates.length;index++) {
+      const [baseSide,baseDistance,baseHeight]=candidates[index];
+      let view;
+      for(const framingScale of [1,1.16,1.35,1.6,2,2.5,3]) {
+        const side=baseSide*distanceScale*framingScale,distance=baseDistance*distanceScale*framingScale;
+        const cameraHeight=targetHeight+(baseHeight+extraHeight*.6-targetHeight)*framingScale;
+        const x=pose.x+side*cos-distance*sin,y=pose.y-side*sin-distance*cos;
+        view={x,y,heading:Math.atan2(pose.x-x,pose.y-y)*180/Math.PI,cameraHeight,
+          cameraPitch:Math.atan2(cameraHeight-targetHeight,Math.hypot(side,distance)),collisionViewCandidate:index};
+        if(fitsFrame(view))break;
+      }
+      const {x,y,cameraHeight}=view,from=[x,cameraHeight,y];
+      if(travelSamples.some(offset=>offset.traffic.some(vehicle=>vehicleBlocksView(vehicle,[x+offset.x,cameraHeight,y+offset.y],[x+offset.x,cameraHeight,y+offset.y]))))continue;
+      const visible=targets.map(target=>travelSamples.every(offset=>!offset.traffic.some(vehicle=>vehicleBlocksView(vehicle,
+        [from[0]+offset.x,from[1],from[2]+offset.y],[target[0]+offset.x,target[1]+offset.height,target[2]+offset.y]))));
+      const score=visible.reduce((sum,clear,i)=>sum+(clear?(i<2?2:1):0),0);
+      if(score<=bestScore)continue;
+      bestScore=score;
+      selected={...view,framingAspect,collisionViewClear:visible.every(Boolean)};
+      if(selected.collisionViewClear)break;
+    }
+    // High candidates sit above even a tightly packed set of trucks. Their
+    // scoring retains normal depth occlusion; no vehicles are hidden or erased.
+    collisionViews.set(pose.collisionEffect,selected);
+    return follow(selected);
+  }
+  function buildCollisionVehicle(pose,origin,stats) {
+    const target = mesh(), effect = pose.collisionEffect;
+    const sample = collisionSample(pose);
+    stats.selfVisible = Boolean(effect);
+    stats.collisionHeight = effect ? sample.height : 0;
+    stats.collisionPitch = effect ? sample.pitch : 0;
+    stats.collisionRoll = effect ? sample.roll : 0;
+    stats.collisionPhase = effect ? sample.phase : 'none';
+    stats.collisionTravelDistance = sample.travelDistance;
+    stats.collisionTravelSpeed = sample.travelSpeed;
+    stats.collisionDamage = sample.damage;
+    stats.collisionSmoke = sample.smoke;
+    stats.collisionVisualX = pose.x;
+    stats.collisionVisualY = pose.y;
+    stats.collisionTravelLimited = motionRules(pose).scale<1;
+    stats.collisionContactShift = Math.max(0,sample.travelDistance-(motionRules(pose).initialGap??sample.travelDistance));
+    if (!effect) return target;
+    const yaw = pose.heading*Math.PI/180, sinYaw = Math.sin(yaw), cosYaw = Math.cos(yaw);
+    const pitch = sample.pitch*Math.PI/180, roll = sample.roll*Math.PI/180;
+    const sinPitch = Math.sin(pitch), cosPitch = Math.cos(pitch), sinRoll = Math.sin(roll), cosRoll = Math.cos(roll);
+    const anchorZ = pose.y-origin;
+    // The shadow stays on the asphalt while the body moves independently.
+    const liftFraction=Math.min(1,sample.height/4),spread = 1+liftFraction*.12, shadow = [];
+    for (let i=0;i<24;i++) {
+      const angle = i*Math.PI/12, x = Math.cos(angle)*1.13*spread, z = Math.sin(angle)*2.55*spread;
+      shadow.push([pose.x+x*cosYaw+z*sinYaw,.032,anchorZ-x*sinYaw+z*cosYaw]);
+    }
+    const shadowBase = rgb('#343d40'), shadowLifted = rgb('#454d4f');
+    polygon(target,shadow,shadowBase.map((value,index)=>value+(shadowLifted[index]-value)*liftFraction),2);
+    const body = buildVehicleTemplate({kind:'car',color:'#d9ee78',width:1.85,length:4.5},2);
+    const impactEnd=effect.impactEnd==='rear'?-1:1;
+    function transformPoint([x,y,z],deform=true) {
+      if(deform&&z*impactEnd>.9) {
+        const dent=Math.min(1,(z*impactEnd-.9)/1.4)*sample.damage;
+        z-=impactEnd*.55*dent;y-=dent*(y>.8?.24:.1);x*=1-.12*dent;
+      }
+      const centeredY=y-.7,pitchedY=centeredY*cosPitch+z*sinPitch,pitchedZ=z*cosPitch-centeredY*sinPitch;
+      const rolledX=x*cosRoll-pitchedY*sinRoll,rolledY=x*sinRoll+pitchedY*cosRoll;
+      return [pose.x+rolledX*cosYaw+pitchedZ*sinYaw,rolledY+.7+sample.height,anchorZ-rolledX*sinYaw+pitchedZ*cosYaw];
+    }
+    for (const face of body.faces) {
+      if (face.layer===2) continue; // Do not lift the traffic template's shadow.
+      const wheel=Math.abs(face.x)>.72&&Math.abs(face.z)>1&&Math.abs(face.z)<1.8&&face.points.every(point=>point[1]<=.73);
+      const points=face.points.map(point=>transformPoint(point,!wheel));
+      const damaged=face.z*impactEnd>1;
+      const color=damaged?face.color.map(channel=>channel*(1-sample.damage*.48)):face.color;
+      polygon(target,points,color,face.layer,face.material);
+    }
+    // Permanent crease marks sit on the crumpled panel, including a rear
+    // impact when reversing. Smoke still originates at the engine in front.
+    for(const [x,z] of [[-.45,1.42],[.13,1.77]]) {
+      const points=[[x,.86,z*impactEnd],[x+.42,.86,(z-.2)*impactEnd],[x+.47,.86,(z-.16)*impactEnd],[x+.02,.86,(z+.04)*impactEnd]];
+      polygon(target,points.map(point=>transformPoint(point)),rgb('#313a31'),3);
+    }
+    return target;
+  }
+  function buildCollisionSmoke(pose,view,origin,stats) {
+    const target=mesh(),effect=pose.collisionEffect;
+    stats.smokeParticleCount=0;
+    if(!effect)return target;
+    const sample=collisionSample(pose),yaw=pose.heading*Math.PI/180;
+    const pitch=sample.pitch*Math.PI/180,roll=sample.roll*Math.PI/180;
+    const localZ=effect.impactEnd==='rear'?1.25:1.25-.15*sample.damage;
+    const sourceY=.95+.18*Math.sin(pitch)+sample.height;
+    const sourceX=pose.x+Math.sin(yaw)*localZ-.25*Math.sin(roll),sourceZ=pose.y-origin+Math.cos(yaw)*localZ;
+    const cameraYaw=view.heading*Math.PI/180,sinYaw=Math.sin(cameraYaw),cosYaw=Math.cos(cameraYaw);
+    const sinPitch=Math.sin(view.cameraPitch),cosPitch=Math.cos(view.cameraPitch);
+    const right=[cosYaw,0,-sinYaw],up=[sinYaw*sinPitch,cosPitch,cosYaw*sinPitch];
+    const travelHeading=boundedNumber(effect.travelHeading,viewHeading(pose),-1e8,1e8)*Math.PI/180;
+    for(let index=0;index<8;index++) {
+      const age=(sample.smokeTime*.28+index/8)%1;
+      const radius=.24+age*.7,drift=.6*age;
+      const x=sourceX-Math.sin(travelHeading)*drift+Math.sin(index*2.1+sample.smokeTime*.8)*age*.25;
+      const y=sourceY+age*3.2,z=sourceZ-Math.cos(travelHeading)*drift;
+      const gray=.18+age*.16,color=[gray,gray+.025,gray+.04];
+      const opacity=sample.smoke*(.5+.5*Math.sin(Math.PI*age))*(1-age*.75);
+      for(const [scale,alpha] of [[1,.22],[.76,.28],[.5,.33]]) {
+        const points=[];
+        for(let point=0;point<12;point++) {
+          const angle=point*Math.PI/6,r=radius*scale*(1+.08*Math.sin(point*2+index));
+          const a=Math.cos(angle)*r,b=Math.sin(angle)*r;
+          points.push([x+right[0]*a+up[0]*b,y+up[1]*b,z+right[2]*a+up[2]*b]);
+        }
+        polygon(target,points,color,3,-alpha*opacity);
+      }
+      stats.smokeParticleCount++;
+    }
+    // The transparent pass uses the same ordinary depth buffer as traffic.
+    // Only its own overlapping puffs need to be ordered from far to near.
+    const depth=face=>(face.x-view.x)*sinYaw+(face.z-(view.y-origin))*cosYaw;
+    target.faces.sort((a,b)=>depth(b)-depth(a));
+    target.vertices=[];
+    for(const face of target.faces)for(let i=1;i<face.points.length-1;i++)
+      for(const index of [0,i,i+1])target.vertices.push(...face.points[index],...face.color,face.material);
     return target;
   }
 
@@ -530,8 +881,8 @@
   }
 
   function createCamera(canvas) {
-    let highwayOrigin = 0, sceneKey = 'highway:none', highway = buildHighway(highwayOrigin);
-    let gl = null, context = null, program = null, staticBuffer = null, guideBuffer = null, trafficBuffer = null, skyBuffer = null;
+    let highwayOrigin = 0, sceneKey = 'highway:none:', highway = buildHighway(highwayOrigin);
+    let gl = null, context = null, program = null, staticBuffer = null, guideBuffer = null, trafficBuffer = null, skyBuffer = null, smokeBuffer = null;
     let width = 0, height = 0, frames = 0, totalFrames = 0, frameStart = performance.now(), disposed = false;
     let locations;
     const shaders = [];
@@ -547,16 +898,18 @@
       program = gl.createProgram();
       gl.attachShader(program,compile(gl.VERTEX_SHADER,`
         attribute vec3 aPosition; attribute vec3 aColor; attribute float aMaterial;
-        uniform vec4 uPose; uniform mediump vec2 uSize; uniform mediump float uSky;
+        uniform vec4 uPose; uniform vec3 uCamera; uniform mediump vec2 uSize; uniform mediump float uSky;
         varying mediump vec3 vColor; varying mediump float vDepth; varying mediump float vMaterial;
         void main(){
           vColor=aColor;vMaterial=aMaterial;
           if(uSky>.5){gl_Position=vec4(aPosition.xy,0.,1.);vDepth=0.;}
           else{
-            vec3 d=aPosition-vec3(uPose.x,1.25,uPose.y);
+            vec3 d=aPosition-vec3(uPose.x,uCamera.x,uPose.y);
             float side=d.x*uPose.w-d.z*uPose.z;
-            float depth=d.x*uPose.z+d.z*uPose.w;
-            gl_Position=vec4(side*1.48/(uSize.x/uSize.y),d.y*1.48+.1*depth,1.000107*depth-.160009,depth);
+            float flatDepth=d.x*uPose.z+d.z*uPose.w;
+            float vertical=d.y*uCamera.z+flatDepth*uCamera.y;
+            float depth=flatDepth*uCamera.z-d.y*uCamera.y;
+            gl_Position=vec4(side*1.48/(uSize.x/uSize.y),vertical*1.48+.1*depth,1.000107*depth-.160009,depth);
             vDepth=depth;
           }
         }`));
@@ -576,7 +929,8 @@
               color+=vec3(.07,.09,.11)*uWet*smoothstep(30.,400.,vDepth);
             }
             float fog=smoothstep(110.,1480.,vDepth)*.91;
-            gl_FragColor=vec4(mix(color,vec3(.79,.86,.86),fog),1.);
+            float opacity=vMaterial<0. ? clamp(-vMaterial,0.,1.) : 1.;
+            gl_FragColor=vec4(mix(color,vec3(.79,.86,.86),fog),opacity);
           }
         }`));
       gl.linkProgram(program);
@@ -584,7 +938,8 @@
       gl.useProgram(program);
       locations = {
         position:gl.getAttribLocation(program,'aPosition'), color:gl.getAttribLocation(program,'aColor'), material:gl.getAttribLocation(program,'aMaterial'),
-        pose:gl.getUniformLocation(program,'uPose'), size:gl.getUniformLocation(program,'uSize'), sky:gl.getUniformLocation(program,'uSky'), wet:gl.getUniformLocation(program,'uWet')
+        pose:gl.getUniformLocation(program,'uPose'), camera:gl.getUniformLocation(program,'uCamera'),
+        size:gl.getUniformLocation(program,'uSize'), sky:gl.getUniformLocation(program,'uSky'), wet:gl.getUniformLocation(program,'uWet')
       };
       for (const key of ['position','color','material']) gl.enableVertexAttribArray(locations[key]);
       staticBuffer = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,staticBuffer); gl.bufferData(gl.ARRAY_BUFFER,highway.data,gl.STATIC_DRAW);
@@ -592,6 +947,7 @@
       trafficBuffer = gl.createBuffer();
       skyBuffer = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,skyBuffer);
       gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,0,0,0,0,0,3,-1,0,0,0,0,0,-1,3,0,0,0,0,0]),gl.STATIC_DRAW);
+      smokeBuffer=gl.createBuffer();
       gl.disable(gl.CULL_FACE); gl.clearColor(.79,.86,.86,1);
       stats.backend = 'WebGL';
     } else {
@@ -624,16 +980,20 @@
       }
       return clipped;
     }
-    function softwareDraw(pose, localY, guide, traffic) {
+    function softwareDraw(pose, localY, guide, traffic,smoke) {
       const angle = viewHeading(pose)*Math.PI/180, sin = Math.sin(angle), cos = Math.cos(angle), focal = height*FOCAL/2;
+      const pitchSin = Math.sin(pose.cameraPitch), pitchCos = Math.cos(pose.cameraPitch);
       const sky = context.createLinearGradient(0,0,0,height*.59);
       sky.addColorStop(0,pose.wet ? '#73a1b7' : '#5ca6d4'); sky.addColorStop(1,'#d4e3e0');
       context.fillStyle = sky; context.fillRect(0,0,width,height);
       const projected = [];
-      for (const face of [...highway.faces,...guide.faces,...traffic.faces]) {
+      for (const face of [...highway.faces,...guide.faces,...traffic.faces,...smoke.faces]) {
         const centerDepth = (face.x-pose.x)*sin+(face.z-localY)*cos;
         if (centerDepth+face.radius < NEAR || centerDepth-face.radius > ROAD.far) continue;
-        let points = face.points.map(([x,y,z]) => { const dx = x-pose.x, dz = z-localY; return [dx*cos-dz*sin,y-ROAD.cameraHeight,dx*sin+dz*cos]; });
+        let points = face.points.map(([x,y,z]) => {
+          const dx = x-pose.x, dz = z-localY, dy = y-pose.cameraHeight, flatDepth = dx*sin+dz*cos;
+          return [dx*cos-dz*sin,dy*pitchCos+flatDepth*pitchSin,flatDepth*pitchCos-dy*pitchSin];
+        });
         points = clipDepth(clipDepth(points,NEAR,true),ROAD.far,false);
         if (points.length < 3) continue;
         const screen = points.map(p => [width/2+p[0]*focal/p[2],height*HORIZON-p[1]*focal/p[2]]);
@@ -645,10 +1005,10 @@
       for (const entry of projected) {
         const t = Math.max(0,Math.min(1,(entry.depth-110)/1370)), fog = t*t*(3-2*t)*.91;
         const color = entry.face.color.map((value,i) => {
-          if (entry.face.material && pose.wet) value *= [.72,.79,.86][i];
+          if (entry.face.material>.5 && pose.wet) value *= [.72,.79,.86][i];
           return Math.round((value*(1-fog)+[.79,.86,.86][i]*fog)*255);
         });
-        context.fillStyle = `rgb(${color.join(',')})`; context.beginPath();
+        context.fillStyle = entry.face.material<0?`rgba(${color.join(',')},${-entry.face.material})`:`rgb(${color.join(',')})`; context.beginPath();
         entry.points.forEach(([x,y],i) => i ? context.lineTo(x,y) : context.moveTo(x,y));
         context.closePath(); context.fill();
       }
@@ -664,12 +1024,20 @@
       stats,
       draw(pose,now = performance.now()) {
         if (disposed || gl?.isContextLost() || ![pose.x,pose.y,pose.heading].every(Number.isFinite)) return false;
-        const origin = Math.floor(pose.y/ROAD.repeat)*ROAD.repeat, localY = pose.y-origin;
-        const route = pose.exitRoute || null, nextSceneKey = `${pose.localRoad ? 'local' : 'highway'}:${route?.id || 'none'}`;
+        const motion=collisionTravel(pose);
+        const visualPose=pose.collisionEffect?{...pose,x:pose.x+motion.x,y:pose.y+motion.y}:pose;
+        const origin = Math.floor(visualPose.y/ROAD.repeat)*ROAD.repeat;
+        const view = collisionCamera(pose,width/height), localY = view.y-origin;
+        const route = pose.exitRoute || null;
+        const trafficRoutes=!pose.localRoad&&!route?[...new Map((pose.traffic||[])
+          .map(vehicle=>vehicle.exitRoute?.event)
+          .filter(exit=>exit&&typeof exit.id==='string'&&Number.isFinite(exit.entryStart)&&Number.isFinite(exit.rampEnd))
+          .map(exit=>[exit.id,exit])).values()].sort((a,b)=>a.entryStart-b.entryStart):[];
+        const nextSceneKey = `${pose.localRoad ? 'local' : 'highway'}:${route?.id || 'none'}:${trafficRoutes.map(exit=>exit.id).join(',')}`;
         if (origin !== highwayOrigin || nextSceneKey !== sceneKey) {
           highwayOrigin = origin;
           sceneKey = nextSceneKey;
-          highway = pose.localRoad ? buildLocalWorld(origin,route) : buildHighway(origin,route);
+          highway = pose.localRoad ? buildLocalWorld(origin,route) : buildHighway(origin,route,trafficRoutes);
           if (gl) {
             gl.bindBuffer(gl.ARRAY_BUFFER,staticBuffer);
             gl.bufferData(gl.ARRAY_BUFFER,highway.data,gl.STATIC_DRAW);
@@ -679,16 +1047,30 @@
         stats.roadType = pose.localRoad ? 'local' : route ? 'exit' : 'highway';
         stats.roadSolid = !pose.localRoad && Boolean(window.RoverRoad?.getState(pose.y).solid);
         stats.nearbyExits = pose.localRoad ? 0 : route ? 1 : window.RoverRoad?.eventsAround(pose.y,ROAD.far).exits.length || 0;
-        stats.cameraHeading = viewHeading(pose);
+        stats.nearbyEntrances = pose.localRoad || route ? 0 : window.RoverRoad?.eventsAround(pose.y,ROAD.far).entrances?.length || 0;
+        stats.cameraHeading = viewHeading(view);
+        stats.cameraHeight = view.cameraHeight;
+        stats.cameraPitch = view.cameraPitch;
+        stats.cameraX = view.x;
+        stats.cameraY = view.y;
+        stats.collisionViewClear = view.collisionViewClear;
+        stats.collisionViewCandidate = view.collisionViewCandidate ?? null;
         const guide = buildBrakingGuide(pose,origin,stats);
-        const traffic = buildTraffic(pose,origin,stats,!gl);
+        const traffic = buildTraffic(view,origin,stats,!gl);
+        const self = buildCollisionVehicle(visualPose,origin,stats);
+        stats.selfVertexCount = self.vertices.length/7;
+        traffic.vertices.push(...self.vertices);
+        traffic.faces.push(...self.faces);
+        const smoke=buildCollisionSmoke(visualPose,view,origin,stats);
+        stats.smokeVertexCount=smoke.vertices.length/7;
         if (gl) {
           gl.useProgram(program); gl.uniform2f(locations.size,width,height); gl.uniform1f(locations.wet,pose.wet ? 1 : 0);
           gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
           gl.disable(gl.DEPTH_TEST); gl.uniform1f(locations.sky,1); bind(skyBuffer); gl.drawArrays(gl.TRIANGLES,0,3);
           gl.enable(gl.DEPTH_TEST); gl.uniform1f(locations.sky,0);
           const angle = stats.cameraHeading*Math.PI/180;
-          gl.uniform4f(locations.pose,pose.x,localY,Math.sin(angle),Math.cos(angle));
+          gl.uniform4f(locations.pose,view.x,localY,Math.sin(angle),Math.cos(angle));
+          gl.uniform3f(locations.camera,view.cameraHeight,Math.sin(view.cameraPitch),Math.cos(view.cameraPitch));
           bind(staticBuffer); gl.drawArrays(gl.TRIANGLES,0,highway.data.length/7);
           if (guide.vertices.length) {
             bind(guideBuffer); gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(guide.vertices),gl.DYNAMIC_DRAW);
@@ -698,7 +1080,13 @@
             bind(trafficBuffer); gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(traffic.vertices),gl.DYNAMIC_DRAW);
             gl.drawArrays(gl.TRIANGLES,0,traffic.vertices.length/7);
           }
-        } else softwareDraw(pose,localY,guide,traffic);
+          if(smoke.vertices.length) {
+            gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);
+            bind(smokeBuffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(smoke.vertices),gl.DYNAMIC_DRAW);
+            gl.drawArrays(gl.TRIANGLES,0,smoke.vertices.length/7);
+            gl.depthMask(true);gl.disable(gl.BLEND);
+          }
+        } else softwareDraw(view,localY,guide,traffic,smoke);
         frames++; totalFrames++;
         if (now-frameStart >= 1000) { stats.fps = Math.round(frames*1000/(now-frameStart)); frameStart = now; frames = 0; }
         stats.frames = totalFrames;
@@ -708,9 +1096,9 @@
       dispose() {
         disposed = true; observer?.disconnect(); window.removeEventListener('resize',resize);
         canvas.removeEventListener('webglcontextlost',lost); canvas.removeEventListener('webglcontextrestored',restored);
-        if (gl) { for (const buffer of [staticBuffer,guideBuffer,trafficBuffer,skyBuffer]) gl.deleteBuffer(buffer); for (const shader of shaders) gl.deleteShader(shader); gl.deleteProgram(program); }
+        if (gl) { for (const buffer of [staticBuffer,guideBuffer,trafficBuffer,skyBuffer,smokeBuffer]) gl.deleteBuffer(buffer); for (const shader of shaders) gl.deleteShader(shader); gl.deleteProgram(program); }
       }
     };
   }
-  window.RoverSimulator = Object.freeze({createCamera,canOccupy,rangeAhead,bounds,obstacles,road:ROAD});
+  window.RoverSimulator = Object.freeze({createCamera,canOccupy,rangeAhead,bounds,obstacles,road:ROAD,sampleCollisionEffect});
 })();
