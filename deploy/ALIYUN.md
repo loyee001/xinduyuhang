@@ -2,7 +2,21 @@
 
 站点：<http://39.97.244.43/rover/>。服务器为 Alibaba Cloud Linux 3，使用已有 Caddy 和 HTTP 80 端口。入口 `/var/www/qdstorm/rover` 是指向同目录 `.rover-release.*` 发布目录的符号链接。网页全部在浏览器运行，不需要 Node.js、数据库或 ChatGPT 登录。
 
-## 已验证发布记录：2026-10-01（d6632e2）
+## 已验证发布记录：2026-10-02（77a0703）
+
+已发布 GitHub 提交 [`77a0703d0368d7560ac2e3f0db5159bae3704543`](https://github.com/loyee001/xinduyuhang/commit/77a0703d0368d7560ac2e3f0db5159bae3704543)。此版本包含鸣笛安全避让、碰撞重新开始、入口汇流、整车沿行驶方向前冲飞起与落地受损灰烟，以及周围车辆选择出口、沿匝道驶入普通道路并继续行驶。
+
+- 发布前 285 项自动测试全部通过；JavaScript、更新脚本语法及源码差异检查通过，同提交的 11 项 `deploy/SHA256SUMS` 全部匹配。
+- 服务器预检查输出 `CHECK_OK`，记录目录为 `/var/tmp/rover-update.pbjWLBtm`。
+- 正式发布的 11 个文件均输出 `VERIFIED` 和 `HTTP_VERIFIED`：归档内容与 Caddy 实际提供的内容都通过该提交清单的 SHA-256 校验。
+- 独立公网检查再次下载全部 11 个静态文件，均为 HTTP 200，摘要全部与 **`77a0703d0368d7560ac2e3f0db5159bae3704543` 提交内**的 `deploy/SHA256SUMS` 一致。`/rover` 返回 308，跳转至 `/rover/`；首页为 HTTP 200 且摘要一致，`health.json` 返回 `ok: true`。本机核验报告为 `/private/tmp/rover-public-release-verification.txt`。
+- 已完成的线上浏览器检查：自动驾驶起步并靠右，周围车辆沿出口匝道驶离；自车按 40 km/h 通过匝道，进入普通道路后以 50 km/h 继续行驶 188 m，自动驾驶保持运行。320 / 390 px 视口均无横向溢出，实测 30 FPS，控制台无 warn/error。
+- 新发布目录为 `/var/www/qdstorm/.rover-release.t0Te9hRo`，`/var/www/qdstorm/rover` 已切换至该目录。旧目录 `/var/www/qdstorm/.rover-release.heqWtP9o` 保留，可用于回滚。
+- 正式发布记录保存在 `/var/tmp/rover-update.7d8JEHdH`，其中保存固定提交、校验清单及新旧 release 路径。
+
+本次下载 `raw.githubusercontent.com` 的更新脚本时遇到 TLS 连接失败，改从同一固定 SHA 的 codeload 归档提取 `deploy/aliyun-static-update.sh`。提取脚本的 SHA-256 与该提交内文件一致，均为 `de1eb1fd23183fa7a392eec03c9ff8271a526a38be311a59f4142a793ce4170d`。下方更新流程记录了这一备用下载方式。
+
+## 历史发布记录：2026-10-01（d6632e2）
 
 自动驾驶与随机限速版本已发布，对应 GitHub 提交 [`d6632e2d940e33f7d18fd5149cdd38c33932e6da`](https://github.com/loyee001/xinduyuhang/commit/d6632e2d940e33f7d18fd5149cdd38c33932e6da)。此次发布同时包含之前在本地完成的车流、倒车、推荐变道、出口匝道与普通道路功能。
 
@@ -21,7 +35,7 @@
 
 ## 当前源码功能与验证
 
-源码功能说明与发布记录分别维护。当前提交和上线进度以本文件中的部署记录为准；只有实际发布并通过服务器、公网验证后，才记录对应提交、发布目录及验证结果，以下源码说明不代表新的线上发布已经完成。
+源码功能说明与发布记录分别维护。当前发布提交和线上实测项目见上方记录；以下介绍功能行为与源码验证范围，不将未完成的线上检查记为已通过。
 
 当前源码提供沿途高速入口，约每 2.4 公里出现匝道和加速车道，按车流密度每 16／12／8 秒模拟时间生成入口车辆；判断安全间距后汇入右车道，条件不足时减速等待。界面显示汇入口距离和汇流状态，自动驾驶、普通跟车及变道建议会识别已经开始汇入的车辆。部分右车道车辆会提前减速，从出口沿匝道驶入普通道路并继续行驶；自车选择同一出口时，前后车辆会连续保留，AI 和自动驾驶按曲线路径跟车。
 
@@ -67,6 +81,21 @@ cat "$ROVER_RUN/update.sh"
 ```
 
 本机没有该 IP 的已登记 SSH 主机密钥；可以沿用已登录的 XTerminal 会话，不需要为此改动服务器 SSH 配置或部署凭证。
+
+若 raw 下载遇到 TLS 连接失败，可保留相同的 `ROVER_COMMIT` 和 `ROVER_RUN`，从固定提交的 codeload 归档只提取更新脚本：
+
+```sh
+curl --proto '=https' --tlsv1.2 -fL --retry 2 --connect-timeout 15 --max-time 120 \
+  "https://codeload.github.com/loyee001/xinduyuhang/tar.gz/$ROVER_COMMIT" \
+  -o "$ROVER_RUN/source.tar.gz"
+tar -xOzf "$ROVER_RUN/source.tar.gz" \
+  "xinduyuhang-$ROVER_COMMIT/deploy/aliyun-static-update.sh" > "$ROVER_RUN/update.sh"
+sha256sum "$ROVER_RUN/update.sh"
+bash -n "$ROVER_RUN/update.sh"
+cat "$ROVER_RUN/update.sh"
+```
+
+执行前将摘要与该固定提交内脚本的 SHA-256 比对；不要直接沿用其他提交的脚本或摘要。此方式只取出一个文件，不将归档目录整体解压到服务器。
 
 ### 3. 先检查，再发布
 
