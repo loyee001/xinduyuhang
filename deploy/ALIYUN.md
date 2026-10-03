@@ -2,7 +2,20 @@
 
 站点：<http://39.97.244.43/rover/>。服务器为 Alibaba Cloud Linux 3，使用已有 Caddy 和 HTTP 80 端口。入口 `/var/www/qdstorm/rover` 是指向同目录 `.rover-release.*` 发布目录的符号链接。网页全部在浏览器运行，不需要 Node.js、数据库或 ChatGPT 登录。
 
-## 已验证发布记录：2026-10-02（77a0703）
+## 已验证发布记录：2026-10-03（5f420b7）
+
+已发布 GitHub 提交 [`5f420b754e578e5e0362b1195f797f5db091cba0`](https://github.com/loyee001/xinduyuhang/commit/5f420b754e578e5e0362b1195f797f5db091cba0)，加入按撞击方向和力度持续翻滚、前冲与落地滑行、侧倒或倒扣终态、可见底盘，以及随车身旋转的受损烟源。
+
+- 发布前当前源码独立复跑 **298/298** 自动测试通过；11 个静态文件的 SHA-256、JavaScript 与更新脚本语法检查通过。GitHub 上传使用 `loyee001`，取回远端提交后确认 7 个改动文件与本地已测试版本完全一致。
+- 服务器预检查输出 `CHECK_OK`，记录目录为 `/var/tmp/rover-update.NCLqaQD6`。
+- 正式更新对全部 11 个文件输出 `VERIFIED` 和 `HTTP_VERIFIED`，随后输出 `ROVER_LIVE`；新发布目录 `/var/www/qdstorm/.rover-release.jrWTadRH`，旧目录 `/var/www/qdstorm/.rover-release.t0Te9hRo` 保留，可用于回滚。
+- 正式发布记录目录 `/var/tmp/rover-update.FUrkDB2C` 保存固定提交、校验清单及新旧目录。更新脚本从同一提交的 codeload 归档提取，SHA-256 校验为 `de1eb1fd23183fa7a392eec03c9ff8271a526a38be311a59f4142a793ce4170d` 后执行。
+- 独立公网验证全部 11 个文件均为 HTTP 200，摘要与 **该发布提交内**的 `deploy/SHA256SUMS` 完全一致；`/rover` 返回 308 并跳转 `/rover/`，首页摘要一致，`health.json` 返回 `ok: true`。本机报告 `/private/tmp/rover-tumble-public-verification.txt`。
+- 线上手机浏览器实际执行倒车并发生碰撞，确认整车离地翻转、灰烟和回放；点击“重新开始”回到起点、中间车道、静止 D 挡。320 / 390 px 均无横向溢出，控制台无 warn/error。
+
+本次更新继续使用已有 Caddy 的 `/rover/` 静态入口，通过符号链接原子切换发布版本；没有修改共享服务配置或重启 Caddy。
+
+## 历史发布记录：2026-10-02（77a0703）
 
 已发布 GitHub 提交 [`77a0703d0368d7560ac2e3f0db5159bae3704543`](https://github.com/loyee001/xinduyuhang/commit/77a0703d0368d7560ac2e3f0db5159bae3704543)。此版本包含鸣笛安全避让、碰撞重新开始、入口汇流、整车沿行驶方向前冲飞起与落地受损灰烟，以及周围车辆选择出口、沿匝道驶入普通道路并继续行驶。
 
