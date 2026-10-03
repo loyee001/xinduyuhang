@@ -59,12 +59,21 @@ function finishWithCollision(kind,previousPose,contact=null){
   // continues through flight, then friction brings the wreck to rest.
   const launchSpeed=Math.min(18,previousPose.speed*(kind==='guardrail'?.75:.55));
   const travelHeading=previousPose.heading+(previousPose.gear==='reverse'?180:0);
-  const slideTime=Math.max(.35,Math.min(1.7,launchSpeed*.65/7)),smokeDwell=1.2;
+  const slideTime=Math.max(.65,Math.min(1.7,launchSpeed*.65/7)),smokeDwell=1.2;
   const reducedMotion=!!window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
   const other=trafficWorld.vehicles.find(vehicle=>vehicle.id===contact?.vehicleId);
   const side=kind==='guardrail'?(car.x<0?1:-1):(other&&other.x!==car.x?Math.sign(car.x-other.x):1);
+  const heading=previousPose.heading*Math.PI/180;
+  const lateral=other?(other.x-previousPose.x)*Math.cos(heading)-(other.y-previousPose.y)*Math.sin(heading):0;
+  const sideImpact=kind==='guardrail'||Math.abs(lateral)>.65;
+  // Off-centre impulses roll the body away from contact; a centred impact
+  // pitches over the struck end. Rates retain their sign throughout flight.
+  const tumbleAxis=sideImpact?'roll':'pitch';
+  const tumbleDirection=sideImpact?(kind==='guardrail'?(car.x<0?-1:1):Math.sign(lateral)):
+    (previousPose.gear==='reverse'?1:-1);
+  const tumbleRateDeg=tumbleDirection*(150+100*strength);
   state.collisionEffect={elapsed:0,duration:reducedMotion?0:flightTime+slideTime+smokeDwell,flightTime,peakHeight,
-    launchSpeed,travelHeading,slideTime,smokeDwell,contactVehicleId:contact?.vehicleId??null,
+    launchSpeed,travelHeading,slideTime,smokeDwell,tumbleAxis,tumbleRateDeg,contactVehicleId:contact?.vehicleId??null,
     impactEnd:previousPose.gear==='reverse'?'rear':'front',
     pitchDeg:(car.gear==='reverse'?-1:1)*(kind==='guardrail'?2+3*strength:3+8*strength),
     rollDeg:side*(kind==='guardrail'?3+5*strength:1.5+3*strength),reducedMotion};
@@ -114,7 +123,7 @@ function renderCollision(){
   $('collision-replay').hidden=!!state.collisionEffect?.reducedMotion||!cameraReady||!state.connected;
   $('view-title').textContent=collisionAnimating()?'碰撞动画 · 车外视角':'碰撞现场 · 车外视角';
   const effect=state.collisionEffect;
-  const collisionPhase=effect.elapsed<effect.flightTime?'碰撞 · 腾空前冲':
+  const collisionPhase=effect.elapsed<effect.flightTime?'碰撞 · 腾空前冲翻滚':
     effect.elapsed<effect.flightTime+effect.slideTime?'碰撞 · 落地滑行':'碰撞 · 车辆受损冒烟';
   $('camera-status').textContent=collisionAnimating()?collisionPhase:'车辆受损 · 本局结束';
   $('camera-live-clock').textContent=collisionAnimating()?'碰撞动画':'碰撞暂停';

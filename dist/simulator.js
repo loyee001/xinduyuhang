@@ -546,8 +546,65 @@
 
   const boundedNumber = (value, fallback, min, max) =>
     Math.max(min,Math.min(max,Number.isFinite(Number(value)) ? Number(value) : fallback));
+  const collisionBodies=new WeakMap();
+  function dentCollisionPoint([x,y,z],effect,damage) {
+    const end=effect.impactEnd==='rear'?-1:1;
+    if(z*end>.9) {
+      const dent=Math.min(1,(z*end-.9)/1.4)*damage;
+      z-=end*.55*dent;y-=dent*(y>.8?.24:.1);x*=1-.12*dent;
+    }
+    return [x,y,z];
+  }
+  function collisionBody(effect,damage) {
+    const cached=collisionBodies.get(effect);
+    if(cached?.damage===damage&&cached.impactEnd===effect.impactEnd)return cached.faces;
+    const template=buildVehicleTemplate({kind:'car',color:'#d9ee78',width:1.85,length:4.5},2);
+    // The underside is visible during a tumble: a dark floor pan, axles and
+    // exhaust make the rotating body readable from below as well as above.
+    const underside=mesh(),chassis=rgb('#333d40'),metal=rgb('#7d898a');
+    box(underside,0,.28,0,1.48,.11,3.85,chassis);
+    for(const z of [-1.4,1.38])box(underside,0,.25,z,1.7,.09,.14,metal);
+    box(underside,.52,.25,-.15,.09,.08,3.15,metal);
+    const faces=[...template.faces.filter(face=>face.layer!==2),...underside.faces].map(face=>{
+      const wheel=Math.abs(face.x)>.72&&Math.abs(face.z)>1&&Math.abs(face.z)<1.8&&face.points.every(p=>p[1]<=.73);
+      return {...face,points:face.points.map(p=>wheel?p:dentCollisionPoint(p,effect,damage))};
+    });
+    collisionBodies.set(effect,{damage,impactEnd:effect.impactEnd,faces});return faces;
+  }
+  // Shared rigid-body transform: wheels, body, scars and the engine smoke
+  // source rotate together about the same centre of mass, even upside down.
+  function collisionRotation(sample) {
+    const pitch=sample.pitch*Math.PI/180,roll=sample.roll*Math.PI/180;
+    const sp=Math.sin(pitch),cp=Math.cos(pitch),sr=Math.sin(roll),cr=Math.cos(roll);
+    return ([x,y,z])=>{
+      const cy=y-.7,py=cy*cp+z*sp,pz=z*cp-cy*sp;
+      return [x*cr-py*sr,x*sr+py*cr+.7,pz];
+    };
+  }
+  function tumbleCollisionSample(effect,sample,elapsed,flightTime,slideTime) {
+    const axis=effect.tumbleAxis,rate=boundedNumber(effect.tumbleRateDeg,0,-280,280);
+    const t=Math.min(elapsed,flightTime);
+    let angle=rate*t*(1-.06*t/flightTime),angularSpeed=rate*(1-.12*t/flightTime);
+    if(elapsed>=flightTime) {
+      const landing=rate*flightTime*.94,step=axis==='roll'?90:180;
+      const rest=Math.round(landing/step)*step;
+      const settleTime=Math.max(.001,Math.min(.8,slideTime));
+      const u=Math.min(1,(elapsed-flightTime)/settleTime),delta=rest-landing;
+      // Ground contact absorbs most angular momentum. The remaining rotation
+      // settles onto a side, roof or wheels without snapping back to upright.
+      const initial=Math.sign(delta)===Math.sign(rate)?Math.min(Math.abs(rate)*.22,Math.abs(delta)*2/settleTime)*Math.sign(rate):0;
+      angle=landing+(3*u*u-2*u*u*u)*delta+(u*u*u-2*u*u+u)*settleTime*initial;
+      angularSpeed=u===1?0:(6*u-6*u*u)*delta/settleTime+(3*u*u-4*u+1)*initial;
+    }
+    const rotation={...sample,[axis]:angle||0,tumbleAngle:angle||0,angularSpeed};
+    const rotate=collisionRotation(rotation);
+    let lowest=Infinity;
+    for(const face of collisionBody(effect,sample.damage))for(const point of face.points)
+      lowest=Math.min(lowest,rotate(point)[1]);
+    return {...rotation,bodyLift:Math.max(sample.height,.035-lowest)};
+  }
   function sampleCollisionEffect(effect) {
-    const resting = {height:0,pitch:0,roll:0,travelDistance:0,travelSpeed:0,phase:'settled',damage:effect?.reducedMotion?1:0,smoke:effect?.reducedMotion?1:0,smokeTime:1.2};
+    const resting = {height:0,bodyLift:0,pitch:0,roll:0,tumbleAngle:0,angularSpeed:0,travelDistance:0,travelSpeed:0,phase:'settled',damage:effect?.reducedMotion?1:0,smoke:effect?.reducedMotion?1:0,smokeTime:1.2};
     if (!effect || effect.reducedMotion) return resting;
     const peak = boundedNumber(effect.peakHeight,2.6,0,4);
     const requestedFlight = boundedNumber(effect.flightTime,2*Math.sqrt(2*peak/9.81),.1,3);
@@ -572,12 +629,14 @@
     const tiltScale = Math.min(1,peak/.6);
     const pitch = boundedNumber(effect.pitchDeg,8,-12,12)*tiltScale;
     const roll = boundedNumber(effect.rollDeg,5,-9,9)*tiltScale;
-    if(elapsed>=duration)return {...sample,travelSpeed:0};
+    let result={...sample,phase:elapsed<flightTime+slideTime?'sliding':'smoking'};
     if (elapsed < flightTime) {
       const t = elapsed/flightTime, tilt = Math.sin(Math.PI*t);
-      return {...sample,height:4*peak*t*(1-t),pitch:pitch*tilt||0,roll:roll*tilt||0,phase:'airborne'};
+      result={...sample,height:4*peak*t*(1-t),pitch:pitch*tilt||0,roll:roll*tilt||0,phase:'airborne'};
     }
-    return {...sample,phase:elapsed<flightTime+slideTime?'sliding':'smoking'};
+    if(elapsed>=duration)result={...sample,travelSpeed:0,phase:'settled'};
+    if(['pitch','roll'].includes(effect.tumbleAxis))return tumbleCollisionSample(effect,result,elapsed,flightTime,slideTime);
+    return {...result,bodyLift:result.height};
   }
   const collisionMotionRules=new WeakMap();
   function motionRules(pose) {
@@ -594,11 +653,15 @@
           side:Math.abs(Math.cos(angle))*width+Math.abs(Math.sin(angle))*length};
       };
       const contactExtent=extent(contact),dx=contact.x-pose.x,dz=contact.y-pose.y;
-      const ahead=dx*sin+dz*cos,initialGap=Math.max(0,ahead-contactExtent.along-2.25);
+      const tumbling=['pitch','roll'].includes(effect.tumbleAxis);
+      // A rotating bumper can sweep beyond the upright 2.25 m half-length.
+      // Reserve its enclosing radius, including trim, from first contact.
+      const egoReach=tumbling?2.55:2.25;
+      const ahead=dx*sin+dz*cos,initialGap=Math.max(0,ahead-contactExtent.along-egoReach);
       const finalDistance=sampleCollisionEffect({...effect,elapsed:1e9}).travelDistance;
       const landingDistance=sampleCollisionEffect({...effect,elapsed:boundedNumber(effect.flightTime,1.45,.1,3)}).travelDistance;
       if(ahead>0&&Math.abs(dx*cos-dz*sin)<contactExtent.side+1&&finalDistance>initialGap&&
-          landingDistance<ahead+contactExtent.along+2.25) {
+          (tumbling||landingDistance<ahead+contactExtent.along+2.25)) {
         let room=Infinity;
         for(const other of pose.traffic||[]) {
           if(other===contact)continue;
@@ -607,7 +670,8 @@
           room=Math.min(room,Math.max(0,forward-contactExtent.along-otherExtent.along-.12));
         }
         rules.contactId=contact.id;rules.initialGap=initialGap;
-        rules.scale=Math.min(1,(initialGap+room)/finalDistance);
+        rules.contactImpulse=tumbling?Math.min(room,Math.max(0,egoReach+contactExtent.along-ahead)):0;
+        rules.scale=Math.min(1,(initialGap+Math.max(0,room-rules.contactImpulse))/finalDistance);
       }
     }
     collisionMotionRules.set(effect,rules);return rules;
@@ -623,7 +687,7 @@
   function collisionTraffic(pose,sample=collisionSample(pose)) {
     const rules=motionRules(pose);
     if(rules.contactId===undefined)return pose.traffic||[];
-    const shift=Math.max(0,sample.travelDistance-rules.initialGap),offset=collisionTravel(pose,{travelDistance:shift});
+    const shift=(rules.contactImpulse||0)+Math.max(0,sample.travelDistance-rules.initialGap),offset=collisionTravel(pose,{travelDistance:shift});
     return (pose.traffic||[]).map(vehicle=>vehicle.id===rules.contactId?{...vehicle,x:vehicle.x+offset.x,y:vehicle.y+offset.y}:vehicle);
   }
   const collisionViews = new WeakMap();
@@ -671,6 +735,23 @@
       framePoints.push([pose.x+x*bodyCos+z*bodySin,height,pose.y-x*bodySin+z*bodyCos]);
     for(const x of [-1.4,1.4])for(const z of [-.5,3])for(const height of [.8,peak+5.25])
       framePoints.push([pose.x+x*bodyCos+z*bodySin,height,pose.y-x*bodySin+z*bodyCos]);
+    const effect=pose.collisionEffect,flight=boundedNumber(effect.flightTime,1.45,.1,3),slide=boundedNumber(effect.slideTime,.8,0,3);
+    const tumbling=['pitch','roll'].includes(effect.tumbleAxis)&&!effect.reducedMotion;
+    const sampleTimes=tumbling?[...Array.from({length:17},(_,i)=>flight*i/16),...Array.from({length:8},(_,i)=>flight+slide*(i+1)/8)]:
+      [0,flight*.5,flight,flight+slide*.5,flight+slide];
+    const rotationSamples=sampleTimes.map(elapsed=>sampleCollisionEffect({...effect,elapsed}));
+    if(tumbling)for(const sample of rotationSamples) {
+      const rotate=collisionRotation(sample),low=[Infinity,Infinity,Infinity],high=[-Infinity,-Infinity,-Infinity];
+      for(const face of collisionBody(effect,sample.damage))for(const point of face.points) {
+        const p=rotate(point);p[1]+=sample.bodyLift;
+        for(let i=0;i<3;i++){low[i]=Math.min(low[i],p[i]);high[i]=Math.max(high[i],p[i]);}
+      }
+      for(const x of [low[0]-.12,high[0]+.12])for(const z of [low[2]-.12,high[2]+.12])for(const height of [low[1]-.08,high[1]+.12])
+        framePoints.push([pose.x+x*bodyCos+z*bodySin,height,pose.y-x*bodySin+z*bodyCos]);
+      const source=rotate(dentCollisionPoint([0,.95,1.25],effect,sample.damage));
+      for(const x of [source[0]-1.5,source[0]+1.5])for(const z of [source[2]-1.5,source[2]+1.5])
+        framePoints.push([pose.x+x*bodyCos+z*bodySin,source[1]+sample.bodyLift+4.2,pose.y-x*bodySin+z*bodyCos]);
+    }
     function fitsFrame(view) {
       const yaw=view.heading*Math.PI/180,sinYaw=Math.sin(yaw),cosYaw=Math.cos(yaw);
       const sinPitch=Math.sin(view.cameraPitch),cosPitch=Math.cos(view.cameraPitch);
@@ -682,13 +763,15 @@
         return depth>NEAR&&Math.abs(horizontal)<.9&&Math.abs(vertical)<.9;
       });
     }
-    const targets=[[0,1.1,0],[0,1.48,0],[-.65,1.05,-1.2],[.65,1.05,-1.2],[-.65,1.05,1.2],[.65,1.05,1.2]]
-      .map(([x,height,z])=>[pose.x+x*bodyCos+z*bodySin,height,pose.y-x*bodySin+z*bodyCos]);
-    const effect=pose.collisionEffect,flight=boundedNumber(effect.flightTime,1.45,.1,3),slide=boundedNumber(effect.slideTime,.8,0,3);
-    const travelSamples=[0,flight*.5,flight,flight+slide*.5,flight+slide]
-      .map(elapsed=>{const sample=sampleCollisionEffect({...effect,elapsed});sample.travelDistance*=motionRules(pose).scale;
+    const localTargets=[[0,1.1,0],[0,1.48,0],[-.65,1.05,-1.2],[.65,1.05,-1.2],[-.65,1.05,1.2],[.65,1.05,1.2]];
+    const travelSamples=rotationSamples
+      .map(sample=>{sample.travelDistance*=motionRules(pose).scale;
         const offset=collisionTravel(pose,sample);
-        return {...offset,height:sample.height,traffic:collisionTraffic(pose,sample).filter(vehicle=>
+        const rotate=collisionRotation(sample),targets=localTargets.map(point=>{
+          const [x,height,z]=tumbling?rotate(point):point;
+          return [pose.x+x*bodyCos+z*bodySin,height+sample.bodyLift,pose.y-x*bodySin+z*bodyCos];
+        });
+        return {...offset,targets,traffic:collisionTraffic(pose,sample).filter(vehicle=>
           Number.isFinite(vehicle.x)&&Number.isFinite(vehicle.y)&&Math.hypot(vehicle.x-pose.x-offset.x,vehicle.y-pose.y-offset.y)<30)};});
     let selected=null,bestScore=-1;
     for(let index=0;index<candidates.length;index++) {
@@ -704,8 +787,8 @@
       }
       const {x,y,cameraHeight}=view,from=[x,cameraHeight,y];
       if(travelSamples.some(offset=>offset.traffic.some(vehicle=>vehicleBlocksView(vehicle,[x+offset.x,cameraHeight,y+offset.y],[x+offset.x,cameraHeight,y+offset.y]))))continue;
-      const visible=targets.map(target=>travelSamples.every(offset=>!offset.traffic.some(vehicle=>vehicleBlocksView(vehicle,
-        [from[0]+offset.x,from[1],from[2]+offset.y],[target[0]+offset.x,target[1]+offset.height,target[2]+offset.y]))));
+      const visible=localTargets.map((_,i)=>travelSamples.every(offset=>!offset.traffic.some(vehicle=>vehicleBlocksView(vehicle,
+        [from[0]+offset.x,from[1],from[2]+offset.y],[offset.targets[i][0]+offset.x,offset.targets[i][1],offset.targets[i][2]+offset.y]))));
       const score=visible.reduce((sum,clear,i)=>sum+(clear?(i<2?2:1):0),0);
       if(score<=bestScore)continue;
       bestScore=score;
@@ -724,6 +807,9 @@
     stats.collisionHeight = effect ? sample.height : 0;
     stats.collisionPitch = effect ? sample.pitch : 0;
     stats.collisionRoll = effect ? sample.roll : 0;
+    stats.collisionTumbleAngle = sample.tumbleAngle;
+    stats.collisionAngularSpeed = sample.angularSpeed;
+    stats.collisionBodyLift = sample.bodyLift;
     stats.collisionPhase = effect ? sample.phase : 'none';
     stats.collisionTravelDistance = sample.travelDistance;
     stats.collisionTravelSpeed = sample.travelSpeed;
@@ -732,11 +818,10 @@
     stats.collisionVisualX = pose.x;
     stats.collisionVisualY = pose.y;
     stats.collisionTravelLimited = motionRules(pose).scale<1;
-    stats.collisionContactShift = Math.max(0,sample.travelDistance-(motionRules(pose).initialGap??sample.travelDistance));
+    stats.collisionContactShift = (motionRules(pose).contactImpulse||0)+Math.max(0,sample.travelDistance-(motionRules(pose).initialGap??sample.travelDistance));
     if (!effect) return target;
     const yaw = pose.heading*Math.PI/180, sinYaw = Math.sin(yaw), cosYaw = Math.cos(yaw);
-    const pitch = sample.pitch*Math.PI/180, roll = sample.roll*Math.PI/180;
-    const sinPitch = Math.sin(pitch), cosPitch = Math.cos(pitch), sinRoll = Math.sin(roll), cosRoll = Math.cos(roll);
+    const rotate=collisionRotation(sample);
     const anchorZ = pose.y-origin;
     // The shadow stays on the asphalt while the body moves independently.
     const liftFraction=Math.min(1,sample.height/4),spread = 1+liftFraction*.12, shadow = [];
@@ -746,21 +831,14 @@
     }
     const shadowBase = rgb('#343d40'), shadowLifted = rgb('#454d4f');
     polygon(target,shadow,shadowBase.map((value,index)=>value+(shadowLifted[index]-value)*liftFraction),2);
-    const body = buildVehicleTemplate({kind:'car',color:'#d9ee78',width:1.85,length:4.5},2);
+    const body = collisionBody(effect,sample.damage);
     const impactEnd=effect.impactEnd==='rear'?-1:1;
-    function transformPoint([x,y,z],deform=true) {
-      if(deform&&z*impactEnd>.9) {
-        const dent=Math.min(1,(z*impactEnd-.9)/1.4)*sample.damage;
-        z-=impactEnd*.55*dent;y-=dent*(y>.8?.24:.1);x*=1-.12*dent;
-      }
-      const centeredY=y-.7,pitchedY=centeredY*cosPitch+z*sinPitch,pitchedZ=z*cosPitch-centeredY*sinPitch;
-      const rolledX=x*cosRoll-pitchedY*sinRoll,rolledY=x*sinRoll+pitchedY*cosRoll;
-      return [pose.x+rolledX*cosYaw+pitchedZ*sinYaw,rolledY+.7+sample.height,anchorZ-rolledX*sinYaw+pitchedZ*cosYaw];
+    function transformPoint(point) {
+      const [x,y,z]=rotate(point);
+      return [pose.x+x*cosYaw+z*sinYaw,y+sample.bodyLift,anchorZ-x*sinYaw+z*cosYaw];
     }
-    for (const face of body.faces) {
-      if (face.layer===2) continue; // Do not lift the traffic template's shadow.
-      const wheel=Math.abs(face.x)>.72&&Math.abs(face.z)>1&&Math.abs(face.z)<1.8&&face.points.every(point=>point[1]<=.73);
-      const points=face.points.map(point=>transformPoint(point,!wheel));
+    for (const face of body) {
+      const points=face.points.map(point=>transformPoint(point));
       const damaged=face.z*impactEnd>1;
       const color=damaged?face.color.map(channel=>channel*(1-sample.damage*.48)):face.color;
       polygon(target,points,color,face.layer,face.material);
@@ -769,7 +847,7 @@
     // impact when reversing. Smoke still originates at the engine in front.
     for(const [x,z] of [[-.45,1.42],[.13,1.77]]) {
       const points=[[x,.86,z*impactEnd],[x+.42,.86,(z-.2)*impactEnd],[x+.47,.86,(z-.16)*impactEnd],[x+.02,.86,(z+.04)*impactEnd]];
-      polygon(target,points.map(point=>transformPoint(point)),rgb('#313a31'),3);
+      polygon(target,points.map(point=>transformPoint(dentCollisionPoint(point,effect,sample.damage))),rgb('#313a31'),3);
     }
     return target;
   }
@@ -778,10 +856,10 @@
     stats.smokeParticleCount=0;
     if(!effect)return target;
     const sample=collisionSample(pose),yaw=pose.heading*Math.PI/180;
-    const pitch=sample.pitch*Math.PI/180,roll=sample.roll*Math.PI/180;
-    const localZ=effect.impactEnd==='rear'?1.25:1.25-.15*sample.damage;
-    const sourceY=.95+.18*Math.sin(pitch)+sample.height;
-    const sourceX=pose.x+Math.sin(yaw)*localZ-.25*Math.sin(roll),sourceZ=pose.y-origin+Math.cos(yaw)*localZ;
+    const source=collisionRotation(sample)(dentCollisionPoint([0,.95,1.25],effect,sample.damage));
+    const sourceY=source[1]+sample.bodyLift;
+    const sourceX=pose.x+source[0]*Math.cos(yaw)+source[2]*Math.sin(yaw),sourceZ=pose.y-origin-source[0]*Math.sin(yaw)+source[2]*Math.cos(yaw);
+    stats.smokeSourceX=sourceX;stats.smokeSourceY=sourceY;stats.smokeSourceZ=sourceZ+origin;
     const cameraYaw=view.heading*Math.PI/180,sinYaw=Math.sin(cameraYaw),cosYaw=Math.cos(cameraYaw);
     const sinPitch=Math.sin(view.cameraPitch),cosPitch=Math.cos(view.cameraPitch);
     const right=[cosYaw,0,-sinYaw],up=[sinYaw*sinPitch,cosPitch,cosYaw*sinPitch];
