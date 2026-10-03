@@ -410,3 +410,270 @@ test('mobile framing includes the moving damaged body, grounded shadow and full 
   }
   camera.dispose();
 });
+
+const tumblingEffect=overrides=>movingEffect({tumbleAxis:'pitch',tumbleRateDeg:220,...overrides});
+const dynamicBuffer=(renderer,id)=>[...renderer.buffers.entries()].find(([buffer])=>buffer.id===id)?.[1];
+function selfVertices(renderer,camera) {
+  const data=dynamicBuffer(renderer,3);
+  assert.ok(data&&camera.stats.selfVertexCount>100,'a complete self-car mesh must be rendered');
+  return data.subarray(data.length-camera.stats.selfVertexCount*7);
+}
+function collisionCameraPosition(camera) {
+  const stats=camera.stats;
+  return [stats.cameraX-stats.collisionVisualX,stats.cameraY-stats.collisionVisualY,
+    stats.cameraHeight,stats.cameraHeading,stats.cameraPitch];
+}
+function assertFramed(renderer,vertices,dimensions,label) {
+  const [camX,camZ,sinYaw,cosYaw]=renderer.uniforms.get('uPose');
+  const [camHeight,sinPitch,cosPitch]=renderer.uniforms.get('uCamera');
+  for(let i=0;i<vertices.length;i+=7) {
+    const dx=vertices[i]-camX,dz=vertices[i+2]-camZ,dy=vertices[i+1]-camHeight;
+    const flat=dx*sinYaw+dz*cosYaw,depth=flat*cosPitch-dy*sinPitch;
+    const px=dimensions.width/2+(dx*cosYaw-dz*sinYaw)*dimensions.height*.74/depth;
+    const py=dimensions.height*.45-(dy*cosPitch+flat*sinPitch)*dimensions.height*.74/depth;
+    assert.ok(depth>.08&&px>=8&&px<=dimensions.width-8&&py>=8&&py<=dimensions.height-8,
+      `${label}: vertex is outside the complete collision frame at ${px}, ${py}, depth ${depth}`);
+  }
+}
+
+test('signed tumble momentum keeps rotating through the flight rather than returning upright at the apex',()=>{
+  const {api}=loadRenderer();
+  for(const tumbleAxis of ['pitch','roll'])for(const tumbleRateDeg of [-260,-150,150,260]) {
+    const animation=tumblingEffect({tumbleAxis,tumbleRateDeg}),direction=Math.sign(tumbleRateDeg);
+    let previousAngle=0,previousSpeed=Math.abs(tumbleRateDeg);
+    const start=api.sampleCollisionEffect(animation);
+    assert.equal(start.tumbleAngle,0);
+    for(let step=1;step<80;step++) {
+      const elapsed=animation.flightTime*step/80,sample=api.sampleCollisionEffect({...animation,elapsed});
+      assert.ok(Number.isFinite(sample.tumbleAngle)&&Number.isFinite(sample.angularSpeed));
+      assert.ok(direction*sample.tumbleAngle>direction*previousAngle,'airborne angular momentum keeps its direction');
+      assert.ok(direction*sample.angularSpeed>0,'the car does not stop rotating at the trajectory apex');
+      assert.ok(Math.abs(sample.angularSpeed)<=previousSpeed+.0001,'air drag may slow rotation but must not add energy');
+      assert.ok(Math.abs(sample.angularSpeed)>Math.abs(tumbleRateDeg)*.4,'air drag does not erase the visible tumble');
+      assert.ok(sample.bodyLift>=sample.height,'ground support never lowers the ballistic body');
+      previousAngle=sample.tumbleAngle;previousSpeed=Math.abs(sample.angularSpeed);
+    }
+    assert.ok(Math.abs(previousAngle)>100,'the mesh must visibly turn over rather than gently lean');
+    const activeAngle=tumbleAxis==='pitch'?'pitch':'roll';
+    assert.ok(Math.abs(api.sampleCollisionEffect({...animation,elapsed:animation.flightTime*.9})[activeAngle])>100);
+  }
+});
+
+test('tumble sampling retains accumulated turns and mirrors the signed rotation direction',()=>{
+  const {api}=loadRenderer(),animation=tumblingEffect({flightTime:3,duration:5,peakHeight:3.8,tumbleRateDeg:260});
+  for(const tumbleAxis of ['pitch','roll']) {
+    let previous=0;
+    for(const elapsed of [.2,.6,1,1.4,1.8,2.2,2.6,2.99]) {
+      const positive=api.sampleCollisionEffect({...animation,tumbleAxis,elapsed});
+      const negative=api.sampleCollisionEffect({...animation,tumbleAxis,tumbleRateDeg:-260,elapsed});
+      assert.ok(positive.tumbleAngle>previous);
+      close(negative.tumbleAngle,-positive.tumbleAngle,.00001);
+      close(negative.angularSpeed,-positive.angularSpeed,.00001);
+      previous=positive.tumbleAngle;
+    }
+    assert.ok(previous>360,'more than one turn is retained without wrapping through zero');
+  }
+});
+
+test('ground contact has no orientation jump and settling retains a stable tipped or inverted pose',()=>{
+  const {api}=loadRenderer();
+  let inverted=false,sideways=false;
+  for(const tumbleAxis of ['pitch','roll'])for(const tumbleRateDeg of [-260,-150,150,260]) {
+    const animation=tumblingEffect({tumbleAxis,tumbleRateDeg});
+    const sample=elapsed=>api.sampleCollisionEffect({...animation,elapsed});
+    for(const boundary of [animation.flightTime,animation.flightTime+animation.slideTime,animation.duration]) {
+      const before=sample(boundary-.00001),after=sample(boundary+.00001);
+      for(const key of ['pitch','roll','tumbleAngle'])close(before[key],after[key],.02);
+      close(before.height,after.height,.001);
+      close(before.bodyLift,after.bodyLift,.002);
+    }
+    const end=sample(animation.duration),unit=tumbleAxis==='pitch'?180:90;
+    close(end.tumbleAngle/unit,Math.round(end.tumbleAngle/unit),.00001);
+    assert.equal(end.angularSpeed,0);
+    assert.equal(end.height,0);
+    assert.equal(end.phase,'settled');
+    for(const elapsed of [animation.duration+.1,animation.duration+20,999]) {
+      const retained=sample(elapsed);
+      for(const key of ['pitch','roll','tumbleAngle','angularSpeed','bodyLift'])close(retained[key],end[key]);
+    }
+    if(tumbleAxis==='pitch'&&Math.abs(Math.round(end.pitch/180))%2===1)inverted=true;
+    if(tumbleAxis==='roll'&&Math.abs(Math.round(end.roll/90))%2===1)sideways=true;
+  }
+  assert.ok(inverted,'a pitch crash can stay upside down instead of always restoring upright');
+  assert.ok(sideways,'a roll crash can stay on its side instead of always restoring upright');
+});
+
+test('reduced motion suppresses tumbling and keeps the complete damaged mesh and smoke still',()=>{
+  for(const tumbleAxis of ['pitch','roll']) {
+    const renderer=loadRenderer('webgl'),camera=renderer.api.createCamera(renderer.canvas);
+    const animation=tumblingEffect({tumbleAxis,tumbleRateDeg:-260,reducedMotion:true});
+    let initialBody,initialSmoke;
+    for(const elapsed of [0,.4,1,animation.duration,99]) {
+      animation.elapsed=elapsed;
+      const sample=renderer.api.sampleCollisionEffect(animation);
+      for(const key of ['height','pitch','roll','tumbleAngle','angularSpeed','bodyLift','travelDistance'])assert.equal(sample[key],0,key);
+      camera.draw(pose({collisionEffect:animation}));
+      const body=selfVertices(renderer,camera),smoke=dynamicBuffer(renderer,5);
+      if(initialBody) {assert.deepEqual(body,initialBody);assert.deepEqual(smoke,initialSmoke);}
+      initialBody=body;initialSmoke=smoke;
+    }
+    camera.dispose();
+  }
+});
+
+test('all tumbling car and shadow vertices stay above the road and framed in landscape and narrow portrait',()=>{
+  const profiles=[
+    {tumbleAxis:'pitch',tumbleRateDeg:150,peakHeight:1.8,gear:'forward'},
+    {tumbleAxis:'pitch',tumbleRateDeg:-260,peakHeight:3.8,gear:'reverse'},
+    {tumbleAxis:'roll',tumbleRateDeg:260,peakHeight:3.8,gear:'forward'},
+    {tumbleAxis:'roll',tumbleRateDeg:-150,peakHeight:1.8,gear:'reverse'}
+  ];
+  for(const dimensions of [{width:350,height:260},{width:260,height:700}])for(const crowded of [false,true]) {
+    const renderer=loadRenderer('webgl',dimensions),camera=renderer.api.createCamera(renderer.canvas);
+    for(const profile of profiles) {
+      const flightTime=2*Math.sqrt(2*profile.peakHeight/9.81);
+      const animation=tumblingEffect({...profile,flightTime,duration:flightTime+2,launchSpeed:0});
+      const input=pose({y:1894,heading:37,gear:profile.gear,traffic:crowded?tightlyPackedTrucks(37):[],collisionEffect:animation});
+      const initialInput=JSON.stringify(input);let fixedCamera;
+      const timestamps=Array.from({length:41},(_,i)=>animation.duration*i/40);
+      timestamps.push(flightTime-.00001,flightTime,flightTime+.00001,animation.duration+20);
+      for(const elapsed of timestamps) {
+        animation.elapsed=elapsed;camera.draw(input);
+        const body=selfVertices(renderer,camera),label=`${dimensions.width}×${dimensions.height}, ${profile.tumbleAxis}, ${profile.tumbleRateDeg}, crowded ${crowded}, t ${elapsed}`;
+        for(let i=1;i<body.length;i+=7)assert.ok(body[i]>=.03-.000001,`${label}: mesh penetrated the pavement at ${body[i]}`);
+        assertFramed(renderer,body,dimensions,label);
+        const smoke=dynamicBuffer(renderer,5);
+        if(smoke?.length)assertFramed(renderer,smoke,dimensions,label+' smoke');
+        const current=collisionCameraPosition(camera);
+        if(fixedCamera)current.forEach((value,index)=>close(value,fixedCamera[index],.000001));
+        else fixedCamera=current;
+        if(crowded) {
+          assert.ok(camera.stats.visibleTraffic>=4,'nearby obstacles remain rendered');
+          assert.equal(camera.stats.collisionViewClear,true,`${label}: nearby trucks cannot conceal the tumbling self car`);
+        }
+      }
+      animation.elapsed=0;
+      assert.equal(JSON.stringify(input),initialInput,'rendering never rewrites the physical car, trucks or effect parameters');
+    }
+    camera.dispose();
+  }
+});
+
+test('smoke follows the inverted engine location instead of staying at the old upright nose',()=>{
+  const renderer=loadRenderer('webgl'),camera=renderer.api.createCamera(renderer.canvas);
+  const animation=tumblingEffect({tumbleAxis:'pitch',tumbleRateDeg:150,launchSpeed:0,elapsed:99});
+  const final=renderer.api.sampleCollisionEffect(animation);
+  assert.equal(Math.abs(Math.round(final.pitch/180))%2,1,'the fixture ends upside down');
+  const meanZ=vertices=>{let sum=0,count=0;for(let i=2;i<vertices.length;i+=7){sum+=vertices[i];count++;}return sum/count;};
+  camera.draw(pose({y:1894,collisionEffect:animation}));
+  const invertedZ=meanZ(dynamicBuffer(renderer,5));
+  camera.draw(pose({y:1894,collisionEffect:movingEffect({launchSpeed:0,elapsed:99})}));
+  const uprightZ=meanZ(dynamicBuffer(renderer,5));
+  assert.ok(invertedZ<uprightZ-1,'the smoke emitter turns to the opposite side with the actual engine');
+  camera.dispose();
+});
+
+test('Canvas paints a continuously turning body and keeps the final rollover visible',()=>{
+  for(const tumbleAxis of ['pitch','roll']) {
+    const renderer=loadRenderer(),camera=renderer.api.createCamera(renderer.canvas);
+    const animation=tumblingEffect({tumbleAxis,tumbleRateDeg:220,launchSpeed:0});
+    const input=pose({y:1894,collisionEffect:animation}),snapshots=[];
+    let fixedCamera;
+    for(const elapsed of [0,animation.flightTime*.25,animation.flightTime*.5,animation.flightTime*.75,animation.duration,99]) {
+      animation.elapsed=elapsed;camera.draw(input);
+      const body=renderer.painted.filter(face=>{
+        const channels=face.color.match(/\d+/g).map(Number);
+        return channels[0]>180&&channels[1]>channels[0]&&channels[2]<160;
+      }).flatMap(face=>face.points);
+      assert.ok(body.length>30,'the fallback paints actual colored body polygons at each tumble pose');
+      assert.ok(body.every(([x,y])=>x>=0&&x<=390&&y>=0&&y<=300),'the complete painted body remains visible');
+      snapshots.push(JSON.stringify(body));
+      const current=collisionCameraPosition(camera);
+      if(fixedCamera)current.forEach((value,index)=>close(value,fixedCamera[index],.000001));
+      else fixedCamera=current;
+    }
+    assert.equal(new Set(snapshots.slice(0,5)).size,5,'rotating body polygons must change, not merely camera statistics');
+    assert.equal(snapshots.at(-1),snapshots.at(-2),'the overturned final body stays painted after animation time ends');
+    assert.ok(Math.abs(camera.stats[tumbleAxis==='pitch'?'collisionPitch':'collisionRoll'])>=90);
+    camera.dispose();
+  }
+});
+
+test('a tumbling car stays outside the contacted truck throughout flight, landing and its final slide',()=>{
+  const renderer=loadRenderer('webgl'),camera=renderer.api.createCamera(renderer.canvas),intrusions=[];
+  // Check vertices against the actual solid cargo/cab interior, not the
+  // truck's entire bounding box (which also contains empty air and wheels).
+  const insideTruck=(x,y,z)=>Math.abs(x)<1.13&&y>.9&&y<3.15&&z>-4.1&&z<2
+    ||Math.abs(x)<1.07&&y>.8&&y<2.54&&z>1.93&&z<4.08;
+  for(const reverse of [false,true])for(const tumbleAxis of ['pitch','roll'])for(const sign of [-1,1]) {
+    const direction=reverse?-1:1,flightTime=2*Math.sqrt(2*3.8/9.81);
+    const truck={id:811,kind:'truck',color:'#4488cc',x:0,y:1894+direction*6.45,width:2.35,length:8.3,heading:0,direction:1};
+    const animation=tumblingEffect({tumbleAxis,tumbleRateDeg:sign*260,peakHeight:3.8,flightTime,
+      slideTime:1,duration:flightTime+2.2,launchSpeed:9,travelHeading:reverse?180:0,
+      contactVehicleId:811,impactEnd:reverse?'rear':'front'});
+    const input=pose({y:1894,gear:reverse?'reverse':'forward',traffic:[truck],collisionEffect:animation});
+    const original=JSON.stringify(truck);let firstIntrusion;
+    const timestamps=Array.from({length:61},(_,i)=>animation.duration*i/60);
+    timestamps.push(flightTime-.00001,flightTime,flightTime+.00001,animation.duration+10);
+    for(const elapsed of timestamps) {
+      animation.elapsed=elapsed;camera.draw(input);
+      const vertices=selfVertices(renderer,camera),truckY=truck.y+direction*camera.stats.collisionContactShift;
+      for(let i=0;i<vertices.length;i+=7) {
+        const x=vertices[i]-truck.x,y=vertices[i+1],z=vertices[i+2]+camera.stats.worldOrigin-truckY;
+        if(!firstIntrusion&&insideTruck(x,y,z))firstIntrusion={reverse,tumbleAxis,sign,elapsed,point:[x,y,z]};
+      }
+      assert.equal(camera.stats.visibleTraffic,1,'the impacted truck remains in the rendered scene');
+    }
+    if(firstIntrusion)intrusions.push(firstIntrusion);
+    assert.equal(JSON.stringify(truck),original,'animation offsets never rewrite physical truck coordinates');
+  }
+  camera.dispose();
+  assert.equal(intrusions.length,0,'tumbling body entered solid truck geometry: '+JSON.stringify(intrusions));
+});
+
+test('tumble contact displacement respects a queued truck and does not treat a separate lane as blocked',()=>{
+  const renderer=loadRenderer('webgl'),camera=renderer.api.createCamera(renderer.canvas),intrusions=[];
+  for(const reverse of [false,true])for(const room of [0,.1,.5,2]) {
+    const direction=reverse?-1:1;
+    const contact={id:901,kind:'truck',color:'#4488cc',x:0,y:1894+direction*6.45,width:2.35,length:8.3,heading:0,direction:1};
+    const blocker={...contact,id:902,color:'#ead260',y:contact.y+direction*(8.3+.12+room)};
+    const animation=tumblingEffect({tumbleAxis:'pitch',tumbleRateDeg:direction*260,launchSpeed:9,
+      travelHeading:reverse?180:0,contactVehicleId:901,impactEnd:reverse?'rear':'front'});
+    const input=pose({y:1894,gear:reverse?'reverse':'forward',traffic:[contact,blocker],collisionEffect:animation});
+    const original=JSON.stringify(input.traffic);let previousShift=-1,firstIntrusion;
+    for(let step=0;step<=60;step++) {
+      animation.elapsed=animation.duration*step/60;camera.draw(input);
+      const shift=camera.stats.collisionContactShift;
+      assert.ok(shift>=previousShift-.00001,'the impacted truck does not snap backward during settling');
+      assert.ok(shift<=room+.00001,`available queue space ${room}m includes the initial separation impulse`);
+      const body=selfVertices(renderer,camera),truckY=contact.y+direction*shift;
+      for(let i=0;i<body.length;i+=7) {
+        const x=body[i],y=body[i+1],z=body[i+2]+camera.stats.worldOrigin-truckY;
+        const inside=Math.abs(x)<1.13&&y>.9&&y<3.15&&z>-4.1&&z<2
+          ||Math.abs(x)<1.07&&y>.8&&y<2.54&&z>1.93&&z<4.08;
+        if(!firstIntrusion&&inside)firstIntrusion={reverse,room,elapsed:animation.elapsed,point:[x,y,z]};
+      }
+      const vertices=dynamicBuffer(renderer,3),truckZ=[];
+      for(let i=0;i<vertices.length;i+=7)if(vertices[i+3]>.1&&Math.abs(vertices[i+4]-2*vertices[i+3])<.001&&Math.abs(vertices[i+5]-3*vertices[i+3])<.001)
+        truckZ.push(vertices[i+2]+camera.stats.worldOrigin);
+      assert.ok(truckZ.length>=30,`the displaced truck has actual body geometry (${reverse}, ${room}, ${animation.elapsed}: ${truckZ.length} vertices)`);
+      if(reverse)assert.ok(Math.min(...truckZ)>=blocker.y+4.15-.001,'the rear crash does not push the truck into the next cab');
+      else assert.ok(Math.max(...truckZ)<=blocker.y-4.15+.001,'the front crash does not push the truck into the next cargo box');
+      previousShift=shift;
+    }
+    assert.equal(camera.stats.collisionTravelLimited,true);
+    assert.equal(JSON.stringify(input.traffic),original);
+    if(firstIntrusion)intrusions.push(firstIntrusion);
+  }
+  for(const x of [-3.75,3.75]) {
+    const contact={id:911,kind:'truck',color:'#4488cc',x:0,y:1900.45,width:2.35,length:8.3,heading:0,direction:1};
+    const neighbour={...contact,id:912,color:'#ead260',x,y:1909};
+    const animation=tumblingEffect({contactVehicleId:911,launchSpeed:9,elapsed:99});
+    camera.draw(pose({y:1894,traffic:[contact,neighbour],collisionEffect:animation}));
+    assert.equal(camera.stats.collisionTravelLimited,false,'a separate normal lane leaves the contact truck room to move');
+    assert.ok(camera.stats.collisionContactShift>5);
+    assert.equal(neighbour.y,1909);
+  }
+  camera.dispose();
+  assert.equal(intrusions.length,0,'limited push space allowed the rotating car into the truck: '+JSON.stringify(intrusions));
+});

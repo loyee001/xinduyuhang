@@ -300,14 +300,15 @@ test('real traffic contact loses speed once, clears held throttle and freezes al
   assert.equal(app.world.contacts, 1, 'a held overlap cannot record repeated crashes while paused');
 });
 
-function causeVehicleCollision(driver, { reverse = false, local = false, seconds = 6, speed = reverse ? 5 : 25 } = {}) {
+function causeVehicleCollision(driver, { reverse = false, local = false, seconds = 6,
+  speed = reverse ? 5 : 25, offsetX = 0 } = {}) {
   const { app } = driver, y = local ? app.car.y : 900, x = local ? 29 : 0;
   Object.assign(app.car, { x, y, heading: 0, steer: 0, speed,
     gear: reverse ? 'reverse' : 'forward' });
   app.state.requestedGear = app.car.gear;
   app.state.laneTarget = 1;
   const lead = adviceVehicle(local ? 0 : 1, y + (reverse ? -5 : 5), 0, 999);
-  lead.x = x;
+  lead.x = x + offsetX;
   app.world.vehicles = [lead];
   driver.advance(seconds);
   assert.equal(app.state.collision?.kind, 'vehicle', 'the fixture must produce a real traffic collision');
@@ -2178,6 +2179,73 @@ test('every collision lifts the whole car clearly while stronger impacts stay bo
   assert.ok(strong.app.state.collisionEffect.launchSpeed<=18);
 });
 
+test('centred vehicle collisions tumble over the struck end in forward and reverse gear', () => {
+  for(const reverse of [false,true]){
+    const driver=loadApp();
+    causeVehicleCollision(driver,{reverse});
+    const effect=driver.app.state.collisionEffect;
+    assert.equal(effect.tumbleAxis,'pitch');
+    assert.equal(Math.sign(effect.tumbleRateDeg),reverse?1:-1,
+      'front and rear impacts need opposite pitch directions');
+    assert.equal(effect.impactEnd,reverse?'rear':'front');
+    assert.equal(effect.travelHeading,reverse?180:0,
+      'tumbling does not reverse the existing horizontal launch direction');
+    assert.equal(driver.app.readState().collisionAnimation.tumbleRateDeg,effect.tumbleRateDeg);
+    assert.equal(driver.drawn.at(-1).collisionEffect.tumbleAxis,effect.tumbleAxis);
+    assert.equal(driver.drawn.at(-1).collisionEffect.tumbleRateDeg,effect.tumbleRateDeg);
+  }
+});
+
+test('left and right guardrails generate opposite rolls away from the contacted side', () => {
+  const effects=[];
+  for(const direction of [-1,1]){
+    const driver=loadApp(),{app}=driver;
+    app.world.vehicles=[];
+    Object.assign(app.car,{x:direction<0?-6.44:7.94,heading:direction*15,speed:30});
+    app.state.laneTarget=direction<0?0:3;
+    driver.key('keydown','ArrowUp');
+    driver.advance(.3);
+    assert.equal(app.state.collision?.kind,'guardrail','the fixture must hit a real guardrail');
+    const effect=app.state.collisionEffect;
+    assert.equal(effect.tumbleAxis,'roll');
+    assert.equal(Math.sign(effect.tumbleRateDeg),direction);
+    effects.push(effect);
+  }
+  assert.ok(effects[0].tumbleRateDeg*effects[1].tumbleRateDeg<0);
+});
+
+test('off-centre vehicle impacts switch to side rolls for either contacted side and gear', () => {
+  for(const reverse of [false,true]){
+    for(const offsetX of [-1.1,1.1]){
+      const driver=loadApp();
+      causeVehicleCollision(driver,{reverse,offsetX});
+      const effect=driver.app.state.collisionEffect;
+      assert.equal(effect.tumbleAxis,'roll','an eccentric contact must visibly differ from a centred pitch');
+      assert.equal(Math.sign(effect.tumbleRateDeg),Math.sign(offsetX),
+        'the struck side determines roll direction even while reversing');
+      assert.equal(effect.impactEnd,reverse?'rear':'front');
+    }
+  }
+});
+
+test('stronger collisions increase tumble angular speed within a bounded visual envelope', () => {
+  const magnitudes=[];
+  for(const speed of [3,15,33,100]){
+    const driver=loadApp();
+    causeVehicleCollision(driver,{speed});
+    const effect=driver.app.state.collisionEffect;
+    const magnitude=Math.abs(effect.tumbleRateDeg);
+    assert.ok(Number.isFinite(magnitude)&&magnitude>=150&&magnitude<=260,
+      'even the 100 m/s maximum must retain a finite bounded angular speed');
+    assert.equal(effect.tumbleAxis,'pitch');
+    assert.ok(effect.tumbleRateDeg<0);
+    magnitudes.push(magnitude);
+  }
+  assert.ok(magnitudes[0]<magnitudes[1]&&magnitudes[1]<magnitudes[2],
+    'impact strength must affect the visible spin instead of using one animation for all speeds');
+  assert.ok(magnitudes[3]>=magnitudes[2]);
+});
+
 test('collision phases show forward flight, landing slide and wreck smoke before the restart dialog', () => {
   const driver=loadApp(),{app,ui}=driver;
   causeVehicleCollision(driver,{seconds:.05});
@@ -2257,18 +2325,37 @@ test('returning from background and resizing redraw the landed collision pose', 
 test('replaying the short collision animation keeps the world frozen and returns to the restart dialog', () => {
   const driver=loadApp();causeVehicleCollision(driver);
   const frozen=JSON.stringify({car:driver.app.car,world:driver.app.world});
+  const effect=driver.app.state.collisionEffect;
+  const parameters=value=>JSON.stringify(Object.fromEntries(Object.entries(value).filter(([key])=>key!=='elapsed')));
+  const originalParameters=parameters(effect);
+  assert.ok(Math.abs(effect.tumbleRateDeg)>0);
   driver.ui('collision-replay').onclick();
   driver.ui('collision-dialog').onclose();
   assert.ok(!driver.ui('collision-dialog').open);
   assert.equal(driver.app.readState().collisionAnimation.active,true);
+  assert.equal(driver.app.state.collisionEffect.elapsed,0);
+  assert.equal(parameters(driver.app.state.collisionEffect),originalParameters,
+    'replay reuses the original impact, rotation and flight parameters');
   driver.frame(.15);
   assert.ok(driver.drawn.at(-1).collisionEffect.elapsed>0);
+  assert.equal(parameters(driver.drawn.at(-1).collisionEffect),originalParameters,
+    'the renderer receives the same tumble parameters while the replay clock advances');
+  assert.equal(JSON.stringify({car:driver.app.car,world:driver.app.world}),frozen);
   driver.frame(driver.app.state.collisionEffect.duration);
   assert.equal(driver.ui('collision-dialog').open,true);
   assert.equal(JSON.stringify({car:driver.app.car,world:driver.app.world}),frozen);
+  assert.equal(parameters(driver.app.state.collisionEffect),originalParameters);
   driver.ui('collision-restart').onclick();
   assert.equal(driver.app.state.collisionEffect,null);
   assert.equal(driver.app.car.speed,0);
+  assert.equal(driver.app.readState().collisionAnimation,null);
+  driver.frame(effect.duration);
+  assert.equal(driver.app.state.collisionEffect,null,'an old tumble cannot resume after restarting');
+  assert.equal(driver.app.car.speed,0);
+  causeVehicleCollision(driver,{reverse:true});
+  assert.equal(driver.app.state.collisionEffect.tumbleAxis,'pitch');
+  assert.ok(driver.app.state.collisionEffect.tumbleRateDeg>0,
+    'a subsequent reverse collision generates its own direction instead of reusing the previous tumble');
 });
 
 test('exit traffic is selected from ordinary right-lane cars and the card follows real route phases', () => {
