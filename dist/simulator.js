@@ -156,10 +156,32 @@
         x-halfWidth <= Math.max(near,far)+entrance.width/2+.75;
     });
   }
-  function buildLocalRoad(target, origin, route, start=-1600, end=2000, entrances=[]) {
+  function returnOccupies(route, x, worldY, halfWidth = 0, halfLength = 0) {
+    if (!route || worldY + halfLength < route.start - 10 || worldY - halfLength > route.end + 15) return false;
+    const centers = [-halfLength,0,halfLength].map(dy => window.RoverRoad.centerForReturn(route,worldY+dy));
+    const clearance = route.width/2 + .8;
+    return x+halfWidth >= Math.min(...centers)-clearance && x-halfWidth <= Math.max(...centers)+clearance;
+  }
+  function cityEntranceBounds(entrance, worldY) {
+    const road=window.RoverRoad, early=road.centerForCityEntrance(entrance,worldY);
+    const late=road.centerForCityEntrance({...entrance,cityEntryStart:entrance.cityEntryEnd,
+      crossingEnd:entrance.cityEntryEnd+60},worldY);
+    return {left:Math.min(early,late)-entrance.cityWidth/2,
+      right:Math.min(localGeometry().laneCenter+localGeometry().halfLaneWidth,Math.max(early,late)+entrance.cityWidth/2)};
+  }
+  function cityEntranceOccupies(entrances, x, worldY, halfWidth=0, halfLength=0) {
+    return entrances.some(entrance=>{
+      if(worldY+halfLength<entrance.cityEntryStart-10||worldY-halfLength>entrance.cityJoinY+10)return false;
+      const sections=[-halfLength,0,halfLength].map(dy=>cityEntranceBounds(entrance,worldY+dy));
+      return x+halfWidth>=Math.min(...sections.map(section=>section.left))-.75 &&
+        x-halfWidth<=Math.max(...sections.map(section=>section.right))+.75;
+    });
+  }
+  function buildLocalRoad(target, origin, route, start=-1600, end=2000, entrances=[], returnRoute=null) {
     const settings = localGeometry(), left = settings.oncomingLaneCenter-settings.halfLaneWidth;
     const right = settings.laneCenter+settings.halfLaneWidth, middle = (left+right)/2;
     const connection = route?.rampEnd ?? -Infinity, begin = Math.max(start,connection-120-origin);
+    const junctions=entrances.map(entrance=>({start:entrance.cityJunctionStart-origin,end:entrance.cityJunctionEnd-origin}));
     for (let z = begin; z < end; z += 20) {
       const z2 = Math.min(z+20,end);
       // The last 120 m widens gently from the exit lane into a two-way road.
@@ -171,8 +193,11 @@
       const l2 = Number.isFinite(connection) ? edge(z2,-1) : left, r2 = Number.isFinite(connection) ? edge(z2,1) : right;
       polygon(target,[[l1,.008,z],[r1,.008,z],[r2,.008,z2],[l2,.008,z2]],COLORS.road,1.2,1);
       if (z+origin < connection) continue;
-      for (const x of [middle-.13,middle+.13]) ground(target,x-.045,x+.045,z,z2,.022,COLORS.amber,2);
+      for (const [a,b] of clearSections(z,z2,junctions))
+        for (const x of [middle-.13,middle+.13]) ground(target,x-.045,x+.045,a,b,.022,COLORS.amber,2);
       for (const x of [left,right]) {
+        if (returnOccupies(returnRoute,x,(z+z2)/2+origin,2.2,(z2-z)/2) ||
+          (x===left&&cityEntranceOccupies(entrances,x,(z+z2)/2+origin,2.2,(z2-z)/2))) continue;
         const outside = x === left ? x-2.15 : x+2.15;
         ground(target,Math.min(x,outside),Math.max(x,outside),z,z2,.085,rgb('#b2b0a1'),1.3);
         box(target,x,.008,(z+z2)/2,.13,.13,z2-z,rgb('#d5d2be'),2);
@@ -184,11 +209,15 @@
       const z = y-origin, block = Math.floor(y/64), height = 3.2+((block%3+3)%3)*.8;
       for (const side of [-1,1]) {
         const x = side < 0 ? left-1.35 : right+1.35;
-        box(target,x,0,z,.11,5.4,.11,COLORS.steelDark);
-        box(target,x-side*.52,5.3,z,1.1,.12,.15,COLORS.steelDark);
-        box(target,x-side*.9,5.24,z,.42,.08,.23,rgb('#fff0ba'));
+        if (!returnOccupies(returnRoute,x,y,1.2) && !cityEntranceOccupies(entrances,x,y,1.2)) {
+          box(target,x,0,z,.11,5.4,.11,COLORS.steelDark);
+          box(target,x-side*.52,5.3,z,1.1,.12,.15,COLORS.steelDark);
+          box(target,x-side*.9,5.24,z,.42,.08,.23,rgb('#fff0ba'));
+        }
         const buildingX = side < 0 ? left-7.1 : right+7.1;
-        if (entranceOccupies(entrances,buildingX,y+18,3.75,7.2)) continue;
+        if (entranceOccupies(entrances,buildingX,y+18,3.75,7.2) ||
+          cityEntranceOccupies(entrances,buildingX,y+18,3.75,7.2) ||
+          returnOccupies(returnRoute,buildingX,y+18,3.75,7.2)) continue;
         const facade = (block+side)%2 ? rgb('#b6b2a0') : rgb('#a6b2a7');
         box(target,buildingX,0,z+18,7.2,height,14,facade);
         box(target,buildingX,height,z+18,7.5,.22,14.3,rgb('#65756d'));
@@ -208,32 +237,44 @@
     }
     if (route && route.rampEnd+30 >= origin+start && route.rampEnd+30 <= origin+end) localSpeedSign(target,route.rampEnd+30,origin);
   }
-  function buildExits(target, exits, origin) {
+  function buildExits(target, exits, origin, returnRoute=null) {
     const road = window.RoverRoad;
     if (!road) return;
     for (const exit of exits) {
       for (const y of [exit.start-600,exit.start-300,exit.entryStart-30]) exitSign(target,exit,y,origin);
-      const half = exit.width / 2;
       // The final part belongs to the widening connection to the local road.
       const pavementEnd = exit.rampEnd-120;
       for (let y = exit.entryStart; y < pavementEnd; y += 10) {
-        const y2 = Math.min(y+10,pavementEnd), x1 = road.centerForExit(exit,y), x2 = road.centerForExit(exit,y2);
+        const y2 = Math.min(y+10,pavementEnd), deceleration = y < exit.splitStart;
+        const x1 = deceleration ? exit.decelerationCenter : road.centerForExit(exit,y);
+        const x2 = deceleration ? exit.decelerationCenter : road.centerForExit(exit,y2);
+        const half = deceleration ? exit.laneWidth/2 : exit.width/2;
         const z1 = y-origin, z2 = y2-origin;
         const strip = (left,right,height,color,layer=1) => polygon(target,
           [[x1+left,height,z1],[x1+right,height,z1],[x2+right,height,z2],[x2+left,height,z2]],color,layer,1);
         strip(-half-.6,half+.6,.004,COLORS.shoulder,1.1);
         strip(-half,half,.005,COLORS.road,1.2);
+        if (deceleration) {
+          // The shoulder becomes a real parallel lane before the split.
+          // A dashed left edge invites one manual right lane-change.
+          if (Math.floor((y-exit.entryStart)/10)%2 === 0) strip(-half,-half+.12,.023,COLORS.paint,2);
+          strip(half-.12,half,.023,COLORS.paint,2);
+          const outer1=x1+half+.5, outer2=x2+half+.5;
+          if (!returnOccupies(returnRoute,(outer1+outer2)/2,(y+y2)/2,.25,(y2-y)/2))
+            polygon(target,[[outer1,.65,z1],[outer2,.65,z2],[outer2,.87,z2],[outer1,.87,z1]],COLORS.steel);
+        }
         // The left boundary only starts outside the highway so a joining ramp
         // never draws a solid diagonal across the main right-hand travel lane.
         if (x1-half > ROAD.emergencyEnd) strip(-half,-half+.12,.018,COLORS.paint,2);
         if (x1+half > ROAD.emergencyEnd) strip(half-.12,half,.018,COLORS.paint,2);
-        if (y > exit.entryStart+110 && y < exit.entryStart+200) {
+        if (y > exit.splitStart+110 && y < exit.splitStart+220) {
           const left = ROAD.emergencyEnd+.25, right = x1-half-.25;
           if (right > left) ground(target,left,right,z1,z1+.4,.02,COLORS.paint,2);
         }
         if (x1-half > ROAD.guardrailRight+.5) {
           for (const side of [-1,1]) {
             const edge1 = x1+side*(half+.5), edge2 = x2+side*(half+.5);
+            if (returnOccupies(returnRoute,(edge1+edge2)/2,(y+y2)/2,.25,(y2-y)/2)) continue;
             polygon(target,[[edge1,.65,z1],[edge2,.65,z2],[edge2,.87,z2],[edge1,.87,z1]],COLORS.steel);
           }
         }
@@ -241,12 +282,42 @@
       // A lane-shaped arrow follows the branch; chevrons distinguish its
       // paved entrance from the amber emergency shoulder alongside it.
       for (let y = exit.entryStart+30; y < exit.rampEnd-120; y += 65) {
-        const x = road.centerForExit(exit,y), z = y-origin;
-        const slope = (road.centerForExit(exit,y+2)-road.centerForExit(exit,y-2))/4;
+        const deceleration = y < exit.splitStart;
+        const x = deceleration ? exit.decelerationCenter : road.centerForExit(exit,y), z = y-origin;
+        const slope = deceleration ? 0 : (road.centerForExit(exit,y+2)-road.centerForExit(exit,y-2))/4;
         const point = (side,along) => [x+side+slope*along,.028,z+along];
         polygon(target,[point(-.1,-2),point(.1,-2),point(.1,1),point(-.1,1)],COLORS.paint,2);
         polygon(target,[point(-.7,.8),point(0,3),point(.7,.8)],COLORS.paint,2);
       }
+      const signY=exit.splitStart-55, signX=exit.decelerationCenter+2.5, signZ=signY-origin;
+      box(target,signX,0,signZ,.09,2.8,.09,COLORS.steel);
+      disc(target,signX,2.7,signZ-.015,.55,rgb('#d4493f'));
+      disc(target,signX,2.7,signZ-.025,.44,COLORS.white);
+      lettering(target,String(exit.speedLimitKmh),signX,2.5,signZ-.035,.39,COLORS.dark);
+    }
+  }
+  function buildExitReturn(target, route, origin) {
+    if (!route) return;
+    const road=window.RoverRoad, half=route.width/2;
+    for (let y=route.start-10;y<route.end+15;y+=10) {
+      const y2=Math.min(y+10,route.end+15), x1=road.centerForReturn(route,y), x2=road.centerForReturn(route,y2);
+      const strip=(left,right,height,color,layer)=>polygon(target,
+        [[x1+left,height,y-origin],[x1+right,height,y-origin],[x2+right,height,y2-origin],[x2+left,height,y2-origin]],color,layer,1);
+      strip(-half-.55,half+.55,.01,COLORS.shoulder,1.3);
+      strip(-half,half,.016,COLORS.road,1.4);
+      if (y>route.start+25 && y2<route.end-25) {
+        for (const side of [-1,1]) {
+          if (side<0 && Math.min(x1,x2)-half<ROAD.halfWidth) continue;
+          strip(side<0?-half:half-.12,side<0?-half+.12:half,.029,COLORS.paint,2);
+        }
+      }
+    }
+    for (let y=route.start+35;y<route.end-25;y+=60) {
+      const x=road.centerForReturn(route,y), z=y-origin;
+      const slope=(road.centerForReturn(route,y+2)-road.centerForReturn(route,y-2))/4;
+      const point=(side,along)=>[x+side+slope*along,.033,z+along];
+      polygon(target,[point(-.1,-2),point(.1,-2),point(.1,1),point(-.1,1)],COLORS.paint,2);
+      polygon(target,[point(-.7,.8),point(0,3),point(.7,.8)],COLORS.paint,2);
     }
   }
   function entranceSign(target, entrance, worldY, origin) {
@@ -259,6 +330,47 @@
     polygon(target,[[x+1,3.25,front],[x+1.13,3.25,front],[x+1.13,4.02,front],[x+1,4.02,front]],COLORS.dark);
     polygon(target,[[x+.86,3.92,front],[x+1.06,4.2,front],[x+1.27,3.92,front]],COLORS.dark);
     polygon(target,[[x+1.04,3.66,front],[x+1.13,3.76,front],[x+1.61,3.38,front],[x+1.53,3.28,front]],COLORS.dark);
+  }
+  function buildCityEntrances(target, entrances, origin) {
+    const road=window.RoverRoad;
+    for(const entrance of entrances) {
+      // The paved intersection is permanent. Its outline contains both the
+      // earliest and latest legal turn, instead of appearing on selection.
+      for(let y=entrance.cityEntryStart-10;y<entrance.cityJoinY;y+=5) {
+        const y2=Math.min(y+5,entrance.cityJoinY), first=cityEntranceBounds(entrance,y), last=cityEntranceBounds(entrance,y2);
+        polygon(target,[[first.left-.45,.01,y-origin],[first.right,.01,y-origin],
+          [last.right,.01,y2-origin],[last.left-.45,.01,y2-origin]],COLORS.shoulder,1.3,1);
+        polygon(target,[[first.left,.014,y-origin],[first.right,.014,y-origin],
+          [last.right,.014,y2-origin],[last.left,.014,y2-origin]],COLORS.road,1.4,1);
+        if(Math.max(first.right,last.right)<localGeometry().oncomingLaneCenter-localGeometry().halfLaneWidth) {
+          for(const side of ['left','right']) {
+            const a=first[side],b=last[side],offset=side==='left'?.12:-.12;
+            polygon(target,[[a,.029,y-origin],[a+offset,.029,y-origin],
+              [b+offset,.029,y2-origin],[b,.029,y2-origin]],COLORS.paint,2);
+          }
+        }
+      }
+      for(let y=entrance.cityEntryStart+12;y<entrance.cityJoinY;y+=40) {
+        const x=road.centerForCityEntrance(entrance,y),z=y-origin;
+        const slope=(road.centerForCityEntrance(entrance,y+1)-road.centerForCityEntrance(entrance,y-1))/2;
+        const point=(side,along)=>[x+side+slope*along,.033,z+along];
+        polygon(target,[point(-.09,-1.5),point(.09,-1.5),point(.09,.6),point(-.09,.6)],COLORS.paint,2);
+        polygon(target,[point(-.55,.4),point(0,2),point(.55,.4)],COLORS.paint,2);
+      }
+      for(const y of [entrance.cityEntryStart-180,entrance.cityEntryStart-20]) {
+        const x=33,z=y-origin,front=z-.11;
+        box(target,x,0,z,.12,4.1,.12,COLORS.steel);
+        box(target,x,2.8,z,4,1.35,.18,COLORS.green);
+        lettering(target,'HWY',x,3.6,front,.4);
+        lettering(target,`${Math.max(0,Math.round(entrance.cityEntryStart-y))}M`,x+.3,3.03,front,.32);
+        polygon(target,[[x-1.6,3.22,front],[x-1.12,3.5,front],[x-1.12,2.95,front]],COLORS.white);
+      }
+      const limitY=entrance.cityEntryStart-7,limitX=32.5,z=limitY-origin;
+      box(target,limitX,0,z,.09,2.7,.09,COLORS.steel);
+      disc(target,limitX,2.6,z-.015,.51,rgb('#d4493f'));
+      disc(target,limitX,2.6,z-.025,.41,COLORS.white);
+      lettering(target,String(entrance.citySpeedLimitKmh),limitX,2.41,z-.035,.36,COLORS.dark);
+    }
   }
   function buildEntrances(target, entrances, origin) {
     const road = window.RoverRoad;
@@ -283,6 +395,7 @@
         if (y2 <= entrance.openingStart) {
           for (const side of [-1,1]) {
             const edge1 = x1+side*(half+.5), edge2 = x2+side*(half+.5);
+            if(cityEntranceOccupies(entrances,(edge1+edge2)/2,(y+y2)/2,.25,(y2-y)/2))continue;
             polygon(target,[[edge1,.65,z1],[edge2,.65,z2],[edge2,.87,z2],[edge1,.87,z1]],COLORS.steel);
           }
         }
@@ -300,19 +413,23 @@
       }
     }
   }
-  function buildHighway(origin = 0, route = null, trafficRoutes = []) {
+  function buildHighway(origin = 0, route = null, trafficRoutes = [], returnRoute = null, continuousLocal = false) {
     const target = mesh();
     const start = -1600, end = 2000;
     const events = window.RoverRoad?.eventsAround(origin+200,2100) || { solids: [], exits: [], entrances: [] };
     events.entrances ||= [];
-    if (route) { events.exits = [route]; events.entrances = []; }
+    if (route && !returnRoute) { events.exits = [route]; events.entrances = []; }
     else {
       const existing=new Set(events.exits.map(exit=>exit.id));
-      for(const exit of trafficRoutes)if(!existing.has(exit.id)) {events.exits.push(exit);existing.add(exit.id);}
+      // Returning drivers are back in the highway traffic world. Keep its
+      // entrances and other exits, plus the selected route behind the car.
+      for(const exit of [...(route?[route]:[]),...trafficRoutes])
+        if(!existing.has(exit.id)) {events.exits.push(exit);existing.add(exit.id);}
       events.exits.sort((a,b)=>a.entryStart-b.entryStart);
     }
     const solids = events.solids.map(zone => ({ start:zone.start-origin, end:zone.end-origin }));
-    const openings = [...events.exits,...events.entrances]
+    const openings = [...events.exits,...events.entrances,
+      ...(returnRoute?[{openingStart:returnRoute.start-20,openingEnd:returnRoute.end+30}]:[])]
       .map(event => ({ start:event.openingStart-origin, end:event.openingEnd-origin })).sort((a,b)=>a.start-b.start);
     const openingAt = z => openings.some(opening => z >= opening.start && z <= opening.end);
     const entranceSignAt = z => events.entrances.some(entrance =>
@@ -381,32 +498,34 @@
       hill(target,-355,z+310,320,310,91,COLORS.hills);
       // Low roadside planting, kept well outside the driving surface.
       for (const [x,dz,h] of [[24,45,5],[-41,135,6],[34,280,4.4],[-43,340,5.5]]) {
+        if(continuousLocal&&x+2.5>=localGeometry().oncomingLaneCenter-localGeometry().halfLaneWidth&&
+          x-2.5<=localGeometry().laneCenter+localGeometry().halfLaneWidth)continue;
         if (x > 0 && (events.exits.some(exit => z+dz+origin >= exit.entryStart && z+dz+origin <= exit.rampEnd && Math.abs(x-window.RoverRoad.centerForExit(exit,z+dz+origin)) < 6) ||
-          entranceOccupies(events.entrances,x,z+dz+origin,2.5,2.5))) continue;
+          entranceOccupies(events.entrances,x,z+dz+origin,2.5,2.5) ||
+          cityEntranceOccupies(events.entrances,x,z+dz+origin,2.5,2.5) ||
+          returnOccupies(returnRoute,x,z+dz+origin,2.5,2.5))) continue;
         box(target,x,0,z+dz,.22,h*.58,.22,COLORS.dark);
         hill(target,x,z+dz,4.5,4.5,h,COLORS.hills);
       }
     }
-    buildExits(target,events.exits,origin);
+    buildExits(target,events.exits,origin,returnRoute);
     buildEntrances(target,events.entrances,origin);
     // Unselected exits still have a visible continuation. Once a route is
     // selected, only that connection is drawn so later exits cannot overlap it.
     const activeTrafficRoutes=new Set(trafficRoutes.map(exit=>exit.id));
-    for (const exit of events.exits) buildLocalRoad(target,origin,exit,start,
-      route||activeTrafficRoutes.has(exit.id)?end:Math.min(end,exit.rampEnd+700-origin),events.entrances);
+    if(continuousLocal)buildLocalRoad(target,origin,null,start,end,events.entrances,returnRoute);
+    else for (const exit of events.exits) buildLocalRoad(target,origin,exit,start,
+      route?.id===exit.id||activeTrafficRoutes.has(exit.id)?end:Math.min(end,exit.rampEnd+700-origin),events.entrances,returnRoute);
+    buildCityEntrances(target,events.entrances,origin);
+    buildExitReturn(target,returnRoute,origin);
     target.data = new Float32Array(target.vertices);
     target.vertices = null;
     return target;
   }
   function buildLocalWorld(origin, route) {
-    const target = mesh(), start = -1600, end = 2000;
-    for (let z = start; z < end; z += 50) ground(target,-2000,2000,z,z+50,-.07,COLORS.grass,0);
-    // Entering local-road mode is a lasting scene transition. Its road runs
-    // in both directions, even if reverse travel passes the old ramp station.
-    buildLocalRoad(target,origin,null,start,end);
-    target.data = new Float32Array(target.vertices);
-    target.vertices = null;
-    return target;
+    // Ordinary roads keep running past each junction. The adjacent motorway
+    // and its recurring connecting roads remain visible before any turn.
+    return buildHighway(origin,null,[],null,true);
   }
 
   const vehicleTemplates = new Map();
@@ -484,13 +603,15 @@
     for (let i=0;i<24;i++) { const angle = i*Math.PI/12; points.push([x+Math.cos(angle)*radius,y+Math.sin(angle)*radius,z]); }
     polygon(target,points,color);
   }
-  function speedSign(target,sign,origin) {
+  function speedSign(target,sign,origin,returnRoute=null) {
     const roadState = window.RoverRoad?.getState(sign.y), exit = roadState?.activeExit;
     const center = exit ? window.RoverRoad.centerForExit(exit,sign.y) : 0;
     let x = exit && Math.abs(center-10) < 4 ? center+exit.width/2+1.5 : 10;
     const entrance = roadState?.activeEntrance;
     if (entrance && entranceOccupies([entrance],x,sign.y,1,.1))
       x = window.RoverRoad.centerForEntrance(entrance,sign.y)+entrance.width/2+1.5;
+    if (returnOccupies(returnRoute,x,sign.y,1,.1))
+      x = window.RoverRoad.centerForReturn(returnRoute,sign.y)+returnRoute.width/2+1.5;
     const z = sign.y-origin;
     box(target,x,0,z,.12,3.6,.12,COLORS.steel);
     disc(target,x,3.55,z+.012,.88,COLORS.steelDark);
@@ -520,7 +641,7 @@
     stats.visibleTraffic = 0;
     for (const vehicle of pose.traffic || []) {
       if (![vehicle.x,vehicle.y].every(Number.isFinite)) continue;
-      if (pose.localRoad) {
+      if (pose.localRoad && !pose.cityEntrance) {
         const local = localGeometry();
         if (vehicle.x < local.oncomingLaneCenter-local.halfLaneWidth || vehicle.x > local.laneCenter+local.halfLaneWidth) continue;
       }
@@ -539,8 +660,8 @@
         placeVehicleMesh(target,lamps,vehicle.x,z,vehicleSin,vehicleCos,includeFaces);
       }
     }
-    const signs = pose.localRoad ? [] : pose.roadSigns || window.RoverTraffic?.signsAround(pose.y) || [];
-    for (const sign of signs) speedSign(target,sign,origin);
+    const signs = pose.localRoad && !pose.cityEntrance ? [] : pose.roadSigns || window.RoverTraffic?.signsAround(pose.y) || [];
+    for (const sign of signs) speedSign(target,sign,origin,pose.exitReturn);
     return target;
   }
 
@@ -1106,26 +1227,29 @@
         const visualPose=pose.collisionEffect?{...pose,x:pose.x+motion.x,y:pose.y+motion.y}:pose;
         const origin = Math.floor(visualPose.y/ROAD.repeat)*ROAD.repeat;
         const view = collisionCamera(pose,width/height), localY = view.y-origin;
-        const route = pose.exitRoute || null;
-        const trafficRoutes=!pose.localRoad&&!route?[...new Map((pose.traffic||[])
+        const route = pose.exitRoute || null, returnRoute=pose.exitReturn||null, cityRoute=pose.cityEntrance||null;
+        const trafficRoutes=(!pose.localRoad||cityRoute)&&(!route||returnRoute||cityRoute)?[...new Map((pose.traffic||[])
           .map(vehicle=>vehicle.exitRoute?.event)
           .filter(exit=>exit&&typeof exit.id==='string'&&Number.isFinite(exit.entryStart)&&Number.isFinite(exit.rampEnd))
           .map(exit=>[exit.id,exit])).values()].sort((a,b)=>a.entryStart-b.entryStart):[];
-        const nextSceneKey = `${pose.localRoad ? 'local' : 'highway'}:${route?.id || 'none'}:${trafficRoutes.map(exit=>exit.id).join(',')}`;
+        const nextSceneKey = `${pose.localRoad ? 'local' : 'highway'}:${route?.id || 'none'}:${returnRoute?.id||'none'}:${cityRoute?.cityRouteId||cityRoute?.id||'none'}:${trafficRoutes.map(exit=>exit.id).join(',')}`;
         if (origin !== highwayOrigin || nextSceneKey !== sceneKey) {
           highwayOrigin = origin;
           sceneKey = nextSceneKey;
-          highway = pose.localRoad ? buildLocalWorld(origin,route) : buildHighway(origin,route,trafficRoutes);
+          highway = cityRoute ? buildHighway(origin,null,trafficRoutes,returnRoute,true) :
+            pose.localRoad ? buildLocalWorld(origin,route) : buildHighway(origin,route,trafficRoutes,returnRoute);
           if (gl) {
             gl.bindBuffer(gl.ARRAY_BUFFER,staticBuffer);
             gl.bufferData(gl.ARRAY_BUFFER,highway.data,gl.STATIC_DRAW);
           }
         }
         stats.worldOrigin = origin;
-        stats.roadType = pose.localRoad ? 'local' : route ? 'exit' : 'highway';
+        stats.roadType = cityRoute ? 'entrance' : pose.localRoad ? 'local' : returnRoute ? 'return' : route ? 'exit' : 'highway';
+        stats.nearbyCityEntrances = pose.localRoad||cityRoute ? window.RoverRoad?.eventsAround(pose.y,ROAD.far).entrances?.length||0 : 0;
+        stats.exitReturn = returnRoute ? {start:returnRoute.start,end:returnRoute.end} : null;
         stats.roadSolid = !pose.localRoad && Boolean(window.RoverRoad?.getState(pose.y).solid);
-        stats.nearbyExits = pose.localRoad ? 0 : route ? 1 : window.RoverRoad?.eventsAround(pose.y,ROAD.far).exits.length || 0;
-        stats.nearbyEntrances = pose.localRoad || route ? 0 : window.RoverRoad?.eventsAround(pose.y,ROAD.far).entrances?.length || 0;
+        stats.nearbyExits = pose.localRoad ? 0 : route&&!returnRoute ? 1 : window.RoverRoad?.eventsAround(pose.y,ROAD.far).exits.length || 0;
+        stats.nearbyEntrances = pose.localRoad || (route&&!returnRoute) ? 0 : window.RoverRoad?.eventsAround(pose.y,ROAD.far).entrances?.length || 0;
         stats.cameraHeading = viewHeading(view);
         stats.cameraHeight = view.cameraHeight;
         stats.cameraPitch = view.cameraPitch;

@@ -99,3 +99,176 @@
 .collision-ended .camera-viewport{aspect-ratio:4/3;min-height:260px}
 #exit-traffic-status{display:block;margin-top:6px;color:#a5b59f;font-size:11px;line-height:1.65;overflow-wrap:anywhere}
 #exit-traffic-status[hidden]{display:none}
+
+
+/* Compact layout: common settings near the camera, driving controls last. */
+.app-shell{max-width:900px;padding-bottom:112px}
+.topbar{height:76px}
+.page-heading{padding:22px 0 18px}
+.workspace{display:flex;flex-direction:column;gap:12px}
+.vision-column{display:flex;flex-direction:column;gap:9px;width:100%}
+.vision-column>*{width:100%;margin-top:0}
+.vision-column>.camera-panel.expanded{width:auto}
+.vision-column>.telemetry{margin-top:0}
+.camera-viewport{aspect-ratio:1.95}
+.control-panel{width:100%;min-height:0;padding:4px 16px 14px}
+.common-settings{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:9px}
+.common-settings>.traffic-controls{margin:0}
+.common-settings>.road-settings{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;margin:0;padding:11px 13px;border:1px solid var(--border);background:#19221b;border-radius:12px}
+.common-settings>.road-settings>span:first-child{color:#c6d6bd;grid-column:1;grid-row:1}
+.common-settings>.road-settings>span:last-child{grid-column:2;grid-row:1;align-self:center}
+.common-settings>.road-settings>div{display:grid;grid-template-columns:1fr 1fr;grid-column:1 / -1;grid-row:2;margin:0;padding:0;border:0;gap:6px}
+.common-settings>.road-settings button{min-height:40px;border:1px solid #3c4d35;background:#222d21;border-radius:8px}
+.common-settings>.road-settings button.selected{background:#35442a;border-color:#819853}
+.control-heading{padding-top:14px}
+.gear-control{margin-top:10px}
+.highway-steering{padding:12px 4px 9px}
+.pedals{gap:9px;margin-bottom:12px}
+.pedal{min-height:60px}
+.road-settings{margin-top:10px}
+.ai-shortcut{margin-top:12px;min-height:54px;padding:9px 10px}
+.road-awareness,.road-events,.lane-advice,.traffic-controls,.horn-feedback{margin-top:9px}
+.vision-column>:is(.road-awareness,.road-events,.lane-advice,.horn-feedback){margin-top:0}
+.road-events,.lane-advice,.horn-feedback{padding:10px 12px}
+.road-rule,.exit-preview,.entrance-preview{gap:8px}
+.exit-preview,.entrance-preview{margin-top:8px;padding-top:8px}
+.road-events .exit-manual-note{margin:6px 0 0;color:#c9d9b7;font-size:11px;line-height:1.5}
+#exit-traffic-status,.entrance-preview #entrance-status{margin-top:3px;line-height:1.5}
+.lane-advice p{margin:7px 0;line-height:1.5}
+.advice-lanes>div{padding:7px 6px;gap:3px}
+.lane-advice button{margin-top:7px;min-height:42px}
+.lane-advice-note{margin-top:4px}
+.telemetry{margin-top:10px;padding:11px 0}
+.telemetry-live{padding-top:8px}
+.horn-feedback p{margin-top:2px;line-height:1.5}
+.ai-intro,.auto-intro{padding:17px 0 12px}
+.auto-intro h2{font-size:21px;margin:5px 0}
+.auto-routes{gap:7px}
+.auto-routes button{min-height:88px;padding:10px}
+.auto-routes i{margin-bottom:4px}
+.auto-routes small{margin-top:3px}
+.auto-status{margin:12px 0;padding:10px}
+.auto-status p{margin-top:3px;line-height:1.5}
+.auto-controls{gap:8px;margin-bottom:12px}
+.auto-note{margin-top:10px;line-height:1.6}
+.keyboard-legend{margin-top:12px;padding-top:10px;gap:5px 11px}
+.safety-bar{padding-top:12px;padding-bottom:calc(12px + env(safe-area-inset-bottom))}
+@media(max-width:800px){
+  .app-shell{max-width:510px;padding:0 12px calc(88px + env(safe-area-inset-bottom))}
+  .topbar{height:50px}
+  .brand{font-size:18px;gap:8px}
+  .brand-symbol{width:31px;height:31px;font-size:29px;border-radius:9px}
+  .brand-caption{display:none}
+  .page-heading{padding:2px 0 9px}
+  h1{font-size:20px}
+  .vehicle-id{font-size:10px;gap:7px}
+  .vehicle-id small{font-size:10px}
+  .workspace{gap:7px}
+  .vision-column{gap:7px}
+  .camera-panel{border-radius:11px}
+  .common-settings{grid-template-columns:minmax(0,1fr);gap:7px}
+  .common-settings>.road-settings{display:flex;align-items:center;padding:6px 9px;border-radius:10px;font-size:11px}
+  .common-settings>.road-settings>div{flex:1;max-width:225px;margin-left:auto;gap:6px}
+  .common-settings>.road-settings>span:first-child{white-space:nowrap}
+  .road-awareness{padding:7px 9px;border-radius:10px}
+  .telemetry{margin-top:0!important;padding:8px 0;border-radius:10px}
+  .control-panel{padding:0 11px 11px;border-radius:11px}
+  .telemetry-live{padding:3px 2px}
+  .session-strip{position:static;height:auto;padding:0;justify-content:flex-end}
+  .session-strip>button{position:static;min-height:40px;padding:0 5px}
+  .demo-note{min-height:0;padding-right:0;margin:0;font-size:10px}
+  .camera-top{min-height:40px;padding-left:9px;padding-right:6px}
+  .camera-title{font-size:11px;gap:5px}
+  .camera-icon,.view-switch{min-height:40px;min-width:40px}
+  .camera-viewport{aspect-ratio:1.95}
+  .camera-caption{left:10px;right:10px;bottom:7px}
+  .camera-caption>strong{font-size:13px;line-height:1.4}
+  .camera-mode{margin-bottom:2px;font-size:10px!important}
+  .camera-coordinates{margin-top:3px;font-size:9px!important}
+  .video-badges{top:8px;left:9px;right:9px}
+  .live-badge{font-size:10px!important}
+  .road-awareness .speed-sign{flex-basis:34px;width:34px;height:34px;font-size:16px}
+  .road-limit{gap:7px}
+  .highway-metrics .metric{padding:0 8px}
+  .highway-metrics .metric strong{font-size:23px}
+  .highway-metrics .metric>div:not(.battery-line){margin:4px 0 2px}
+  .highway-metrics .metric>span{font-size:10px!important}
+  .highway-metrics .metric-note{font-size:9px!important;line-height:1.35}
+  .mode-tabs .mode-tab{min-height:42px;font-size:12px}
+  .control-heading{padding-top:8px}
+  .control-panel .subtle{font-size:9px!important}
+  .gear-control{margin-top:7px;gap:8px}
+  .gear-options{max-width:225px;gap:6px}
+  .gear-options button{min-height:40px;font-size:12px}
+  .gear-options b{font-size:14px}
+  .gear-hint{margin:4px 0 0;line-height:1.4}
+  .highway-steering{padding:7px 0 6px;gap:8px}
+  .steer-button{width:58px;height:44px;flex-basis:58px;border-radius:9px}
+  .highway-steering>div{gap:1px}
+  .highway-steering>div .icon{width:22px;height:22px}
+  .highway-steering small{font-size:10px}
+  .lane-hint{margin-bottom:7px;font-size:10px;line-height:1.4}
+  .pedals{gap:7px;margin-bottom:8px}
+  .pedal{min-height:54px;gap:7px;border-radius:9px}
+  .pedal>span{font-size:15px}
+  .pedal small{font-size:10px;margin-top:0}
+  .pedal .icon{width:21px;height:21px}
+  .speed-control{padding-top:7px}
+  .speed-control input{min-height:34px;margin-top:0}
+  .road-settings{margin-top:7px;gap:7px}
+  .road-settings>div{padding:2px}
+  .road-settings button{min-height:40px;padding:3px 10px}
+  .normal-brake-button{min-height:42px;margin-top:8px}
+  .ai-shortcut{margin-top:8px;min-height:49px;padding:7px 8px;gap:7px}
+  .ai-shortcut>span:nth-child(2){font-size:12px}
+  .ai-shortcut small{font-size:10px!important}
+  .ai-intro,.auto-intro{padding:13px 0 10px}
+  .ai-orb{display:none}
+  .ai-intro h2,.auto-intro h2{font-size:19px;margin-bottom:4px}
+  .ai-intro p,.auto-intro p{font-size:11px!important;line-height:1.6}
+  .suggestions{gap:6px;margin-bottom:10px}
+  .suggestions>button{font-size:11px;min-height:42px}
+  .command-composer{padding:9px}
+  .ai-feedback{font-size:11px;margin-top:8px}
+  .auto-route-label{font-size:11px;margin-bottom:6px}
+  .auto-routes button{min-height:80px;padding:8px}
+  .auto-routes strong{font-size:12px}
+  .auto-routes small{font-size:10px}
+  .auto-status{margin:9px 0;padding:9px}
+  .auto-status strong{font-size:13px}
+  .auto-status p{font-size:11px}
+  .auto-note{font-size:10px;line-height:1.5}
+  .keyboard-legend{padding-top:8px;margin-top:8px;gap:3px 9px;font-size:9px}
+  .keyboard-legend small{font-size:9px}
+  .road-events,.lane-advice,.traffic-controls,.horn-feedback{padding:9px;border-radius:10px}
+  .road-event-label,.lane-advice-eyebrow{font-size:9px}
+  .road-event-icon{flex-basis:25px;height:28px;font-size:21px}
+  .road-events p,.road-events .exit-manual-note{font-size:10px;line-height:1.5}
+  .exit-preview,.entrance-preview{margin-top:7px;padding-top:7px}
+  .lane-advice p{font-size:10px;margin:6px 0}
+  .lane-advice-symbol{width:28px;height:30px}
+  .advice-lanes>div{padding:6px;gap:2px}
+  .lane-advice-note{font-size:9px;line-height:1.4}
+  .horn-feedback{gap:7px}
+  .horn-feedback strong{font-size:12px}
+  .horn-feedback p{font-size:10px}
+  .safety-bar{padding:9px 12px calc(9px + env(safe-area-inset-bottom))}
+  .safety-state strong{font-size:12px}
+  .safety-state small{font-size:10px!important}
+  .horn-button{min-height:44px}
+  .safety-inner .emergency-button,.safety-inner .reset-button{min-height:44px;font-size:12px}
+}
+@media(max-width:360px){
+  .app-shell{padding-left:9px;padding-right:9px}
+  .vehicle-id{font-size:9px}
+  .vehicle-id small{font-size:9px}
+  h1{font-size:18px}
+  .highway-metrics .metric strong{font-size:21px}
+  .highway-metrics .metric>span{font-size:9px!important}
+  .highway-metrics .metric-note{font-size:8px!important}
+  .control-panel{padding-left:9px;padding-right:9px}
+  .mode-tabs .mode-tab{font-size:11px}
+  .gear-options{max-width:205px}
+  .steer-button{width:52px;flex-basis:52px}
+  .safety-bar{padding-left:9px;padding-right:9px}
+}

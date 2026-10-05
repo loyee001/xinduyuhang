@@ -17,7 +17,8 @@ let trafficWorld=traffic.createState(car,{density:'medium'});
 const state={connected:true,mode:'manual',speedLimit:30,requestedGear:'forward',trafficDensity:'medium',autoLimitBraking:false,shiftPending:false,laneTarget:1,laneChanging:false,shoulderAlert:false,shoulderRecovery:false,wet:false,estop:false,serviceBrake:0,failsafe:false,plan:null,controls:new Map(),logs:[],trail:[[0,0]],latency:null,map:false,started:performance.now(),brakeAnchor:null,contactUntil:0,lastContactNotice:-Infinity,trafficInfo:null,lastInput:{throttle:0,brake:0,steering:0},predicted:0,pausedAt:null};
 let camera=null,cameraReady=false,lastFrame=performance.now(),lastRender=0,lastCameraFrame=0,toastTimer;
 state.laneAdvice=null;state.adviceCooldownUntil=0;
-state.exitActive=null;state.exitCompleted=false;state.exitCruise=false;
+state.exitActive=null;state.exitCompleted=false;state.exitCruise=false;state.exitStage=null;state.exitReturn=null;state.skippedExit=null;
+state.entranceActive=null;state.entranceStage=null;state.entranceReason='';state.highwayTraffic=null;state.localTraffic=null;
 state.autodrive={active:false,route:'cruise',decision:null,nextLaneCheck:0,reason:'选择行程后点击启动，车辆将自动控制油门和刹车。'};
 state.horn={lastAt:-Infinity,count:0,status:'idle',reason:'前车会在允许变道且车距安全时避让。',vehicleId:null,targetLane:null,vehicle:null};
 state.collision=null;
@@ -61,7 +62,7 @@ function finishWithCollision(kind,previousPose,contact=null){
   const travelHeading=previousPose.heading+(previousPose.gear==='reverse'?180:0);
   const slideTime=Math.max(.65,Math.min(1.7,launchSpeed*.65/7)),smokeDwell=1.2;
   const reducedMotion=!!window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
-  const other=trafficWorld.vehicles.find(vehicle=>vehicle.id===contact?.vehicleId);
+  const other=visibleTraffic().find(vehicle=>vehicle.id===contact?.vehicleId);
   const side=kind==='guardrail'?(car.x<0?1:-1):(other&&other.x!==car.x?Math.sign(car.x-other.x):1);
   const heading=previousPose.heading*Math.PI/180;
   const lateral=other?(other.x-previousPose.x)*Math.cos(heading)-(other.y-previousPose.y)*Math.sin(heading):0;
@@ -227,7 +228,14 @@ window.addEventListener('pointerup',event=>releaseDrive('p'+event.pointerId));
 window.addEventListener('pointercancel',event=>releaseDrive('p'+event.pointerId,true));
 function requestLaneChange(direction,{fromPlan=false}={}){
   if(![-1,1].includes(direction)||!available())return false;
-  if(state.exitActive){if(!fromPlan)toast(state.exitCompleted?'普通道路双向各一条车道，请保持本车道，不能跨越双黄线':'已选择出口路线，请沿匝道驶离或在入口前取消');return false;}
+  if(state.entranceActive){if(!fromPlan)toast('正在沿入口匝道行驶，汇入高速后可以变道');return false;}
+  if(state.exitCompleted&&direction===-1&&!fromPlan)return requestCityEntrance();
+  if(state.exitActive){
+    if(!fromPlan&&direction===-1&&state.exitStage==='deceleration'){
+      beginExitReturn('已取消驶出，沿连接道返回右车道');render();return true;
+    }
+    if(!fromPlan)toast(state.exitCompleted?'普通道路双向各一条车道，请保持本车道，不能跨越双黄线':state.exitReturn?'正在沿连接道返回主路':'沿匝道行驶；超速将自动返回主路');return false;
+  }
   if(state.shoulderRecovery){toast('正在返回右车道，完成后可继续变道');return false;}
   if(state.laneChanging&&!laneControl.isCentered(car,laneCenters[state.laneTarget])){
     // A pending change can be cancelled while parked; a held/repeated input
@@ -238,6 +246,13 @@ function requestLaneChange(direction,{fromPlan=false}={}){
   }
   const target=state.laneTarget+direction;
   if(target<0||target>3){toast(target<0?'已经是最左侧车道':'右侧已无可用车道');return false;}
+  if(target===3){
+    if(fromPlan){toast('出口需手动向右变道，AI 只能协助靠右准备');return false;}
+    const exit=nextExitForRoute();
+    if(exit&&car.y>=exit.entryStart&&car.y<exit.splitStart){
+      return requestExit({manual:true,exit});
+    }
+  }
   const rule=roadModel.canChangeLane(car.y,{speed:car.speed,gear:car.gear,targetSpeed:effectiveTarget(state.autodrive.active?100:state.speedLimit)});
   if(!rule.allowed){if(!fromPlan)toast(rule.reason);return false;}
   if(!fromPlan)cancelPlan('手动变道接管');state.laneTarget=target;state.laneChanging=true;
@@ -255,6 +270,7 @@ function getLaneAdvice(){
   const rule=roadModel.canChangeLane(car.y,{speed:car.speed,gear:car.gear,targetSpeed:effectiveTarget(state.autodrive.active?100:state.speedLimit)});
   let reason='';
   if(state.collision)reason='本次驾驶发生碰撞，重新开始后再评估车道。';
+  else if(state.entranceActive)reason='正在沿入口匝道返回高速，汇入后恢复变道建议。';
   else if(state.exitActive)reason=state.exitCompleted?'普通道路双向各一条车道，保持本车道，禁止跨越双黄线。':'正在沿出口路线行驶，暂停普通车道建议。';
   else if(!rule.allowed)reason=rule.reason;
   else if(state.estop||state.failsafe||!state.connected||!cameraReady)reason='制动锁定或连接不可用，暂停变道建议。';
@@ -274,7 +290,7 @@ function renderLaneAdvice(){
   document.querySelector('.advice-lanes').hidden=state.exitCompleted;
   const title=state.collision?'碰撞结束 · 建议已暂停':recommended?`推荐向${advice.direction==='left'?'左':'右'}变道`:
     advice.status==='keep'?'保持当前车道':advice.status==='blocked'?'暂不建议变道':
-    state.exitCompleted?'普通道路 · 保持本车道':state.laneChanging?'正在完成变道':advice.reason==='车速较低，起步后再评估变道'?'起步后评估车流':'变道建议已暂停';
+    state.entranceActive?'入口匝道 · 正在汇入':state.exitCompleted?'普通道路 · 保持本车道':state.laneChanging?'正在完成变道':advice.reason==='车速较低，起步后再评估变道'?'起步后评估车流':'变道建议已暂停';
   $('lane-advice').dataset.status=advice.status;
   $('lane-advice-title').textContent=title;$('lane-advice-reason').textContent=advice.reason;
   $('lane-advice-icon').textContent=recommended?(advice.direction==='left'?'←':'→'):advice.status==='blocked'?'Ⅱ':'↑';
@@ -327,12 +343,33 @@ window.addEventListener('blur',()=>{if(car.speed>.01||state.controls.size||state
 document.addEventListener('visibilitychange',()=>{if(state.collision){if(document.hidden)finishCollisionAnimation({draw:false});else collisionFramePending=true;lastFrame=performance.now();return;}if(document.hidden){state.pausedAt=performance.now();failSafe('页面进入后台，自动制动已触发');camera?.pause();}else{const elapsed=state.pausedAt===null?0:(performance.now()-state.pausedAt)/1000;advanceElapsed(Math.min(elapsed,60),true);state.pausedAt=null;lastFrame=performance.now();lastCameraFrame=0;render();}});
 window.addEventListener('pagehide',()=>{if(state.collision){finishCollisionAnimation({draw:false});return;}state.controls.clear();state.failsafe=true;cancelPlan('页面离开');});
 $('normal-stop').onclick=()=>requestBrake('常规制动：持续刹车至完全停止');$('emergency-stop').onclick=emergencyStop;$('reset-estop').onclick=releaseEmergency;
-function currentRoadType(){return state.exitCompleted?'local':state.exitActive?'ramp':'highway';}
-function currentRoadCap(){return (state.exitCompleted?roadModel.localRoad.speedLimitKmh:state.exitActive?40:traffic.limitAt(car.y))/3.6;}
+function currentRoadType(){return state.entranceActive?'entrance':state.exitCompleted?'local':state.exitStage==='ramp'?'ramp':'highway';}
+function currentRoadCap(){return (state.entranceActive?(car.y<state.entranceActive.crossingEnd?20:Math.min(60,traffic.limitAt(car.y))):state.exitCompleted?roadModel.localRoad.speedLimitKmh:state.exitStage==='ramp'?roadModel.constants.rampLimitKmh:traffic.limitAt(car.y))/3.6;}
+function backgroundTraffic(){return state.highwayTraffic||state.localTraffic;}
+function visibleTraffic(){return backgroundTraffic()?[...trafficWorld.vehicles,...backgroundTraffic().vehicles]:trafficWorld.vehicles;}
+function separateTrafficIds(){
+  const background=backgroundTraffic();if(!background)return;
+  const used=new Set(trafficWorld.vehicles.map(vehicle=>vehicle.id));
+  let next=Math.max(10000,trafficWorld.nextEntranceId,background.nextEntranceId,...visibleTraffic().map(vehicle=>vehicle.id+1));
+  for(const vehicle of background.vehicles){if(used.has(vehicle.id))vehicle.id=next++;used.add(vehicle.id);}
+  trafficWorld.nextEntranceId=next+10000;background.nextEntranceId=next+20000;
+}
+function handoffCityTraffic(){
+  const city=trafficWorld.roadType==='local'?trafficWorld:state.localTraffic;
+  const highway=trafficWorld.roadType==='highway'?trafficWorld:state.highwayTraffic;
+  if(!city||!highway)return;
+  // Late exit arrivals join the same leader/follower calculation as the city
+  // traffic. Ownership moves once, before either population is stepped.
+  const arriving=highway.vehicles.filter(vehicle=>vehicle.exitRoute&&vehicle.x>=26.5);
+  if(!arriving.length)return;
+  const moved=new Set(arriving);highway.vehicles=highway.vehicles.filter(vehicle=>!moved.has(vehicle));
+  for(const vehicle of arriving){vehicle.lane=0;vehicle.exitRoute.localTraffic=true;vehicle.fromEntrance=false;city.vehicles.push(vehicle);}
+}
 function effectiveTarget(target,gear=state.requestedGear){return Math.min(target,currentRoadCap(),gear==='reverse'?physics.constants.maxReverseSpeed:100);}
 function motionHeading(){return (car.heading+(car.gear==='reverse'?180:0))%360;}
 function setGear(gear){
   if(!['forward','reverse'].includes(gear)||gear===state.requestedGear||!available())return;
+  if(state.entranceActive){toast('入口匝道内请保持前进挡');return;}
   if(state.exitActive&&!state.exitCompleted){toast('出口匝道内保持前进挡，进入普通道路后可以倒车');return;}
   cancelPlan('手动换挡');state.controls.clear();state.requestedGear=gear;state.serviceBrake=0;state.failsafe=false;state.brakeAnchor=null;
   state.shiftPending=car.gear!==gear;
@@ -343,50 +380,133 @@ $('gear-forward').onclick=()=>setGear('forward');$('gear-reverse').onclick=()=>s
 document.querySelectorAll('[data-density]').forEach(button=>button.onclick=()=>{
   if(state.collision)return;
   const density=button.dataset.density;if(!traffic.densityPresets[density]||density===state.trafficDensity)return;
-  traffic.setDensity(trafficWorld,car,density);state.trafficDensity=density;state.contactUntil=0;
+  traffic.setDensity(trafficWorld,car,density);
+  if(backgroundTraffic())traffic.setDensity(backgroundTraffic(),car,density);
+  separateTrafficIds();state.trafficDensity=density;state.contactUntil=0;
   log(`车流切换为${traffic.densityPresets[density].label}，已重新布置周围车辆`);render();
 });
 $('speed-slider').oninput=event=>{if(state.collision)return;const value=Number(event.target.value),max=state.requestedGear==='reverse'?physics.constants.maxReverseSpeed:100;if(!Number.isFinite(value)||value<1||value>max)return;state.speedLimit=value;render();};
 function setRoad(wet){if(state.collision)return;if(car.braking){toast('请在本次制动结束后切换路面');return;}state.wet=wet;state.brakeAnchor=null;log(`路面切换为${wet?'湿滑':'干燥'}，摩擦系数 ${wet?.45:.85}`);render();}
 $('dry-road').onclick=()=>setRoad(false);$('wet-road').onclick=()=>setRoad(true);
-function nextExitForRoute(){return roadModel.eventsAround(car.y,7000).exits.filter(exit=>exit.entryStart+25>=car.y).sort((a,b)=>a.entryStart-b.entryStart)[0]||null;}
-function requestExit({fromPlan=false,exit=null}={}){
-  if(!available()||state.exitActive)return false;
+function nextExitForRoute(){return roadModel.eventsAround(car.y,7000).exits.filter(exit=>exit.id!==state.skippedExit&&exit.splitStart>=car.y).sort((a,b)=>a.entryStart-b.entryStart)[0]||null;}
+function requestExit({manual=false,exit=null}={}){
+  if(!manual||!available()||state.exitActive)return false;
   const selected=exit||nextExitForRoute();
   let reason='';
-  if(car.gear!=='forward'||state.requestedGear!=='forward'||state.shiftPending)reason='驶入出口需要前进挡';
-  else if(state.shoulderAlert||state.shoulderRecovery||state.laneTarget!==2||state.laneChanging||!laneControl.isCentered(car,laneCenters[2]))reason='请先到达右车道中央，再驶入出口';
-  else if(!selected||car.y<selected.entryStart-300)reason='出口尚未进入可驶入范围，请按距离提示继续前进';
-  else if(car.y>selected.entryStart+25)reason='已错过这个出口，请继续驶向下一个出口';
-  if(reason){if(!fromPlan)toast(reason);return false;}
-  if(!fromPlan)cancelPlan('手动选择出口路线');
-  state.exitActive=selected;state.exitCompleted=false;state.requestedGear='forward';
-  log(`已选择${selected.name}，减速至 40 km/h 后沿匝道驶离`);render();return true;
+  if(car.gear!=='forward'||state.requestedGear!=='forward'||state.shiftPending)reason='驶入减速车道需要前进挡';
+  else if(state.shoulderAlert||state.shoulderRecovery||state.laneTarget!==2||state.laneChanging||!laneControl.isCentered(car,laneCenters[2]))reason='请先到达右车道中央，再向右变道';
+  else if(!selected||car.y<selected.entryStart)reason='减速车道尚未开始，请继续沿主路行驶';
+  else if(car.y>selected.splitStart-Math.max(35,car.speed*8))reason='已没有足够距离完成出口变道，请继续沿主路行驶';
+  else {const rule=roadModel.canChangeLane(car.y,{speed:car.speed,gear:car.gear,targetSpeed:car.speed});if(!rule.allowed)reason=rule.reason;}
+  if(reason){toast(reason);return false;}
+  cancelPlan('手动向右变道进入减速车道');
+  state.exitActive=selected;state.exitStage='deceleration';state.exitReturn=null;state.exitCompleted=false;
+  state.laneTarget=3;state.laneChanging=true;state.requestedGear='forward';state.autoLimitBraking=false;
+  log(`正在进入${selected.name}减速车道，请手动减至 40 km/h；匝道超速会返回主路`);render();return true;
 }
-$('exit-action').onclick=()=>{
-  if(state.collision)return;
-  if(state.exitActive){
-    if(state.exitCompleted)return;
-    if(car.y<state.exitActive.entryStart){cancelPlan('取消出口路线');state.exitActive=null;log('已取消出口路线，继续沿右车道行驶');render();}
-    return;
-  }
-  requestExit();
-};
+function beginExitReturn(reason){
+  if(!state.exitActive||state.exitReturn||state.exitCompleted)return;
+  cancelPlan(reason);state.exitReturn=roadModel.createExitReturn(state.exitActive,car);
+  state.exitStage='returning';state.skippedExit=state.exitActive.id;state.laneChanging=true;state.laneTarget=2;
+  state.autoLimitBraking=false;log(reason);toast(reason);
+}
 function routeSteering(){
+  if(state.entranceActive){
+    const entry=state.entranceActive,ahead=1.5*Math.max(5.5,car.speed*(state.wet?1.7:1.4));
+    if(entry.cityYielding)return laneControl.steeringFor(car,roadModel.localRoad.laneCenter,{wet:state.wet});
+    const y=state.entranceStage==='merging'?car.y+ahead:Math.min(entry.mergeStart,car.y+ahead);
+    return laneControl.steeringFor(car,roadModel.centerForCityEntrance(entry,y),{wet:state.wet});
+  }
   if(!state.exitActive)return laneControl.steeringFor(car,laneCenters[state.laneTarget],{wet:state.wet});
   if(state.exitCompleted)return laneControl.steeringFor(car,roadModel.localRoad.laneCenter,{wet:state.wet});
   const ahead=1.5*Math.max(5.5,car.speed*(state.wet?1.7:1.4));
-  return laneControl.steeringFor(car,roadModel.centerForExit(state.exitActive,car.y+ahead),{wet:state.wet});
+  const target=state.exitReturn?roadModel.centerForReturn(state.exitReturn,car.y+ahead):
+    state.exitStage==='deceleration'?state.exitActive.decelerationCenter:roadModel.centerForExit(state.exitActive,car.y+ahead);
+  return laneControl.steeringFor(car,target,{wet:state.wet});
 }
 function updateExitState(){
-  if(state.exitActive&&!state.exitCompleted&&car.y>=state.exitActive.rampEnd){
-    state.exitCompleted=true;
-    trafficWorld=traffic.transitionToLocal(trafficWorld,car,state.exitActive);
-    log(`已从${state.exitActive.name}驶入普通道路，限速 50 km/h，可继续行驶`);
+  const exit=state.exitActive;if(!exit||state.exitCompleted)return;
+  if(state.exitReturn){
+    if(car.y>=state.exitReturn.end&&laneControl.isCentered(car,laneCenters[2])){
+      state.exitActive=null;state.exitReturn=null;state.exitStage=null;state.laneChanging=false;
+      state.adviceCooldownUntil=car.elapsedTime+5;log('已返回高速右车道，可继续正常行驶');
+    }
+    return;
+  }
+  if(state.exitStage==='deceleration'){
+    if(laneControl.isCentered(car,exit.decelerationCenter))state.laneChanging=false;
+    if(car.y<exit.splitStart)return;
+    if(car.speed>roadModel.constants.rampLimitKmh/3.6+.01){beginExitReturn('超过匝道限速 40 km/h，取消驶出并返回主路');return;}
+    if(Math.abs(car.x-exit.decelerationCenter)>.5){beginExitReturn('未完成减速车道变道，取消驶出并返回主路');return;}
+    state.exitStage='ramp';state.laneChanging=false;log('已进入出口匝道，保持 40 km/h 以内继续行驶');
+  }
+  if(car.speed>roadModel.constants.rampLimitKmh/3.6+.01){beginExitReturn('匝道超速，沿连接道自动返回高速主路');return;}
+  if(car.y>=exit.rampEnd){
+    state.exitCompleted=true;state.exitStage='local';state.laneTarget=2;state.laneChanging=false;
+    const highway=trafficWorld;
+    trafficWorld=state.localTraffic||traffic.transitionToLocal(highway,car,exit);
+    state.localTraffic=null;state.highwayTraffic=highway;
+    const transferred=new Set(trafficWorld.vehicles);
+    highway.vehicles=highway.vehicles.filter(vehicle=>!transferred.has(vehicle));separateTrafficIds();
+    log(`已从${exit.name}驶入普通道路，限速 50 km/h，可继续行驶`);
+  }
+}
+function requestCityEntrance(){
+  const entry=roadModel.getState(car.y).nextCityEntrance;
+  let reason='';
+  if(!state.exitCompleted||state.entranceActive)return false;
+  if(car.gear!=='forward'||state.requestedGear!=='forward'||state.shiftPending)reason='驶入高速入口需要前进挡';
+  else if(!entry||car.y<entry.cityEntryStart||car.y>entry.cityEntryEnd)reason='请到达下一个高速入口路口，再手动向左驶入';
+  else if(car.speed>20/3.6+.01)reason='请先减至 20 km/h 以内，再向左驶入高速入口';
+  else if(!laneControl.isCentered(car,roadModel.localRoad.laneCenter))reason='请先在城市道路本车道内回正居中';
+  else {const gap=traffic.cityEntranceAllowed(trafficWorld,car,entry,{wet:state.wet,targetSpeed:Math.min(state.speedLimit,20/3.6)});if(!gap.allowed)reason=gap.reason;}
+  if(reason){toast(reason);return false;}
+  cancelPlan('手动左转驶入高速入口');switchMode('manual');
+  if(!state.highwayTraffic)state.highwayTraffic=traffic.createHighwayFromLocal(trafficWorld,car);
+  separateTrafficIds();state.entranceActive=roadModel.createCityEntrance(entry,car);
+  state.entranceStage='joining';state.entranceReason='低速通过路口，再沿入口匝道前进';
+  state.laneChanging=true;state.autoLimitBraking=false;
+  log(`正在从${entry.name}驶回高速，路口限速 20 km/h，请让行后继续`);render();return true;
+}
+function updateEntranceState(){
+  const entry=state.entranceActive;if(!entry)return;
+  // A parked selection is not a permanent right of way. Recheck while still
+  // in the city lane, including after waiting or releasing the accelerator.
+  if(!entry.cityCrossingStarted){
+    const approaching=trafficWorld.vehicles.find(vehicle=>vehicle.id===entry.cityYieldVehicle&&vehicle.direction<0&&vehicle.y+vehicle.length/2>=car.y-4);
+    const gap=approaching?{allowed:false,oncoming:true,vehicleId:approaching.id,reason:'正在让行对向车辆，待其通过路口后再起步'}:
+      traffic.cityEntranceAllowed(trafficWorld,car,entry,{wet:state.wet,targetSpeed:Math.min(state.speedLimit,20/3.6)});
+    if(!gap.allowed){entry.cityYielding=true;entry.cityYieldVehicle=gap.oncoming?gap.vehicleId:null;state.entranceReason=gap.reason;}
+    else if(entry.cityYielding){
+      Object.assign(entry,roadModel.createCityEntrance(entry,car),{cityYielding:false});
+      state.entranceReason='对向车已通过，可以低速左转';
+    }
+    if(!entry.cityYielding&&car.x<28.7)entry.cityCrossingStarted=true;
+  }
+  if(state.entranceStage!=='merging'&&car.y>=entry.mergeStart-55){
+    const gap=traffic.highwayMergeAllowed(state.highwayTraffic,car,{wet:state.wet});
+    state.entranceReason=gap.reason;
+    if(gap.allowed){state.entranceStage='merging';log('高速右车道间隙足够，沿加速车道汇入');}
+    else state.entranceStage='waiting';
+  }
+  if(state.entranceStage==='merging'&&car.y>=entry.mergeEnd&&laneControl.isCentered(car,laneCenters[2])){
+    state.localTraffic=trafficWorld;trafficWorld=state.highwayTraffic;state.highwayTraffic=null;
+    state.entranceActive=null;state.entranceStage=null;state.entranceReason='';
+    state.exitActive=null;state.exitCompleted=false;state.exitStage=null;state.exitReturn=null;state.exitCruise=false;
+    state.laneTarget=2;state.laneChanging=false;state.adviceCooldownUntil=car.elapsedTime+5;
+    log('已汇入高速右车道，恢复高速限速及正常变道');
   }
 }
 function renderEntrance(section){
   const panel=$('entrance-preview');
+  if(state.exitCompleted||state.entranceActive){
+    const entry=state.entranceActive||section.nextCityEntrance;panel.hidden=!entry;if(!entry)return;
+    const distance=Math.max(0,entry.cityEntryStart-car.y),open=!state.entranceActive&&car.y>=entry.cityEntryStart&&car.y<=entry.cityEntryEnd;
+    panel.classList.toggle('nearby',distance<300);panel.classList.toggle('joining',!!state.entranceActive);
+    $('entrance-name').textContent=entry.name+' · 返回高速';
+    $('entrance-detail').textContent=state.entranceActive?`距高速汇入 ${Math.max(0,Math.ceil(entry.mergeEnd-car.y))} m`:open?'入口已开放 · 减至 20 km/h 后手动向左':`前方 ${Math.ceil(distance)} m · 左转进入高速入口`;
+    $('entrance-status').textContent=state.collision?'本局已结束，入口行驶已暂停':state.entranceActive?state.entranceReason:'路口让行对向车；按 A / ← 或左变道进入，错过后继续找下一处';return;
+  }
   const reversing=car.gear==='reverse';
   const entrance=section.activeEntrance||(reversing?
     roadModel.eventsAround(car.y,4000).entrances?.filter(entry=>entry.start<car.y).at(-1):section.nextEntrance);
@@ -409,12 +529,12 @@ function renderEntrance(section){
 function renderRoadEvents(){
   const section=roadModel.getState(car.y),rule=roadModel.canChangeLane(car.y,{speed:car.speed,gear:car.gear,targetSpeed:effectiveTarget(state.autodrive.active?100:state.speedLimit)});
   renderEntrance(section);
-  $('road-rule-title').textContent=state.exitCompleted?'普通道路 · 限速 50 km/h':state.exitActive?'出口匝道 · 限速 40 km/h':section.solid?'实线路段 · 禁止变道':!rule.allowed?'前方实线 · 暂缓变道':'虚线路段 · 可变道';
-  $('road-rule-detail').textContent=state.exitCompleted?'双向各一条车道 · 保持右侧行驶，不得跨越双黄线':state.exitActive?'沿匝道接入普通道路，进入后可继续行驶':!rule.allowed?rule.reason:`前方 ${Math.max(0,Math.ceil(section.nextSolid?.distance||0))} m 进入实线路段`;
+  $('road-rule-title').textContent=state.entranceActive?'高速入口 · '+(car.y<state.entranceActive.crossingEnd?'路口限速 20 km/h':'匝道限速 60 km/h'):state.exitCompleted?'普通道路 · 限速 50 km/h':state.exitReturn?'返回高速主路':state.exitStage==='deceleration'?'减速车道 · 手动减速':state.exitActive?'出口匝道 · 限速 40 km/h':section.solid?'实线路段 · 禁止变道':!rule.allowed?'前方实线 · 暂缓变道':'虚线路段 · 可变道';
+  $('road-rule-detail').textContent=state.entranceActive?state.entranceReason:state.exitCompleted?'双向各一条车道 · 仅可在高速入口的标线路口低速左转':state.exitReturn?'沿连接道驶回右车道，油门和刹车仍由你控制':state.exitStage==='deceleration'?'分流前手动减至 40 km/h；向左可取消驶出':state.exitActive?'匝道超速会自动返回主路；限速内可继续驶入普通道路':!rule.allowed?rule.reason:`前方 ${Math.max(0,Math.ceil(section.nextSolid?.distance||0))} m 进入实线路段`;
   $('road-events').classList.toggle('solid-zone',!rule.allowed&&!state.exitActive);$('road-events').classList.toggle('exiting',!!state.exitActive);
-  const exit=state.exitActive||nextExitForRoute(),button=$('exit-action');
+  const exit=state.exitActive||nextExitForRoute();
   $('exit-name').textContent=exit?exit.name:'出口信息加载中';
-  $('exit-detail').textContent=state.exitActive?(state.exitCompleted?`已接入普通道路 · 继续行驶 ${Math.max(0,Math.floor(car.y-exit.rampEnd))} m`:`接入普通道路 · 还有 ${Math.max(0,Math.ceil(exit.rampEnd-car.y))} m`):exit?`入口 ${Math.max(0,Math.ceil(exit.entryStart-car.y))} m · 从右车道驶入`:'继续沿高速行驶';
+  $('exit-detail').textContent=state.exitActive?(state.exitCompleted?`已接入普通道路 · 继续行驶 ${Math.max(0,Math.floor(car.y-exit.rampEnd))} m`:state.exitReturn?`返回右车道 · 还有 ${Math.max(0,Math.ceil(state.exitReturn.end-car.y))} m`:state.exitStage==='deceleration'?`距分流 ${Math.max(0,Math.ceil(exit.splitStart-car.y))} m · 请手动减至 40 km/h`:`接入普通道路 · 还有 ${Math.max(0,Math.ceil(exit.rampEnd-car.y))} m`):exit?car.y>=exit.entryStart?`减速车道已开放 · 距分流 ${Math.ceil(exit.splitStart-car.y)} m · 手动右变道`:`减速车道 ${Math.ceil(exit.entryStart-car.y)} m · 提前靠右`:'继续沿高速行驶';
   const trafficExit=state.exitActive||section.activeExit||exit;
   const exiting=(state.trafficInfo?.exiting?.list||[]).filter(vehicle=>vehicle.exitId===trafficExit?.id);
   const leaving=exiting.filter(vehicle=>vehicle.status==='ramp').length;
@@ -424,8 +544,7 @@ function renderRoadEvents(){
     approaching?`${approaching} 辆右车道车辆正减速准备驶离`:'部分右车道车辆会从出口驶离';
   $('exit-traffic-status').hidden=state.exitCompleted;
   if($('exit-traffic-status').textContent!==exitTrafficStatus)$('exit-traffic-status').textContent=exitTrafficStatus;
-  button.textContent=state.exitActive?(state.exitCompleted?'普通道路行驶中':car.y<exit.entryStart?'取消驶离':'沿匝道行驶中'):'驶入这个出口';
-  button.disabled=state.exitActive?(state.exitCompleted?true:car.y>=exit.entryStart):(!exit||car.y<exit.entryStart-300||car.y>exit.entryStart+25||state.laneTarget!==2||state.laneChanging||car.gear!=='forward'||state.estop||!state.connected||!cameraReady);
+
 }
 function parseCommand(raw){
   if(typeof raw!=='string'||!raw.trim()||raw.length>240)throw new Error('请输入 1～240 字的指令。');
@@ -455,6 +574,7 @@ document.querySelectorAll('[data-command]').forEach(button=>button.onclick=()=>{
 function startPlan({fromAuto=false}={}){
   const plan=state.plan;
   if(plan?.status!=='ready'||!available())return false;
+  if(state.entranceActive||state.exitActive&&!state.exitCompleted){toast('连接道路请手动控制油门与刹车');return false;}
   if(state.exitActive&&!state.exitCompleted&&(plan.gear==='reverse'||plan.steps?.some((step,index)=>step.gear==='reverse'&&!plan.steps.slice(0,index).some(prior=>prior.type==='exit')))){toast('出口匝道内保持前进，请在进入普通道路后倒车');return false;}
   if(state.exitCompleted&&plan.steps?.some(step=>step.type==='exit'||step.type==='lane')){toast('当前为双向单车道普通道路，请选择直行、调速、停车或倒车任务');return false;}
   if(!fromAuto)stopAutodrive('开始新的 AI 任务');
@@ -534,12 +654,17 @@ function updateSequencePlan(plan){
     if(!plan.laneStarted)plan.laneStarted=attemptPlanLane(plan,step.direction);
     else if(!state.laneChanging&&laneControl.isCentered(car,laneCenters[plan.laneGoal]))finishSequenceStep(plan);
   }else if(step.type==='exit'){
-    if(state.exitActive){sequenceWait(plan,state.exitCompleted?'已接入普通道路，限速 50 km/h':'沿出口匝道行驶，限速 40 km/h');if(state.exitCompleted)finishSequenceStep(plan);return;}
-    if(!plan.routeExit||car.y>plan.routeExit.entryStart+25){blockSequence(plan,'未能在出口前完成靠右变道，已错过本次出口；请重新选择行程');return;}
+    if(!plan.routeExit||car.y>plan.routeExit.splitStart-Math.max(35,car.speed*8)){
+      plan.routeExit=nextExitForRoute();
+      if(!plan.routeExit){blockSequence(plan,'暂未找到下一个出口');return;}
+    }
     if(state.laneTarget<2){attemptPlanLane(plan,1);return;}
     if(state.laneChanging){sequenceWait(plan,'正在进入右车道');return;}
-    if(car.y<plan.routeExit.entryStart-300){sequenceWait(plan,`保持右车道，距离出口入口 ${Math.ceil(plan.routeExit.entryStart-car.y)} 米`);return;}
-    if(requestExit({fromPlan:true,exit:plan.routeExit}))sequenceWait(plan,'已选择出口，减速后沿匝道驶离');
+    if(car.y<plan.routeExit.entryStart-300){sequenceWait(plan,`保持右车道，距离减速车道 ${Math.ceil(plan.routeExit.entryStart-car.y)} 米`);return;}
+    plan.status='handoff';plan.waitingReason='已靠右准备。请自己减速，并在减速车道开放后向右变道；后续步骤不再自动执行。';
+    stopAutodrive('出口准备完成，等待手动减速及右变道');state.controls.clear();state.serviceBrake=0;
+    $('ai-feedback').textContent=plan.waitingReason;log(plan.waitingReason);switchMode('manual');renderPlan();
+
   }
 }
 function sequenceTarget(plan){
@@ -547,13 +672,13 @@ function sequenceTarget(plan){
   // While waiting for a legal gap, follow the current vehicle instead of
   // repeatedly running into it. This controller only belongs to AI plans.
   if(plan.gear==='forward'){
-    const ahead=traffic.getSnapshot(trafficWorld,{...car,exitRoute:state.exitActive}).nearestAhead;
+    const ahead=traffic.getSnapshot(trafficWorld,{...car,exitRoute:state.exitActive,exitReturn:state.exitReturn}).nearestAhead;
     if(ahead){const frontSpeed=ahead.speedKmh/3.6,gap=Math.max(12,car.speed*1.8);target=Math.min(target,Math.max(0,frontSpeed+(ahead.distance-gap)*.3));}
   }
   return target;
 }
 $('task-action').onclick=()=>{if(state.collision)return;if(state.plan?.status==='ready')startPlan();else if(state.plan?.status==='running'||state.exitCruise)requestBrake('停止 AI 任务，持续常规制动');else{state.plan=null;renderPlan();}};
-function renderPlan(){const plan=state.plan;$('task-card').hidden=!plan;if(!plan)return;if(plan.kind==='brake-test'&&plan.phase===0)plan.labels[0]=brakingTargetLabel(plan.target);const status={ready:'待确认',running:plan.kind==='sequence'?(plan.waitingReason?'等待 / 执行中':'执行中'):plan.phase?'制动中':'执行中',blocked:'受阻 · 制动停车',completed:state.exitCruise?'已驶离 · 巡航中':'已完成',limited:'未达目标 · 已结束',cancelled:state.collision?'碰撞结束':car.speed>.01?(state.lastInput.brake>0?'已取消 · 制动中':'已取消 · 滑行中'):'已取消'};$('task-badge').textContent=status[plan.status];$('task-waiting').hidden=!plan.waitingReason;$('task-waiting').textContent=plan.waitingReason||'';$('task-steps').replaceChildren();plan.labels.forEach((label,index)=>{const li=document.createElement('li'),number=document.createElement('span'),text=document.createElement('span');number.className='step-number';const done=plan.status==='completed'||index<plan.phase;number.textContent=done?'✓':String(index+1);text.textContent=label;li.className=done?'done':plan.status==='running'&&index===plan.phase?'current':'';li.append(number,text);$('task-steps').append(li);});const action=$('task-action');action.replaceChildren();const icon=document.createElement('i'),text=document.createElement('span');icon.dataset.icon=plan.status==='running'||state.exitCruise?'stop':plan.status==='ready'?'play':'refresh';text.textContent=state.exitCruise?'结束巡航并制动':plan.status==='running'?'取消并制动':plan.status==='ready'?'开始执行':'新的任务';action.append(icon,text);paintIcons(action);}
+function renderPlan(){const plan=state.plan;$('task-card').hidden=!plan;if(!plan)return;if(plan.kind==='brake-test'&&plan.phase===0)plan.labels[0]=brakingTargetLabel(plan.target);const status={ready:'待确认',running:plan.kind==='sequence'?(plan.waitingReason?'等待 / 执行中':'执行中'):plan.phase?'制动中':'执行中',blocked:'受阻 · 制动停车',handoff:'已交回手动',completed:state.exitCruise?'已驶离 · 巡航中':'已完成',limited:'未达目标 · 已结束',cancelled:state.collision?'碰撞结束':car.speed>.01?(state.lastInput.brake>0?'已取消 · 制动中':'已取消 · 滑行中'):'已取消'};$('task-badge').textContent=status[plan.status];$('task-waiting').hidden=!plan.waitingReason;$('task-waiting').textContent=plan.waitingReason||'';$('task-steps').replaceChildren();plan.labels.forEach((label,index)=>{const li=document.createElement('li'),number=document.createElement('span'),text=document.createElement('span');number.className='step-number';const done=plan.status==='completed'||index<plan.phase;number.textContent=done?'✓':String(index+1);text.textContent=label;li.className=done?'done':plan.status==='running'&&index===plan.phase?'current':'';li.append(number,text);$('task-steps').append(li);});const action=$('task-action');action.replaceChildren();const icon=document.createElement('i'),text=document.createElement('span');icon.dataset.icon=plan.status==='running'||state.exitCruise?'stop':plan.status==='ready'?'play':'refresh';text.textContent=state.exitCruise?'结束巡航并制动':plan.status==='running'?'取消并制动':plan.status==='ready'?'开始执行':'新的任务';action.append(icon,text);paintIcons(action);}
 function updatePlan(){
   const plan=state.plan;if(plan?.status!=='running')return;
   if(plan.kind==='sequence'){updateSequencePlan(plan);return;}
@@ -584,6 +709,7 @@ function prepareAutoExit(preferredExit=null){
 }
 function startAutodrive(){
   if(!available())return false;
+  if(state.entranceActive||state.exitActive&&!state.exitCompleted){toast('连接道路请手动控制油门与刹车，回到主路后可启动自动驾驶');return false;}
   if(state.shoulderAlert||state.shoulderRecovery){toast('请先停稳并返回正常车道，再启动自动驾驶');return false;}
   const route=state.autodrive.route;
   cancelPlan('切换为全自动驾驶');switchMode('auto');
@@ -591,7 +717,7 @@ function startAutodrive(){
   state.requestedGear='forward';state.shiftPending=car.gear!=='forward';
   Object.assign(state.autodrive,{active:true,route,decision:null,nextLaneCheck:0,reason:'正在接管油门、刹车和车道控制'});
   if(route==='exit'&&!state.exitCompleted)prepareAutoExit();
-  log(route==='exit'&&!state.exitCompleted?'全自动驾驶启动：自动靠右，从下一个可用出口驶离':'全自动驾驶启动：按道路限速持续巡航');
+  log(route==='exit'&&!state.exitCompleted?'出口准备辅助启动：自动靠右，驶出需手动减速及右变道':'全自动驾驶启动：按道路限速持续巡航');
   updateAutodrive();renderPlan();render();return true;
 }
 function updateAutodrive(){
@@ -621,7 +747,7 @@ function renderAutodrive(){
   const auto=state.autodrive,decision=auto.decision;
   const labels={cruising:'自动巡航中',following:'自动跟车中',braking:'自动制动中','anticipating-limit':'前方降速 · 提前制动',changing:'自动变道中',shifting:'停稳换挡中',waiting:'等待通行条件',locked:'自动制动中'};
   $('auto-status-card').classList.toggle('active',auto.active);
-  $('auto-status-title').textContent=auto.active?(auto.route==='exit'&&!state.exitCompleted?'自动驶向出口':labels[decision?.status]||'自动驾驶中'):'自动驾驶待命';
+  $('auto-status-title').textContent=auto.active?(auto.route==='exit'&&!state.exitCompleted?'出口准备辅助':labels[decision?.status]||'自动驾驶中'):'自动驾驶待命';
   if($('auto-status-reason').textContent!==auto.reason)$('auto-status-reason').textContent=auto.reason;
   $('auto-throttle').textContent=auto.active?(state.lastInput.throttle>0?'自动给油':'自动释放'):'待命';
   $('auto-brake').textContent=auto.active?(state.lastInput.brake>0?Math.round(state.lastInput.brake*100)+'% 制动力':'自动释放'):'待命';
@@ -635,7 +761,7 @@ function getInput(){
   const values=[...state.controls.values()],plan=state.plan;
   let throttle=values.includes('throttle')?1:0,brake=values.includes('brake')?.55:state.serviceBrake,steering=routeSteering();
   const gear=state.autodrive.active?'forward':plan?.status==='running'?plan.gear:state.requestedGear;
-  const target=state.autodrive.active?(state.autodrive.decision?.targetSpeed||0):plan?.status==='running'&&plan.kind==='sequence'?sequenceTarget(plan):state.exitCruise?sequenceTarget({target:state.speedLimit,gear}):effectiveTarget(plan?.status==='running'?plan.target:state.speedLimit,gear);
+  let target=state.autodrive.active?(state.autodrive.decision?.targetSpeed||0):plan?.status==='running'&&plan.kind==='sequence'?sequenceTarget(plan):state.exitCruise?sequenceTarget({target:state.speedLimit,gear}):effectiveTarget(plan?.status==='running'?plan.target:state.speedLimit,gear);
   if(plan?.status==='running'){
     if(plan.kind==='sequence'){const step=plan.steps[plan.phase];if(['brake','wait'].includes(step?.type)){throttle=0;brake=step.amount||1;}else{throttle=car.speed<=target?1:0;brake=car.speed>target+.12?.55:0;}}
     else if(plan.phase===1){throttle=0;brake=1;}
@@ -648,15 +774,40 @@ function getInput(){
   const roadCap=currentRoadCap();
   // Actual deceleration through the same tyre/drag model; never snap speed or
   // latch emergency stop. Held throttle can resume once the legal speed is met.
-  if(car.speed>roadCap+.01)state.autoLimitBraking=true;
+  if(state.exitStage==='ramp')state.autoLimitBraking=false;
+  else if(car.speed>roadCap+.01)state.autoLimitBraking=true;
   else if(car.speed<=roadCap)state.autoLimitBraking=false;
   if(state.autoLimitBraking){throttle=0;brake=Math.max(brake,Math.min(.55,Math.max(.06,(car.speed-roadCap)/8)));}
+  if(state.entranceActive){
+    const entry=state.entranceActive;
+    if(entry.cityYielding){throttle=0;brake=Math.max(brake,.7);target=0;}
+    if(state.entranceStage!=='merging'){
+      // Approach the waiting line through a braking-distance envelope. Holding
+      // the accelerator cannot drive past an unsafe merge; no position snap.
+      const remaining=Math.max(0,entry.mergeStart-12-car.y),deceleration=state.wet?2:3;
+      const allowed=Math.max(0,Math.sqrt(2*deceleration*Math.max(0,remaining-3)+9)-3);
+      target=Math.min(target,allowed);
+      if(car.speed>allowed+.02){throttle=0;brake=Math.max(brake,.55);}
+      if(remaining<3.1){throttle=0;brake=Math.max(brake,.55);}
+    }
+    // Other vehicles share the same entrance. Keep a physical stopping gap
+    // while joining instead of driving through a queue waiting to merge.
+    for(const vehicle of visibleTraffic()){
+      if(vehicle.direction<0||vehicle.y<=car.y||vehicle.y>car.y+150)continue;
+      const center=roadModel.centerForCityEntrance(entry,Math.min(vehicle.y,entry.mergeEnd));
+      if(Math.abs(vehicle.x-center)>2.15)continue;
+      const gap=vehicle.y-car.y-2.25-vehicle.length/2;
+      const safe=Math.max(0,Math.sqrt(Math.max(0,vehicle.speed**2+4*Math.max(0,gap-5)))-3);
+      target=Math.min(target,safe);
+      if(car.speed>safe+.05||gap<5){throttle=0;brake=Math.max(brake,.55);}
+    }
+  }
   if(state.estop||state.failsafe||!state.connected||!cameraReady||car.energyKWh>=51.6){throttle=0;brake=1;}
   if(brake>0)throttle=0;
-  return {throttle,brake,steering,targetSpeed:target,gear,wet:state.wet,guardrails:!state.exitActive};
+  return {throttle,brake,steering,targetSpeed:state.exitStage==='ramp'?Math.min(state.speedLimit,100):target,gear,wet:state.wet,guardrails:!state.exitActive&&!state.entranceActive};
 }
 function updateLaneState(){
-  if(state.exitActive)return;
+  if(state.exitActive||state.entranceActive)return;
   if(car.x>laneControl.constants.shoulderBoundary&&!state.shoulderAlert&&!state.shoulderRecovery){
     state.shoulderAlert=true;state.laneTarget=3;state.laneChanging=true;
     requestBrake('已进入应急车道，触发全力紧急制动',1,{emergency:true});
@@ -669,7 +820,8 @@ function updateLaneState(){
 }
 function advance(dt){
   if(state.collision)return;
-  updateExitState();updateLaneState();updatePlan();updateAutodrive();
+  handoffCityTraffic();
+  updateExitState();updateEntranceState();updateLaneState();updatePlan();updateAutodrive();
   const input=getInput();state.lastInput=input;
   // Limit braking ends at the legal speed, so it has no fixed parking line.
   // Keep the live full-stop prediction and avoid integrating a new stop on
@@ -679,17 +831,20 @@ function advance(dt){
     state.brakeAnchor={x:car.x,y:car.y,heading:motionHeading(),pressure:input.brake,distance:physics.estimateBrakingDistance(car.speed,{wet:state.wet,brake:input.brake})};
   }else if(input.brake===0&&car.braking)state.brakeAnchor=null;
   const previousPose={...car},wasBraking=car.braking,contacts=car.wallContactCount;
-  traffic.step(trafficWorld,car,dt,{roadModel,merging:currentRoadType()==='highway',exiting:!state.exitCompleted,wet:state.wet,egoLaneTarget:state.laneChanging?state.laneTarget:null});
+  const trafficOptions={roadModel,wet:state.wet,egoLaneTarget:state.entranceStage==='merging'?2:state.laneChanging&&!state.exitCompleted?state.laneTarget:null};
+  traffic.step(trafficWorld,car,dt,{...trafficOptions,merging:trafficWorld.roadType==='highway',exiting:trafficWorld.roadType==='highway'});
+  const background=backgroundTraffic();
+  if(background)traffic.step(background,car,dt,{...trafficOptions,merging:background.roadType==='highway',exiting:background.roadType==='highway'});
   physics.step(car,input,dt);
   state.shiftPending=state.requestedGear!==car.gear;
   if(previousPose.gear!==car.gear){state.brakeAnchor=null;log(`已停稳换入${car.gear==='reverse'?'倒车 R':'前进 D'}挡`);}
-  const contact=traffic.resolveContact(trafficWorld,car,previousPose);
+  const contact=traffic.resolveContact(trafficWorld,car,previousPose)||(background?traffic.resolveContact(background,car,previousPose):null);
   if(contact||car.wallContactCount>contacts){
     if(contact)car.acceleration=(car.speed-previousPose.speed)/dt;
     finishWithCollision(contact?'vehicle':'guardrail',previousPose,contact);
     return;
   }
-  updateExitState();updateLaneState();
+  updateExitState();updateEntranceState();updateLaneState();
   const prev=state.trail[state.trail.length-1];
   if(Math.hypot(car.x-prev[0],car.y-prev[1])>.5){state.trail.push([car.x,car.y]);if(state.trail.length>1500)state.trail.splice(1,1);}
   if(wasBraking&&!car.braking&&car.speed===0){log(`车辆已停稳，制动距离 ${(car.lastBrakeDistance||0).toFixed(2)} m`);if(!state.estop&&!state.failsafe)state.serviceBrake=0;renderPlan();}
@@ -704,7 +859,7 @@ function resetSession({clearEmergency=!!state.collision}={}){
   Object.assign(state.horn,{lastAt:-Infinity,count:0,status:'idle',reason:'前车会在允许变道且车距安全时避让。',vehicleId:null,targetLane:null,vehicle:null});
   Object.assign(state.autodrive,{active:false,route:'cruise',decision:null,nextLaneCheck:0,reason:'模拟已重置，点击启动自动驾驶。'});
   car=physics.createState();trafficWorld=traffic.createState(car,{density:state.trafficDensity});
-  Object.assign(state,{collision:null,collisionEffect:null,laneAdvice:null,adviceCooldownUntil:0,exitActive:null,exitCompleted:false,exitCruise:false,
+  Object.assign(state,{collision:null,collisionEffect:null,laneAdvice:null,adviceCooldownUntil:0,exitActive:null,exitCompleted:false,exitCruise:false,exitStage:null,exitReturn:null,skippedExit:null,entranceActive:null,entranceStage:null,entranceReason:'',highwayTraffic:null,localTraffic:null,
     estop:keepLocked,requestedGear:'forward',autoLimitBraking:false,shiftPending:false,laneTarget:1,laneChanging:false,
     shoulderAlert:false,shoulderRecovery:false,serviceBrake:0,failsafe:false,plan:null,trail:[[0,0]],logs:[],started:performance.now(),
     brakeAnchor:null,contactUntil:0,lastContactNotice:-Infinity,trafficInfo:null,lastInput:{throttle:0,brake:0,steering:0},predicted:0,pausedAt:null});
@@ -723,15 +878,15 @@ $('expand-button').onclick=()=>toggleExpand();
 window.addEventListener('resize',()=>{if(state.collision)collisionFramePending=true;});
 function render(){const moving=car.speed>.01,braking=state.lastInput.brake>0&&moving;state.predicted=physics.estimateBrakingDistance(car.speed,{wet:state.wet,brake:1});$('speed-value').textContent=car.speed.toFixed(1);$('speed-kmh').textContent=(car.speed*3.6).toFixed(1)+' km/h';$('predicted-brake').textContent=state.predicted.toFixed(1);$('actual-brake').textContent=car.braking?car.brakeDistance.toFixed(1):car.lastBrakeDistance===null?'—':car.lastBrakeDistance.toFixed(1);$('actual-brake-label').textContent=car.braking?'正在制动':'上次制动';$('brake-result-label').textContent=car.braking?'距离正在累计':'停车后保留实测结果';$('braking-hud').hidden=!braking;$('braking-hud-distance').textContent=car.brakeDistance.toFixed(1)+' m';$('braking-hud-label').textContent=state.estop?'紧急制动':state.shiftPending?'换挡制动':state.autoLimitBraking?'限速自动制动':state.lastInput.brake>=1?'全力制动':'常规制动';$('speed-limit-label').textContent=String(state.speedLimit);$('target-kmh').textContent=(state.speedLimit*3.6).toFixed(0)+' km/h';$('odometer-live').textContent=car.distance.toFixed(1)+' m';$('distance-value').textContent=car.distance.toFixed(1);$('map-distance').textContent=car.distance.toFixed(1)+' m';$('heading-live').textContent=(Math.round(car.heading)%360)+'°';$('acceleration-live').textContent=car.acceleration.toFixed(2)+' m/s²';$('position-text').textContent=`X ${car.x.toFixed(1)} · Y ${car.y.toFixed(1)} m`;$('heading-text').textContent=String(Math.round(car.heading)%360).padStart(3,'0')+'°';$('steering-angle').textContent=(car.steer*180/Math.PI).toFixed(1)+'°';$('steering-indicator').style.transform=`rotate(${car.steer*180/Math.PI*3}deg)`;
   const touchingWall=!!car.wallContact&&moving,touchingTraffic=performance.now()<state.contactUntil;
-  const drivingLabel=state.autodrive.active?(state.autodrive.reason||'全自动驾驶中'):state.exitActive?(state.exitCompleted?(braking?'普通道路 · 正在制动':moving?(state.exitCruise?'普通道路 · AI 巡航':car.gear==='reverse'?'普通道路 · 倒车':'普通道路 · 持续行驶'):'普通道路 · 已停稳'):braking?'出口路线 · 减速至 40 km/h':'沿出口匝道驶离高速'):state.shoulderAlert?(state.estop?(moving?'应急车道 · 紧急制动':'应急车道 · 已停稳锁定'):(moving?'正在返回右车道':'返回右车道 · 按油门继续')):state.laneChanging?(moving?`正在变道至${laneName(state.laneTarget)}`:`待起步 → ${laneName(state.laneTarget)}`):state.shiftPending&&moving?'减速至停稳 · 准备换挡':state.autoLimitBraking&&braking?'超速自动制动 · 降至限速':braking?'正在制动，车辆仍在移动':touchingWall?'沿护栏擦行 · 摩擦减速':touchingTraffic?'车辆接触 · 控制仍可用':moving?(car.gear==='reverse'?(state.lastInput.throttle?'正在倒车':'倒车惯性滑行'):(state.lastInput.throttle?'正在加速 / 巡航':'松开油门，惯性滑行')):'车辆已停稳';$('camera-mode').textContent=(state.autodrive.active?'自动驾驶':state.plan?.status==='running'||state.exitCruise?'AI 试驾':'手动驾驶')+' · '+(car.gear==='reverse'?'R 倒车':'D 前进')+' · '+(state.wet?'湿滑路面':'干燥路面');$('camera-status').textContent=drivingLabel;$('safety-title').textContent=state.shoulderAlert?drivingLabel:state.estop?(moving?'紧急制动中':'已停稳 · 制动锁定'):drivingLabel;$('safety-description').textContent=state.shoulderAlert?(state.estop?(moving?`已制动 ${car.brakeDistance.toFixed(1)} m`:'停稳后可解除，返回右车道'):(moving?'自动回正居中，到达后解除警报':'按住油门，自动返回右车道')):state.estop?(moving?`已制动 ${car.brakeDistance.toFixed(1)} m`:'解除后不会自动行驶'):moving?`${car.speed.toFixed(1)} m/s · ${braking?'持续减速':'注意刹车距离'}`:'按住油门开始驾驶';document.querySelector('.safety-bar').classList.toggle('stopped',state.estop);$('emergency-stop').hidden=state.estop;$('reset-estop').hidden=!state.estop;$('reset-estop').disabled=moving;$('reset-estop').textContent=moving?'制动中，等待停稳':state.shoulderAlert?'解除并返回右车道':'解除制动锁定';$('connection-dot').classList.toggle('offline',!state.connected);$('connection-label').textContent=state.connected?'模拟连接正常':'失联，自动制动';$('camera-offline').hidden=state.connected;$('device-status').textContent=state.connected?'模拟连接正常':'已断开，制动中';$('toggle-connection').textContent=state.connected?'断开模拟连接':'恢复模拟连接';$('dry-road').classList.toggle('selected',!state.wet);$('dry-road').setAttribute('aria-pressed',String(!state.wet));$('wet-road').classList.toggle('selected',state.wet);$('wet-road').setAttribute('aria-pressed',String(state.wet));$('dry-road').disabled=car.braking;$('wet-road').disabled=car.braking;$('grip-value').textContent=state.wet?'μ 0.45':'μ 0.85';$('device-grip').textContent=state.wet?'0.45（湿滑）':'0.85（干燥）';$('device-rtt').textContent=location.protocol==='file:'?'本地文件 · 无网络请求':state.latency===null?'未测量 / 不可达':state.latency.toFixed(1)+' ms';$('device-power').textContent=Math.max(0,86-car.energyKWh/60*100).toFixed(1)+'% / '+((car.powerW||0)/1000).toFixed(1)+' kW';
-  const road=state.trafficInfo=traffic.getSnapshot(trafficWorld,{...car,exitRoute:state.exitActive}),speedKmh=car.speed*3.6;road.speedLimitKmh=Math.round(currentRoadCap()*3.6);const overspeed=speedKmh>road.speedLimitKmh+.05;
+  const drivingLabel=state.entranceActive?(state.entranceStage==='waiting'?'等待高速车流间隙':state.entranceStage==='merging'?'正在汇入高速右车道':'高速入口 · 沿匝道前进'):state.autodrive.active?(state.autodrive.reason||'全自动驾驶中'):state.exitActive?(state.exitCompleted?(braking?'普通道路 · 正在制动':moving?(state.exitCruise?'普通道路 · AI 巡航':car.gear==='reverse'?'普通道路 · 倒车':'普通道路 · 持续行驶'):'普通道路 · 已停稳'):state.exitReturn?'取消驶出 · 正在返回高速':state.exitStage==='deceleration'?'减速车道 · 请手动减速':'出口匝道 · 超速自动返回主路'):state.shoulderAlert?(state.estop?(moving?'应急车道 · 紧急制动':'应急车道 · 已停稳锁定'):(moving?'正在返回右车道':'返回右车道 · 按油门继续')):state.laneChanging?(moving?`正在变道至${laneName(state.laneTarget)}`:`待起步 → ${laneName(state.laneTarget)}`):state.shiftPending&&moving?'减速至停稳 · 准备换挡':state.autoLimitBraking&&braking?'超速自动制动 · 降至限速':braking?'正在制动，车辆仍在移动':touchingWall?'沿护栏擦行 · 摩擦减速':touchingTraffic?'车辆接触 · 控制仍可用':moving?(car.gear==='reverse'?(state.lastInput.throttle?'正在倒车':'倒车惯性滑行'):(state.lastInput.throttle?'正在加速 / 巡航':'松开油门，惯性滑行')):'车辆已停稳';$('camera-mode').textContent=(state.autodrive.active?'自动驾驶':state.plan?.status==='running'||state.exitCruise?'AI 试驾':'手动驾驶')+' · '+(car.gear==='reverse'?'R 倒车':'D 前进')+' · '+(state.wet?'湿滑路面':'干燥路面');$('camera-status').textContent=drivingLabel;$('safety-title').textContent=state.shoulderAlert?drivingLabel:state.estop?(moving?'紧急制动中':'已停稳 · 制动锁定'):drivingLabel;$('safety-description').textContent=state.shoulderAlert?(state.estop?(moving?`已制动 ${car.brakeDistance.toFixed(1)} m`:'停稳后可解除，返回右车道'):(moving?'自动回正居中，到达后解除警报':'按住油门，自动返回右车道')):state.estop?(moving?`已制动 ${car.brakeDistance.toFixed(1)} m`:'解除后不会自动行驶'):moving?`${car.speed.toFixed(1)} m/s · ${braking?'持续减速':'注意刹车距离'}`:'按住油门开始驾驶';document.querySelector('.safety-bar').classList.toggle('stopped',state.estop);$('emergency-stop').hidden=state.estop;$('reset-estop').hidden=!state.estop;$('reset-estop').disabled=moving;$('reset-estop').textContent=moving?'制动中，等待停稳':state.shoulderAlert?'解除并返回右车道':'解除制动锁定';$('connection-dot').classList.toggle('offline',!state.connected);$('connection-label').textContent=state.connected?'模拟连接正常':'失联，自动制动';$('camera-offline').hidden=state.connected;$('device-status').textContent=state.connected?'模拟连接正常':'已断开，制动中';$('toggle-connection').textContent=state.connected?'断开模拟连接':'恢复模拟连接';$('dry-road').classList.toggle('selected',!state.wet);$('dry-road').setAttribute('aria-pressed',String(!state.wet));$('wet-road').classList.toggle('selected',state.wet);$('wet-road').setAttribute('aria-pressed',String(state.wet));$('dry-road').disabled=car.braking;$('wet-road').disabled=car.braking;$('grip-value').textContent=state.wet?'μ 0.45':'μ 0.85';$('device-grip').textContent=state.wet?'0.45（湿滑）':'0.85（干燥）';$('device-rtt').textContent=location.protocol==='file:'?'本地文件 · 无网络请求':state.latency===null?'未测量 / 不可达':state.latency.toFixed(1)+' ms';$('device-power').textContent=Math.max(0,86-car.energyKWh/60*100).toFixed(1)+'% / '+((car.powerW||0)/1000).toFixed(1)+' kW';
+  const road=state.trafficInfo=traffic.getSnapshot(trafficWorld,{...car,exitRoute:state.exitActive,exitReturn:state.exitReturn}),speedKmh=car.speed*3.6;road.speedLimitKmh=Math.round(currentRoadCap()*3.6);const overspeed=speedKmh>road.speedLimitKmh+.05;
   $('road-limit-sign').textContent=String(road.speedLimitKmh);
   $('road-limit-sign').setAttribute('aria-label',`道路限速${road.speedLimitKmh}公里每小时`);
-  $('road-speed-status').textContent=state.autoLimitBraking?'自动制动至 '+road.speedLimitKmh+' km/h':'限速保护已开启';
+  $('road-speed-status').textContent=state.autoLimitBraking?'自动制动至 '+road.speedLimitKmh+' km/h':state.exitStage==='ramp'?'匝道超速将返回主路':state.exitStage==='deceleration'?'请手动减至匝道限速':'限速保护已开启';
   const travelDirection=Math.cos(motionHeading()*Math.PI/180)>=0?1:-1;
   const nextSign=traffic.nextLimit(car.y,travelDirection);
   const nextLimit=nextSign?.limitKmh;
-  $('next-road-limit').textContent=state.exitCompleted?'普通道路 · 限速 50 km/h':state.exitActive?'出口匝道 · 限速 40 km/h':nextSign?`${car.gear==='reverse'?'倒车方向':'前方'} ${Math.ceil(Math.abs(nextSign.y-car.y))} m · 限速 ${nextLimit}`:'超速自动制动 · 达标后释放';
+  $('next-road-limit').textContent=state.entranceActive?(car.y<state.entranceActive.crossingEnd?'入口路口 · 限速 20 km/h':'加速车道 · 限速 60 km/h'):state.exitCompleted?'普通道路 · 限速 50 km/h':state.exitReturn?'返回高速右车道':state.exitStage==='deceleration'?'前方匝道 · 40 km/h · 手动减速':state.exitActive?'出口匝道 · 40 km/h · 超速返回':nextSign?`${car.gear==='reverse'?'倒车方向':'前方'} ${Math.ceil(Math.abs(nextSign.y-car.y))} m · 限速 ${nextLimit}`:'超速自动制动 · 达标后释放';
   const reverse=car.gear==='reverse',ahead=reverse?road.nearestBehind:road.nearestAhead,close=!!ahead&&ahead.distance<Math.max(10,car.speed*1.5);
   $('traffic-direction-label').textContent=reverse?'同车道后车':'同车道前车';
   $('traffic-gap').textContent=ahead?`${Math.max(0,ahead.distance).toFixed(0)} m`:reverse?'后方畅通':'前方畅通';
@@ -742,7 +897,7 @@ function render(){const moving=car.speed>.01,braking=state.lastInput.brake>0&&mo
   $('speed-slider').max=String(max);$('speed-slider').value=String(shownTarget);$('speed-slider').setAttribute('aria-label',`目标速度，最高${max}米每秒`);
   $('speed-slider').style.setProperty('--speed-progress',((shownTarget-1)/(max-1)*100)+'%');
   $('speed-limit-label').textContent=String(Number(shownTarget.toFixed(2)));$('target-kmh').textContent=(shownTarget*3.6).toFixed(0)+' km/h';
-  $('effective-speed-note').textContent=`实际目标 ${(effectiveTarget(state.autodrive.active?100:state.speedLimit)*3.6).toFixed(0)} km/h · ${state.requestedGear==='reverse'?'倒车限速':'遵守路段限速'}`;
+  $('effective-speed-note').textContent=state.exitStage==='ramp'?`油门目标 ${(state.speedLimit*3.6).toFixed(0)} km/h · 超过 40 将返回主路`:`实际目标 ${(effectiveTarget(state.autodrive.active?100:state.speedLimit)*3.6).toFixed(0)} km/h · ${state.requestedGear==='reverse'?'倒车限速':'遵守路段限速'}`;
   $('gear-status').textContent=state.shiftPending?'减速换挡中':reverse?'R · 倒车':'D · 前进';
   $('gear-hint').textContent=state.shiftPending?'先停稳再换向，油门在换挡期间暂停':reverse?'倒车上限 5 m/s · 画面朝后，按住油门倒车':'换挡时先减速至停稳，再切换行驶方向';
   $('throttle-hint').textContent=state.requestedGear==='reverse'?'按住倒车':'按住前进';
@@ -750,15 +905,15 @@ function render(){const moving=car.speed>.01,braking=state.lastInput.brake>0&&mo
   document.querySelector('.gear-control').classList.toggle('shifting',state.shiftPending);
   for(const button of document.querySelectorAll('[data-density]')){const selected=button.dataset.density===state.trafficDensity;button.classList.toggle('selected',selected);button.setAttribute('aria-pressed',String(selected));}
   $('traffic-density-note').textContent=`${traffic.densityPresets[state.trafficDensity].label} · ${road.vehicleCount} 辆模拟车`;
-  const sceneName=state.exitCompleted?'普通道路':state.exitActive?'出口匝道':'高速公路';
+  const sceneName=state.entranceActive?'高速入口':state.exitCompleted?'普通道路':state.exitReturn?'返回高速':state.exitStage==='deceleration'?'出口减速车道':state.exitActive?'出口匝道':'高速公路';
   $('view-title').textContent=state.map?'行驶轨迹':sceneName+(reverse?' · 倒车视角':' · 驾驶视角');
-  $('road-scene-caption').textContent=state.exitCompleted?'实时车流 · 普通道路 · 双向行驶':state.exitActive?'实时驾驶 · 出口匝道 · 接入普通道路':'实时车流 · 高速公路 · 三车道';
+  $('road-scene-caption').textContent=state.entranceActive?'城市入口 · 加速车道 · 安全汇入':state.exitCompleted?'实时车流 · 普通道路 · 双向行驶':state.exitReturn?'实时驾驶 · 返回连接道':state.exitStage==='deceleration'?'手动减速 · 右变道驶出':state.exitActive?'实时驾驶 · 出口匝道 · 接入普通道路':'实时车流 · 高速公路 · 三车道';
   $('camera-panel').classList.toggle('reversing',reverse);
-  $('lane-status').textContent=state.exitActive?(state.exitCompleted?'普通道路 · 自动居中':'出口匝道 · 自动循迹'):laneName(state.laneTarget)+(state.estop&&state.shoulderAlert?(moving?' · 制动中':' · 制动锁定'):state.laneChanging?(moving?' · 变道中':' · 待起步'):' · 已居中');
-  $('lane-hint').textContent=state.exitCompleted?'保持本车道继续行驶，双黄线禁止跨越；可制动或换挡倒车':state.exitActive?'沿选定匝道接入普通道路，驶出后继续行驶':state.shoulderAlert?(state.estop?'应急车道已触发急刹，停稳后解除并返回右车道':(moving?'正在自动返回右车道，到达中央后警报解除':'已选择返回右车道，重新按住油门驶回')):state.laneChanging?'自动移至目标车道中央，完成后可再次点按':state.laneTarget===2?'继续向右将进入应急车道，并触发紧急制动':car.gear==='reverse'?'倒车时左右仍按道路方向选择，自动移至车道中央':'每次点按切换相邻车道，松手后自动完成变道';
+  $('lane-status').textContent=state.entranceActive?(state.entranceStage==='waiting'?'等待汇入 · 自动让行':'高速入口 · 循迹中'):state.exitActive?(state.exitCompleted?'普通道路 · 自动居中':state.exitReturn?'返回右车道 · 循迹中':state.exitStage==='deceleration'?'减速车道 · 手动减速':'出口匝道 · 自动循迹'):laneName(state.laneTarget)+(state.estop&&state.shoulderAlert?(moving?' · 制动中':' · 制动锁定'):state.laneChanging?(moving?' · 变道中':' · 待起步'):' · 已居中');
+  $('lane-hint').textContent=state.entranceActive?state.entranceReason:state.exitCompleted?'到高速入口标线路口后减至 20 km/h，按左变道驶入；其余路段保持本车道':state.exitReturn?'保持前进，沿连接道返回主路；油门、刹车仍可操作':state.exitStage==='deceleration'?'请手动减至 40 km/h；向左变道可取消驶出':state.exitActive?'限速内继续驶离；匝道超速自动返回高速':state.shoulderAlert?(state.estop?'应急车道已触发急刹，停稳后解除并返回右车道':(moving?'正在自动返回右车道，到达中央后警报解除':'已选择返回右车道，重新按住油门驶回')):state.laneChanging?'自动移至目标车道中央，完成后可再次点按':state.laneTarget===2?(nextExitForRoute()&&car.y>=nextExitForRoute().entryStart?'向右进入减速车道，请自己减至 40 km/h':'继续向右将进入应急车道，并触发紧急制动'):car.gear==='reverse'?'倒车时左右仍按道路方向选择，自动移至车道中央':'每次点按切换相邻车道，松手后自动完成变道';
   document.querySelector('.highway-steering').classList.toggle('changing',state.laneChanging);
   for(const button of document.querySelectorAll('[data-lane-change]')){
-    button.disabled=!!state.exitActive||state.estop||!state.connected||!cameraReady;
+    button.disabled=!!state.entranceActive||(!!state.exitActive&&!((state.exitStage==='deceleration'||state.exitCompleted)&&button.dataset.laneChange==='-1'))||state.estop||!state.connected||!cameraReady;
     button.classList.toggle('shoulder-next',button.dataset.laneChange==='1'&&state.laneTarget===2);
   }
   renderRoadEvents();renderLaneAdvice();renderAutodrive();renderHorn();
@@ -774,9 +929,9 @@ function render(){const moving=car.speed>.01,braking=state.lastInput.brake>0&&mo
   if(state.map){const scale=.5,latest=car.y;const originY=260+latest*scale;$('map-origin').setAttribute('transform',`translate(320 ${originY})`);$('map-origin').style.display=originY>=0&&originY<=330?'':'none';$('route-trail').setAttribute('points',state.trail.filter(p=>p[1]>latest-480&&p[1]<latest+160).map(([x,y])=>`${320+x*8},${260-(y-latest)*scale}`).join(' '));$('map-rover').setAttribute('transform',`translate(${320+car.x*8} 260) rotate(${car.heading})`);}
 }
 function drawCameraFrame(now){
-  const pose={...car,exitRoute:state.exitActive,localRoad:state.exitCompleted,emergencyLaneAlert:state.shoulderAlert,
+  const pose={...car,exitRoute:state.exitActive,exitReturn:state.exitReturn,cityEntrance:state.entranceActive,localRoad:state.exitCompleted,emergencyLaneAlert:state.shoulderAlert,
     wet:state.wet,brakePrediction:state.collision?0:state.predicted,brakeAnchor:state.brakeAnchor,
-    traffic:trafficWorld.vehicles,roadSigns:state.exitCompleted?[]:traffic.signsAround(car.y),collisionEffect:state.collisionEffect};
+    traffic:visibleTraffic(),roadSigns:state.exitCompleted?[]:traffic.signsAround(car.y),collisionEffect:state.collisionEffect};
   if(!camera.draw(pose,now))return false;
   collisionFramePending=false;$('camera-canvas').dataset.frame=String(camera.stats.frames);
   const seconds=(now-state.started)/1000;
@@ -809,6 +964,6 @@ function tick(now){
 try{camera=window.RoverSimulator.createCamera($('camera-canvas'));cameraReady=true;}catch(error){$('camera-error').hidden=false;console.error(error);}
 window.addEventListener('rover-camera-lost',()=>{cameraReady=false;if(state.collision)finishCollisionAnimation({draw:false});failSafe('画面丢失，继续全力制动');$('camera-error').hidden=false;});
 async function probeLocalService(){if(location.protocol==='file:')return;if(document.hidden){setTimeout(probeLocalService,2000);return;}const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),2000),started=performance.now();try{const response=await fetch('./health.json?t='+Math.floor(started),{method:'HEAD',cache:'no-store',signal:controller.signal});if(!response.ok)throw new Error();state.latency=performance.now()-started;}catch{state.latency=null;}finally{clearTimeout(timer);setTimeout(probeLocalService,2000);}}
-function readState(){const road=traffic.getSnapshot(trafficWorld,{...car,exitRoute:state.exitActive});return {collision:state.collision?{...state.collision}:null,simulationPaused:!!state.collision,collisionAnimation:state.collisionEffect?{...state.collisionEffect,active:collisionAnimating()}:null,horn:{count:state.horn.count,status:state.horn.status,reason:state.horn.reason,vehicleId:state.horn.vehicleId,targetLane:state.horn.targetLane},autodrive:{active:state.autodrive.active,route:state.autodrive.route,status:state.autodrive.decision?.status||'idle',reason:state.autodrive.reason},roadType:currentRoadType(),exitCruise:state.exitCruise,road:state.exitCompleted?{type:'local',speedLimitKmh:50,solid:true,nextExit:null}:roadModel.getState(car.y),exit:state.exitActive?{...state.exitActive,completed:state.exitCompleted}:null,taskStep:state.plan?.kind==='sequence'?state.plan.steps[state.plan.phase]:null,taskWaiting:state.plan?.waitingReason||'',laneRecommendation:getLaneAdvice(),laneTarget:state.laneTarget,laneTargetName:state.exitCompleted?'普通道路本车道':laneName(state.laneTarget),laneChanging:state.laneChanging,emergencyLaneAlert:state.shoulderAlert,returningFromEmergencyLane:state.shoulderRecovery,gear:car.gear,requestedGear:state.requestedGear,signedSpeed:car.speed*(car.gear==='reverse'?-1:1),trafficDensity:state.trafficDensity,automaticSpeedLimit:true,autoLimitBraking:state.autoLimitBraking,effectiveTargetSpeed:effectiveTarget(state.autodrive.active?100:state.speedLimit),roadLimitKmh:Math.round(currentRoadCap()*3.6),overspeed:car.speed>currentRoadCap()+.01,trafficCount:road.vehicles.length,merging:road.merging,exiting:road.exiting,nearestAhead:road.nearestAhead,nearestBehind:road.nearestBehind,wallContact:car.wallContact,simulation:true,scenario:currentRoadType(),model:'simplified vehicle dynamics',connected:state.connected,emergencyBrake:state.estop,speed:car.speed,maxSpeed:100,targetSpeed:state.speedLimit,acceleration:car.acceleration,position:{x:car.x,y:car.y,heading:car.heading},distance:car.distance,braking:car.braking,brakeDistance:car.brakeDistance,lastBrakeDistance:car.lastBrakeDistance,predictedBrakingDistance:state.predicted,wet:state.wet,taskStatus:state.plan?.status||'none',cameraFps:camera?.stats.fps||0,localLatencyMs:state.latency};}
-if(document.modelContext?.registerTool){const lifecycle=new AbortController();const definitions=[{name:'change_rover_simulation_lane',title:'切换模拟车辆车道',description:'Request one adjacent lane through the same controls as the left/right buttons. Left/right refer to the road. Entering the right emergency shoulder triggers physical emergency braking.',inputSchema:{type:'object',properties:{direction:{type:'string',enum:['left','right']}},required:['direction'],additionalProperties:false},annotations:{readOnlyHint:false},execute(input){if(!input||!['left','right'].includes(input.direction))throw new Error('direction required');const accepted=requestLaneChange(input.direction==='left'?-1:1);if(accepted)switchMode('manual');return {accepted,...readState()};}},{name:'read_rover_simulation',title:'查看车辆物理模拟状态',description:'Read local highway physics, actual speed and physical braking distance. No real hardware.',inputSchema:{type:'object',properties:{},additionalProperties:false},annotations:{readOnlyHint:true},execute:readState},{name:'stage_rover_simulation_command',title:'准备高速模拟任务',description:'Stage a local highway simulation plan for confirmation. Brake commands apply deceleration immediately; they do not teleport speed to zero.',inputSchema:{type:'object',properties:{command:{type:'string',minLength:1,maxLength:240}},required:['command'],additionalProperties:false},annotations:{readOnlyHint:false},execute(input){if(!input||typeof input.command!=='string')throw new Error('command required');if(state.collision)return {status:'blocked',reason:'发生碰撞，请先重新开始'};switchMode('ai');$('command-input').value=input.command;return submitCommand(input.command);}},{name:'emergency_stop_rover_simulation',title:'全力制动模拟车辆',description:'Latch full emergency brakes in the local simulation. Speed decreases physically over a nonzero braking distance. Does not immediately stop or control real hardware.',inputSchema:{type:'object',properties:{},additionalProperties:false},annotations:{readOnlyHint:false},execute(){emergencyStop();return readState();}}];for(const tool of definitions){try{Promise.resolve(document.modelContext.registerTool(tool,{signal:lifecycle.signal})).catch(()=>{});}catch{}}window.addEventListener('pagehide',()=>lifecycle.abort(),{once:true});}
+function readState(){const road=traffic.getSnapshot(trafficWorld,{...car,exitRoute:state.exitActive,exitReturn:state.exitReturn});return {collision:state.collision?{...state.collision}:null,simulationPaused:!!state.collision,collisionAnimation:state.collisionEffect?{...state.collisionEffect,active:collisionAnimating()}:null,horn:{count:state.horn.count,status:state.horn.status,reason:state.horn.reason,vehicleId:state.horn.vehicleId,targetLane:state.horn.targetLane},autodrive:{active:state.autodrive.active,route:state.autodrive.route,status:state.autodrive.decision?.status||'idle',reason:state.autodrive.reason},roadType:currentRoadType(),entrance:state.entranceActive?{...state.entranceActive,stage:state.entranceStage}:null,entranceStage:state.entranceStage,highwayTrafficCount:state.highwayTraffic?.vehicles.length??null,exitStage:state.exitStage,exitReturn:state.exitReturn?{...state.exitReturn}:null,exitCruise:state.exitCruise,road:state.entranceActive?{type:'entrance',speedLimitKmh:Math.round(currentRoadCap()*3.6),solid:false,nextExit:null}:state.exitCompleted?{type:'local',speedLimitKmh:50,solid:true,nextExit:null,nextCityEntrance:roadModel.getState(car.y).nextCityEntrance}:roadModel.getState(car.y),exit:state.exitActive?{...state.exitActive,completed:state.exitCompleted}:null,taskStep:state.plan?.kind==='sequence'?state.plan.steps[state.plan.phase]:null,taskWaiting:state.plan?.waitingReason||'',laneRecommendation:getLaneAdvice(),laneTarget:state.laneTarget,laneTargetName:state.entranceActive?'高速入口匝道':state.exitCompleted?'普通道路本车道':laneName(state.laneTarget),laneChanging:state.laneChanging,emergencyLaneAlert:state.shoulderAlert,returningFromEmergencyLane:state.shoulderRecovery,gear:car.gear,requestedGear:state.requestedGear,signedSpeed:car.speed*(car.gear==='reverse'?-1:1),trafficDensity:state.trafficDensity,automaticSpeedLimit:state.exitStage!=='ramp',autoLimitBraking:state.autoLimitBraking,effectiveTargetSpeed:state.exitStage==='ramp'?state.speedLimit:effectiveTarget(state.autodrive.active?100:state.speedLimit),roadLimitKmh:Math.round(currentRoadCap()*3.6),overspeed:car.speed>currentRoadCap()+.01,trafficCount:road.vehicles.length,merging:road.merging,exiting:road.exiting,nearestAhead:road.nearestAhead,nearestBehind:road.nearestBehind,wallContact:car.wallContact,simulation:true,scenario:currentRoadType(),model:'simplified vehicle dynamics',connected:state.connected,emergencyBrake:state.estop,speed:car.speed,maxSpeed:100,targetSpeed:state.speedLimit,acceleration:car.acceleration,position:{x:car.x,y:car.y,heading:car.heading},distance:car.distance,braking:car.braking,brakeDistance:car.brakeDistance,lastBrakeDistance:car.lastBrakeDistance,predictedBrakingDistance:state.predicted,wet:state.wet,taskStatus:state.plan?.status||'none',cameraFps:camera?.stats.fps||0,localLatencyMs:state.latency};}
+if(document.modelContext?.registerTool){const lifecycle=new AbortController();const definitions=[{name:'change_rover_simulation_lane',title:'切换模拟车辆车道',description:'Request one adjacent lane through the same controls as the left/right buttons. Left/right refer to the road. AI may change ordinary lanes only. Exiting requires the user to manually enter the deceleration lane; AI cannot commit an exit.',inputSchema:{type:'object',properties:{direction:{type:'string',enum:['left','right']}},required:['direction'],additionalProperties:false},annotations:{readOnlyHint:false},execute(input){if(!input||!['left','right'].includes(input.direction))throw new Error('direction required');const accepted=requestLaneChange(input.direction==='left'?-1:1,{fromPlan:true});if(accepted)switchMode('manual');return {accepted,...readState()};}},{name:'read_rover_simulation',title:'查看车辆物理模拟状态',description:'Read local highway physics, actual speed and physical braking distance. No real hardware.',inputSchema:{type:'object',properties:{},additionalProperties:false},annotations:{readOnlyHint:true},execute:readState},{name:'stage_rover_simulation_command',title:'准备高速模拟任务',description:'Stage a local highway simulation plan for confirmation. Brake commands apply deceleration immediately; they do not teleport speed to zero.',inputSchema:{type:'object',properties:{command:{type:'string',minLength:1,maxLength:240}},required:['command'],additionalProperties:false},annotations:{readOnlyHint:false},execute(input){if(!input||typeof input.command!=='string')throw new Error('command required');if(state.collision)return {status:'blocked',reason:'发生碰撞，请先重新开始'};switchMode('ai');$('command-input').value=input.command;return submitCommand(input.command);}},{name:'emergency_stop_rover_simulation',title:'全力制动模拟车辆',description:'Latch full emergency brakes in the local simulation. Speed decreases physically over a nonzero braking distance. Does not immediately stop or control real hardware.',inputSchema:{type:'object',properties:{},additionalProperties:false},annotations:{readOnlyHint:false},execute(){emergencyStop();return readState();}}];for(const tool of definitions){try{Promise.resolve(document.modelContext.registerTool(tool,{signal:lifecycle.signal})).catch(()=>{});}catch{}}window.addEventListener('pagehide',()=>lifecycle.abort(),{once:true});}
 log('车道辅助已就绪：左右点按自动变道居中，进入应急车道会紧急制动');render();requestAnimationFrame(tick);probeLocalService();

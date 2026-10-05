@@ -456,6 +456,56 @@
     next.exitCompleted = finite(world.exitCompleted);
     return next;
   }
+  // Retain two independent, moving traffic populations while the player travels
+  // between roads. IDs stay distinct because the renderer tracks cars by ID.
+  function createHighwayFromLocal(world, ego) {
+    const next = createState(ego, { density:world?.density });
+    let id = Math.max(10000, finite(world?.nextEntranceId), ...(world?.vehicles || []).map(v=>finite(v.id)+1));
+    for (const vehicle of next.vehicles) vehicle.id = id++;
+    next.nextEntranceId = id;
+    next.elapsedTime = finite(world?.elapsedTime);
+    next.nextEntranceArrival = next.elapsedTime + 3;
+    return next;
+  }
+  function cityEntranceAllowed(world, ego, event, {wet=false,targetSpeed=20/3.6}={}) {
+    if (!event || !isLocal(world)) return {allowed:false,reason:'当前没有可驶入的城市入口'};
+    const speed = Math.max(0,finite(ego.speed)), start = finite(ego.y), startX = finite(ego.x,29);
+    // Predict the first turn, including a stationary start. The opposed lane
+    // must remain clear until the entire body has crossed it, not just now.
+    const cap = clamp(targetSpeed,1,20/3.6);
+    // Cover both a gentle start and the force model's maximum acceleration.
+    // A slow-only prediction incorrectly assumes the oncoming car will have
+    // passed before this high-power demo car actually crosses its lane.
+    for (const acceleration of [wet?1.2:1.6,wet?4.3:5.6]) {
+    for (let t=0; t<=90; t+=.25) {
+      const rampTime = Math.max(0,(cap-speed)/acceleration), accelerated = Math.min(t,rampTime);
+      const travel = speed*accelerated + .5*acceleration*accelerated*accelerated + Math.max(0,t-rampTime)*Math.max(cap,speed);
+      const u = clamp(travel/60,0,1), x = startX + (18-startX)*u*u*(3-2*u);
+      if (x < 22) break;
+      for (const vehicle of world.vehicles) {
+        const ext = vehicleExtents(vehicle), direction = finite(vehicle.direction,1);
+        const futureY = vehicle.y + direction*Math.max(0,finite(vehicle.speed))*t;
+        if (Math.abs(vehicle.x-x) < ext.x+1.8 && Math.abs(futureY-(start+travel)) < ext.y+3.5+(wet?3:1)) {
+          return {allowed:false,vehicleId:vehicle.id,oncoming:direction<0,reason:direction<0?'对向有来车，请在本车道等待安全间隙':'入口附近有车辆，请让行后再左转'};
+        }
+      }
+    }
+    }
+    return {allowed:true,reason:'路口间隙足够，可以低速左转进入匝道'};
+  }
+  function highwayMergeAllowed(world, ego, {wet=false}={}) {
+    if (!world) return {allowed:false,reason:'正在确认高速车流'};
+    const speed = Math.max(0,finite(ego.speed)), extent = egoExtents(ego);
+    for (const vehicle of world.vehicles) {
+      if (vehicle.direction < 0 || !overlapsCorridor(vehicle,lanes[2],.93,.2)) continue;
+      const delta = vehicle.y-finite(ego.y), gap = Math.abs(delta)-vehicleExtents(vehicle).y-extent.y;
+      const otherSpeed = Math.max(0,finite(vehicle.speed)), horizon = wet?8:6;
+      const projected = gap + (delta>=0?otherSpeed-speed:speed-otherSpeed)*horizon;
+      const margin = delta>=0?Math.max(12,speed*(wet?2:1.5)):Math.max(12,otherSpeed*(wet?2:1.4));
+      if (gap<margin || projected<margin) return {allowed:false,reason:delta>=0?'高速右车道前方间距不足，等待汇入':'高速右车道后车接近，等待汇入'};
+    }
+    return {allowed:true,reason:'高速右车道前后间隙足够'};
+  }
   function recycle(world, ego) {
     const preset = presetFor(world);
     // Entrance arrivals have a real source. Retire distant arrivals instead
@@ -595,9 +645,12 @@
     const x = finite(ego.x), y = finite(ego.y), extent = egoExtents(ego);
     let nearestAhead = null, nearestBehind = null;
     for (const vehicle of world.vehicles) {
-      const route = !isLocal(world) && ego.exitRoute;
-      const pathCenter = route && typeof world.roadModel?.centerForExit === 'function' ?
-        world.roadModel.centerForExit(route, vehicle.y) : x;
+      const returning = !isLocal(world) && ego.exitReturn;
+      const route = !returning && !isLocal(world) && ego.exitRoute;
+      const pathCenter = returning && typeof world.roadModel?.centerForReturn === 'function' ?
+        world.roadModel.centerForReturn(returning, vehicle.y) :
+        route && typeof world.roadModel?.centerForExit === 'function' ?
+          world.roadModel.centerForExit(route, vehicle.y) : x;
       const sameExit = route && vehicle.exitRoute?.event.id === route.id;
       if (vehicle.direction !== 1 || (!sameExit && !overlapsCorridor(vehicle, pathCenter, extent.x))) continue;
       const distance = Math.max(0, Math.abs(vehicle.y - y) - vehicle.length / 2 - extent.y);
@@ -792,5 +845,6 @@
       signedSpeed * Math.cos(angle) - v.direction * v.speed), side: hit.axis === 'x' };
   }
   return Object.freeze({ constants, densityPresets, createState, setDensity, step, limitAt, nextLimit, signsAround, getSnapshot,
-    getLaneRecommendation, requestYield, resolveContact, transitionToLocal });
+    getLaneRecommendation, requestYield, resolveContact, transitionToLocal,
+    createHighwayFromLocal, cityEntranceAllowed, highwayMergeAllowed });
 });

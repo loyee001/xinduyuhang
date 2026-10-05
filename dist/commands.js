@@ -124,7 +124,7 @@
         add({ type: 'wait', duration }, `停车等待 ${readable(duration)} 秒`);
         consumed = match[0];
       } else if ((match = remaining.match(exitPattern))) {
-        add({ type: 'exit' }, '从下一个出口驶离高速，进入普通道路');
+        add({ type: 'exit' }, '靠右准备下一个出口，然后交回手动：自己减速并向右变道驶出');
         consumed = match[0];
       } else if ((match = remaining.match(/^(?:缓慢刹车|缓慢制动|平稳停车|轻刹车|轻刹|缓刹|刹车停止|制动停车|刹车|制动|停车|停下|停止)/))) {
         const amount = /缓慢|平稳|轻刹|缓刹/.test(match[0]) ? .55 : 1;
