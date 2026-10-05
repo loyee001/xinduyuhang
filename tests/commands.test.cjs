@@ -88,7 +88,7 @@ test('bounded multi-lane requests expand into consecutive adjacent steps', () =>
   for (const raw of ['向左变三条车道', '向右变零条车道', '向左变1.5条车道']) assert.throws(() => commands.parse(raw), /1～2/);
 });
 
-test('waits finish stopped while a final exit enters the ordinary road without an implicit brake', () => {
+test('waits finish stopped while an exit request announces manual commitment without an implicit brake', () => {
   const waited = commands.parse('直行20米再停车等待三秒');
   assert.deepEqual(waited.steps.at(-1), { type: 'wait', duration: 3 });
   assert.equal(waited.steps.length, 2);
@@ -97,7 +97,7 @@ test('waits finish stopped while a final exit enters the ordinary road without a
   for (const raw of ['从下一个出口驶出高速', '下个出口驶离', '驶入下个出口', '在下一个出口驶离高速公路']) {
     const result = commands.parse(raw);
     assert.deepEqual(result.steps, [{ type: 'exit' }], raw);
-    assert.match(result.labels[0], /进入普通道路/);
+    assert.match(result.labels[0], /手动|右变道/);
     assert.doesNotMatch(result.labels[0], /停车|停止/);
   }
   assert.deepEqual(commands.parse('直行一公里后从下一个出口驶出高速').steps.map(step => step.type), ['drive', 'exit']);

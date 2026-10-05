@@ -1178,7 +1178,7 @@ test('departing NPCs brake physically, follow the curved slip road, and continue
 
 test('exit vehicles release the highway corridor after their bodies leave it', () => {
   const {state,ego,options,departure}=exitFixture();
-  departure.y=firstExit.entryStart+140;
+  departure.y=firstExit.splitStart+140;
   departure.x=entranceRoad.centerForExit(firstExit,departure.y);
   departure.exitRoute.status='ramp';
   departure.previousX=departure.x;
@@ -1196,9 +1196,9 @@ test('exit vehicles release the highway corridor after their bodies leave it', (
 test('departing traffic follows a stopped ego around the exit curve on dry and wet roads', () => {
   for(const wet of [false,true]) {
     const {state,options,departure}=exitFixture({wet});
-    departure.y=firstExit.entryStart+120;departure.x=entranceRoad.centerForExit(firstExit,departure.y);
+    departure.y=firstExit.splitStart+120;departure.x=entranceRoad.centerForExit(firstExit,departure.y);
     departure.speed=11;departure.exitRoute.status='ramp';
-    const ego={x:entranceRoad.centerForExit(firstExit,firstExit.entryStart+210),y:firstExit.entryStart+210,speed:0,heading:0,gear:'forward'};
+    const ego={x:entranceRoad.centerForExit(firstExit,firstExit.splitStart+210),y:firstExit.splitStart+210,speed:0,heading:0,gear:'forward'};
     assert.ok(Math.abs(ego.x-departure.x)>4,'the stopped ego is around the bend');
     for(let i=0;i<400;i++)traffic.step(state,ego,.1,{...options,exiting:false});
     assert.ok(departure.y<ego.y-4.5);
@@ -1208,7 +1208,7 @@ test('departing traffic follows a stopped ego around the exit curve on dry and w
 
 test('two vehicles taking the same exit preserve their following gap around the curve', () => {
   const {state,ego,options,departure}=exitFixture();
-  departure.y=firstExit.entryStart+100;departure.x=entranceRoad.centerForExit(firstExit,departure.y);departure.speed=11;
+  departure.y=firstExit.splitStart+100;departure.x=entranceRoad.centerForExit(firstExit,departure.y);departure.speed=11;
   const leader=vehicle({id:90,lane:2,y:departure.y+75,x:entranceRoad.centerForExit(firstExit,departure.y+75),speed:0,cruiseFactor:0,
     exitRoute:{event:firstExit,status:'ramp'}});
   state.vehicles.push(leader);
@@ -1219,8 +1219,8 @@ test('two vehicles taking the same exit preserve their following gap around the 
 
 test('exit-path snapshots see the next curved-route car without confusing highway traffic', () => {
   const {state,options,departure}=exitFixture();
-  departure.y=firstExit.entryStart+230;departure.x=entranceRoad.centerForExit(firstExit,departure.y);departure.exitRoute.status='ramp';
-  const y=firstExit.entryStart+120,ego={x:entranceRoad.centerForExit(firstExit,y),y,speed:10,heading:0,exitRoute:firstExit};
+  departure.y=firstExit.splitStart+230;departure.x=entranceRoad.centerForExit(firstExit,departure.y);departure.exitRoute.status='ramp';
+  const y=firstExit.splitStart+120,ego={x:entranceRoad.centerForExit(firstExit,y),y,speed:10,heading:0,exitRoute:firstExit};
   state.vehicles.push(vehicle({id:99,lane:2,x:3.75,y:y+25,speed:20}));
   const snapshot=traffic.getSnapshot(state,ego);
   assert.equal(snapshot.nearestAhead.id,departure.id);
@@ -1228,11 +1228,28 @@ test('exit-path snapshots see the next curved-route car without confusing highwa
   assert.ok(Math.abs(ego.x-departure.x)>5);
 });
 
+test('return-path snapshots see the mainline again and ignore cars continuing along the cancelled exit', () => {
+  const { state } = exitFixture();
+  const returning = entranceRoad.createExitReturn(firstExit, { x: 7.125, y: 1960, speed: 15, heading: 0 });
+  const ego = { x: 4.5, y: 2200, speed: 15, heading: 0, exitRoute: firstExit, exitReturn: returning };
+  const mainline = vehicle({ id: 991, lane: 2, x: 3.75, y: 2215, speed: 12 });
+  const mainlineBehind = vehicle({ id: 992, lane: 2, x: 3.75, y: 2180, speed: 14 });
+  const continuingExit = vehicle({ id: 993, lane: 2, x: 29, y: 2205, speed: 10,
+    exitRoute: { event: firstExit, status: 'local' } });
+  state.vehicles = [continuingExit, mainline, mainlineBehind];
+  const snapshot = traffic.getSnapshot(state, ego);
+  assert.equal(snapshot.nearestAhead.id, mainline.id);
+  assert.equal(snapshot.nearestBehind.id, mainlineBehind.id);
+  assert.ok(snapshot.nearestAhead.distance > 0 && snapshot.nearestAhead.distance < 15);
+  assert.equal(traffic.getSnapshot(state, { ...ego, exitReturn: null }).nearestAhead.id, continuingExit.id,
+    'the cancelled route alone would incorrectly keep looking down the slip road');
+});
+
 test('ordinary-road transition preserves nearby departing cars and reuses their exact poses without overcrowding', () => {
   for(const density of ['low','medium','dense']) {
     const {state,options,departure}=exitFixture({density});
     departure.x=29;departure.y=firstExit.rampEnd+70;departure.exitRoute.status='local';departure.speed=12;
-    const behind=vehicle({id:990,lane:2,y:firstExit.entryStart+300,x:entranceRoad.centerForExit(firstExit,firstExit.entryStart+300),speed:11,
+    const behind=vehicle({id:990,lane:2,y:firstExit.splitStart+300,x:entranceRoad.centerForExit(firstExit,firstExit.splitStart+300),speed:11,
       exitRoute:{event:firstExit,status:'ramp'}});
     state.vehicles.push(behind);
     const ego={x:29,y:firstExit.rampEnd+1,speed:11,heading:0,gear:'forward'};
@@ -1291,4 +1308,67 @@ test('dense exit recycling keeps both retirement and replacement beyond the rend
   const recycledY=departure.y;
   traffic.step(state,ego,.1,{...options,exiting:false});
   assert.ok(Math.abs(departure.y-recycledY)<4,'normal dense recycling must not immediately teleport the replacement back into view');
+});
+
+
+test('creating a highway background from a city world preserves time and density without moving either population', () => {
+  for (const density of ['low', 'medium', 'dense']) {
+    const ego = { x: 29, y: 5000, speed: 5, heading: 0, gear: 'forward', distance: 901 };
+    const local = traffic.createState(ego, { density, roadType: 'local' });
+    local.elapsedTime = 123.5;
+    local.nextEntranceId = 40001;
+    const localPoses = JSON.stringify(local), egoPose = JSON.stringify(ego);
+    const highway = traffic.createHighwayFromLocal(local, ego);
+    assert.equal(highway.roadType, 'highway');
+    assert.equal(highway.density, density);
+    assert.equal(highway.elapsedTime, local.elapsedTime);
+    assert.equal(highway.vehicles.length, traffic.densityPresets[density].vehicleCount);
+    assert.equal(JSON.stringify(local), localPoses);
+    assert.equal(JSON.stringify(ego), egoPose);
+    const ids = [...local.vehicles, ...highway.vehicles].map(car => car.id);
+    assert.equal(new Set(ids).size, ids.length, 'simultaneously rendered worlds need independent identities');
+    assert.ok(highway.vehicles.some(car => car.x === 3.75 && car.direction === 1));
+    assert.ok(highway.vehicles.some(car => car.x < -10 && car.direction === -1));
+    const snapshot = traffic.getSnapshot(highway, ego);
+    assert.equal(snapshot.speedLimitKmh, traffic.limitAt(ego.y));
+    assert.notEqual(snapshot.speedLimitKmh, 50);
+  }
+});
+
+test('city entrance admission predicts an approaching opposing vehicle through the whole turning corridor', () => {
+  const event = firstEntrance, ego = { x: 29, y: event.cityEntryStart + 2, speed: 5, heading: 0, gear: 'forward' };
+  for (const wet of [false, true]) {
+    const oncoming = vehicle({ x: 25.5, y: ego.y + 75, speed: 12, direction: -1, heading: 180, lane: 1 });
+    const local = { ...world([oncoming]), roadType: 'local' };
+    assert.ok(Math.abs(oncoming.y - ego.y) > 50, 'the danger is predicted, not only an immediate overlapping body');
+    const blocked = traffic.cityEntranceAllowed(local, ego, event, { wet });
+    assert.equal(blocked.allowed, false);
+    assert.match(blocked.reason, /对向|来车|间隙/);
+    oncoming.y = ego.y - 80;
+    assert.equal(traffic.cityEntranceAllowed(local, ego, event, { wet }).allowed, true,
+      'a passed opposing car moves away from the crossing');
+    oncoming.x = -18.25;
+    oncoming.y = ego.y + 75;
+    assert.equal(traffic.cityEntranceAllowed(local, ego, event, { wet }).allowed, true,
+      'unrelated highway lanes do not block the city intersection');
+    assert.equal(traffic.cityEntranceAllowed({ ...local, vehicles: [] }, ego, event, { wet }).allowed, true);
+  }
+});
+
+test('highway merge admission checks both front spacing and a fast approaching rear vehicle', () => {
+  const ego = { x: 7.125, y: 5000, speed: 10, heading: 0, gear: 'forward' };
+  for (const wet of [false, true]) {
+    const rear = vehicle({ x: 3.75, y: ego.y - 100, speed: 30, lane: 2 });
+    const state = world([rear]);
+    assert.equal(traffic.highwayMergeAllowed(state, ego, { wet }).allowed, false,
+      'a currently non-overlapping rear car can consume the merge gap');
+    rear.y = ego.y - 500;
+    assert.equal(traffic.highwayMergeAllowed(state, ego, { wet }).allowed, true);
+    state.vehicles = [vehicle({ x: 3.75, y: ego.y + 8, speed: 0, lane: 2 })];
+    assert.equal(traffic.highwayMergeAllowed(state, ego, { wet }).allowed, false);
+    state.vehicles = [vehicle({ x: 0, y: ego.y + 8, speed: 0, lane: 1 }),
+      vehicle({ id: 2, x: -18.25, y: ego.y, speed: 25, direction: -1, lane: 5 })];
+    assert.equal(traffic.highwayMergeAllowed(state, ego, { wet }).allowed, true,
+      'middle and opposite-direction lanes are outside the destination lane');
+  }
 });

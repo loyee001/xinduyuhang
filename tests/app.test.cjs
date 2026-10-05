@@ -454,8 +454,9 @@ test('collision restart preserves driving preferences while clearing locks, inpu
 });
 
 test('collision during ordinary-road cruise clears its route on restart and waits for fresh input', () => {
-  const driver = localRoadCruise(), { app, ui } = driver;
-  assert.equal(app.state.exitCruise, true);
+  const driver = localRoadAutodrive(), { app, ui } = driver;
+  assert.equal(app.state.autodrive.active, true);
+  assert.equal(app.state.exitCruise, false);
   causeVehicleCollision(driver, { local: true });
   assert.equal(app.state.exitCruise, false);
   ui('collision-restart').onclick();
@@ -603,8 +604,9 @@ function enterEmergencyShoulder(driver) {
   const { app, ui } = driver;
   app.world.vehicles = [];
   // Keep shoulder/recovery scenarios within a long dashed-line window;
-  // solid-line permissions have their own integration tests below.
-  app.car.y = 900;
+  // solid-line permissions have their own integration tests below. Stay past
+  // the exit split so a right change still means the emergency shoulder.
+  app.car.y = 1500;
   driver.setTarget(20);
   driver.key('keydown', 'KeyW');
   ui('lane-right').onclick();
@@ -1275,157 +1277,288 @@ test('an AI lane step waits for a blocked target corridor and resumes when the r
   assert.equal(app.state.estop, false);
 });
 
-test('exit selection requires the right lane, forward gear and the actual entry approach', () => {
+// Only physical user lane controls can commit an exit. This fixture leaves
+// the whole route to the real physics; no production function bypasses input.
+function enterManualExit({ speed = 10, target = speed, wet = false, input = 'button' } = {}) {
   const driver = loadApp(), { app, ui } = driver;
+  const exit = app.road.getState(0).nextExit;
   app.world.vehicles = [];
-  app.car.y = 900;
-  assert.equal(app.requestExit(), false, 'an exit cannot be selected from the middle lane');
-  assert.equal(app.state.exitActive, null);
-  assert.match(ui('toast').textContent, /右车道/);
-  app.car.x = 3.75;
+  Object.assign(app.car, { x: 3.75, y: exit.entryStart + 20, speed });
   app.state.laneTarget = 2;
-  app.car.y = 700;
-  assert.equal(app.requestExit(), false, 'the exit must first enter its approach window');
-  app.car.y = 900;
-  app.car.gear = app.state.requestedGear = 'reverse';
-  assert.equal(app.requestExit(), false);
-  assert.match(ui('toast').textContent, /前进挡/);
-  app.car.gear = app.state.requestedGear = 'forward';
-  app.render();
-  assert.equal(ui('exit-action').disabled, false);
-  ui('exit-action').onclick();
-  assert.equal(app.state.exitActive.id, 'exit-0');
-  assert.equal(app.state.exitCompleted, false);
-  assert.match(ui('exit-action').textContent, /取消/);
-  ui('exit-action').onclick();
-  assert.equal(app.state.exitActive, null, 'the route may still be cancelled before the entry');
-  app.car.y = 1341;
-  assert.equal(app.requestExit(), false, 'missing the entry must not steer backward into it');
-  assert.equal(app.state.exitActive, null);
+  app.state.wet = wet;
+  driver.setTarget(target);
+  if (input === 'button') ui('lane-right').onclick();
+  else driver.key('keydown', input);
+  assert.equal(app.state.exitActive?.id, exit.id);
+  assert.equal(app.state.exitStage, 'deceleration');
+  return driver;
+}
+
+test('exit has no action button and only a fresh manual right change enters its deceleration lane', () => {
+  for (const input of ['button', 'ArrowRight', 'KeyD']) {
+    const driver = enterManualExit({ input }), { app, document } = driver;
+    assert.equal(document.getElementById('exit-action'), null);
+    assert.equal(app.car.x, 3.75, 'accepting the input must not teleport to the new lane');
+    assert.equal(app.state.shoulderAlert, false);
+    driver.key('keydown', 'KeyW');
+    advanceUntil(driver, () => Math.abs(app.car.x - 7.125) < .12, 25);
+    assert.equal(app.state.exitStage, 'deceleration');
+    assert.equal(app.state.estop, false);
+    assert.equal(app.car.wallContactCount, 0);
+    const selected = app.state.exitActive.id;
+    driver.key('keydown', 'ArrowRight', true);
+    driver.key('keydown', 'KeyD', true);
+    assert.equal(app.state.exitActive.id, selected, 'a held key cannot queue another route');
+  }
 });
 
-test('an accepted exit slows physically on the ramp and continuously joins the ordinary road without braking', () => {
-  const driver = loadApp(), { app, ui } = driver;
+test('the exit requires the real forward entry window and rejects programmatic lane tools', () => {
+  const driver = loadApp(), { app, ui, modelTools } = driver;
+  const exit = app.road.getState(0).nextExit;
   app.world.vehicles = [];
-  Object.assign(app.car, { x: 3.75, y: 900, speed: 20 });
+  Object.assign(app.car, { x: 3.75, y: exit.entryStart + 20, speed: 10 });
   app.state.laneTarget = 2;
-  driver.setTarget(30);
+  driver.setTarget(10);
+  assert.equal(app.requestExit(), false, 'the former direct route selector is not user consent');
+  assert.equal(modelTools.get('change_rover_simulation_lane').execute({ direction: 'right' }).accepted, false);
+  assert.equal(app.state.exitActive, null, 'a model tool cannot replace manual right input');
+  for (const [name, setup] of [
+    ['before entry', () => { app.car.y = exit.entryStart - 10; }],
+    ['too late', () => { app.car.y = exit.splitStart - 5; }],
+    ['reverse gear', () => { app.car.y = exit.entryStart + 20; app.car.gear = app.state.requestedGear = 'reverse'; }]
+  ]) {
+    ui('reset-session').onclick();
+    app.world.vehicles = [];
+    Object.assign(app.car, { x: 3.75, y: exit.entryStart + 20, speed: 10 });
+    app.state.laneTarget = 2;
+    driver.setTarget(10);
+    setup();
+    ui('lane-right').onclick();
+    assert.equal(app.state.exitActive, null, name);
+  }
+});
+
+test('the deceleration lane keeps manual throttle and brake ownership without applying the ramp cap', () => {
+  const driver = enterManualExit({ speed: 15, target: 15 }), { app } = driver;
   driver.key('keydown', 'KeyW');
-  app.render();
+  driver.advance(.1);
   assert.equal(app.readState().roadType, 'highway');
-  ui('exit-action').onclick();
+  assert.ok(app.readState().roadLimitKmh >= 60);
+  assert.ok(app.car.speed > 40 / 3.6);
+  assert.equal(app.state.lastInput.brake, 0, 'entering a deceleration lane must not brake automatically');
+  assert.equal(app.state.lastInput.throttle, 1);
+  assert.equal(app.state.estop, false);
+  driver.key('keyup', 'KeyW');
+  const coastingSpeed = app.car.speed;
+  driver.advance(1);
+  assert.ok(app.car.speed < coastingSpeed && app.car.speed > 40 / 3.6);
+  assert.equal(app.state.lastInput.brake, 0);
+  driver.key('keydown', 'KeyS');
+  driver.advance(.1);
+  assert.ok(app.state.lastInput.brake > 0, 'the user can deliberately slow for the exit');
+  assert.ok(app.car.brakeDistance > 0);
+});
+
+test('a manually slowed exit follows the ramp continuously and continues on the ordinary road', () => {
+  const driver = enterManualExit({ speed: 15, target: 10 }), { app, ui } = driver;
   const exit = app.state.exitActive;
-  assert.ok(exit && exit.entryStart === 1080 && exit.rampEnd === 1850);
+  driver.key('keydown', 'KeyS');
+  advanceUntil(driver, () => app.car.speed <= 10, 8);
+  driver.key('keyup', 'KeyS');
+  driver.key('keydown', 'KeyW');
+  advanceUntil(driver, () => app.state.exitStage === 'ramp', 80, .1);
   assert.equal(app.readState().roadType, 'ramp');
-  driver.advance(0.1);
-  assert.ok(app.car.speed < 20 && app.car.speed > 19, 'the ramp cap applies braking without assigning the capped velocity');
-  assert.equal(app.state.lastInput.targetSpeed, 40 / 3.6);
-  assert.ok(app.state.lastInput.brake > 0);
+  assert.ok(app.car.speed <= 40 / 3.6);
+  assert.equal(app.state.shoulderAlert, false);
   assert.equal(app.state.estop, false);
-  assert.match(ui('road-rule-title').textContent, /40 km\/h/);
-  advanceUntil(driver, () => app.car.y > 1200, 50, 0.25);
-  assert.ok(app.car.speed <= 40 / 3.6 + 0.02);
-  assert.ok(app.car.x > 5.625, 'the exit route must actually leave the normal highway lanes');
-  assert.equal(app.state.shoulderAlert, false, 'a selected ramp must not be treated as an illegal shoulder entry');
-  assert.equal(app.state.estop, false);
-  assert.equal(ui('exit-action').disabled, true, 'the route is committed after the entry');
-  const routeId = app.state.exitActive.id;
-  ui('exit-action').onclick();
-  assert.equal(app.state.exitActive.id, routeId);
-  ui('lane-left').onclick();
-  assert.equal(app.state.laneTarget, 2, 'ordinary lane changes must not redirect an active ramp route');
-  advanceUntil(driver, () => app.car.y >= exit.rampEnd - 5, 100, 0.1);
+  advanceUntil(driver, () => app.car.y >= exit.rampEnd - 5, 100, .1);
   let previous = { ...app.car };
   for (let step = 0; step < 120 && !app.state.exitCompleted; step++) {
     driver.advance(1 / 120);
-    assert.ok(app.car.y > previous.y && app.car.y - previous.y < 0.15, 'road transition keeps continuous position');
-    assert.ok(Math.abs(app.car.x - previous.x) < 0.01);
-    assert.ok(Math.abs(app.car.speed - previous.speed) < 0.1, 'road transition keeps continuous velocity');
+    assert.ok(app.car.y > previous.y && app.car.y - previous.y < .15);
+    assert.ok(Math.abs(app.car.x - previous.x) < .01);
+    assert.ok(Math.abs(app.car.speed - previous.speed) < .1);
     assert.equal(app.state.lastInput.brake, 0);
     previous = { ...app.car };
   }
   assert.equal(app.state.exitCompleted, true);
+  assert.equal(app.state.exitStage, 'local');
   app.world.vehicles = [];
   assert.equal(app.readState().roadType, 'local');
-  assert.ok(app.car.speed > 10);
-  assert.equal(app.state.controls.get('kKeyW'), 'throttle', 'the transition retains a held manual throttle');
-  assert.equal(app.state.serviceBrake, 0);
-  assert.equal(app.state.exitCruise, false, 'manual driving must not create an AI cruise latch');
   assert.equal(app.readState().roadLimitKmh, 50);
-  assert.ok(Math.abs(app.car.x - 29) < 0.5);
-  assert.equal(app.state.estop, false);
-  assert.equal(app.state.shoulderAlert, false);
-  assert.match(ui('road-rule-title').textContent, /普通道路|普通公路/);
-  assert.doesNotMatch(ui('exit-detail').textContent, /正在停车|已停稳/);
+  assert.equal(app.state.controls.get('kKeyW'), 'throttle');
+  assert.equal(app.state.exitCruise, false);
+  assert.ok(Math.abs(app.car.x - 29) < .5);
   driver.advance(5);
   const coastStart = { y: app.car.y, speed: app.car.speed };
   driver.key('keyup', 'KeyW');
   driver.advance(3);
   assert.ok(app.car.y > coastStart.y && app.car.speed < coastStart.speed && app.car.speed > 0);
-  assert.equal(app.state.lastInput.throttle, 0);
   assert.equal(app.state.lastInput.brake, 0);
   ui('reset-session').onclick();
   assert.equal(app.state.exitActive, null);
+  assert.equal(app.state.exitReturn, null);
+  assert.equal(app.state.exitStage, null);
   assert.equal(app.state.exitCompleted, false);
-  assert.equal(app.state.exitCruise, false);
-  assert.equal(app.car.y, 0);
-  assert.equal(app.car.x, 0);
   assert.equal(app.readState().roadType, 'highway');
 });
 
-test('a compound AI plan exits, drives another 300 meters on the ordinary road and physically parks', () => {
-  const driver = loadApp(), { app } = driver;
-  app.world.vehicles = [];
-  Object.assign(app.car, { x: 3.75, y: 900 });
-  app.state.laneTarget = 2;
-  driver.setTarget(20);
-  stageAndStart(driver, '直行10米，然后从下一个出口驶离，再直行300米，最后停车');
-  assert.deepEqual(Array.from(app.state.plan.steps, step => step.type), ['drive', 'exit', 'drive', 'brake']);
-  advanceUntil(driver, () => !!app.state.exitActive, 15);
-  assert.equal(app.state.plan.status, 'running');
-  assert.equal(app.state.plan.phase, 1);
-  assert.equal(app.state.exitActive.id, 'exit-0');
-  advanceUntil(driver, () => app.state.exitCompleted, 120, 0.25);
-  assert.ok(app.car.speed > 0);
-  assert.equal(app.state.plan.status, 'running');
-  assert.equal(app.state.plan.phase, 2, 'the next drive starts when the car reaches the ordinary road');
-  assert.equal(app.state.exitCruise, false, 'an unfinished compound plan retains control of its own next step');
-  assert.equal(app.readState().roadType, 'local');
-  assert.equal(app.state.lastInput.brake, 0);
-  const localStartDistance = app.state.plan.stepDistance;
-  advanceUntil(driver, () => app.state.plan.status === 'completed', 50, 0.1);
-  assert.equal(app.car.speed, 0);
-  assert.ok(app.car.x > 28 && app.car.y >= 2150);
-  assert.ok(app.car.distance - localStartDistance >= 300 && app.car.distance - localStartDistance < 330);
-  assert.ok(app.car.lastBrakeDistance > 0);
-  assert.equal(app.state.estop, false);
-  assert.equal(app.state.shoulderAlert, false);
-  assert.equal(app.state.exitCruise, false);
+test('overspeed at the split returns physically to the highway without braking or teleporting', () => {
+  for (const wet of [false, true]) {
+    const driver = enterManualExit({ speed: 15, target: 15, wet }), { app } = driver;
+    driver.key('keydown', 'KeyW');
+    advanceUntil(driver, () => app.state.exitStage === 'returning', 40, 1 / 60);
+    assert.ok(app.car.speed > 40 / 3.6);
+    assert.ok(app.car.x > 5.625);
+    assert.equal(app.state.lastInput.brake, 0);
+    assert.equal(app.state.exitCompleted, false);
+    const returnStart = { ...app.car }, selected = app.state.exitActive.id;
+    let previous = { ...app.car }, samples = 0;
+    while (app.state.exitActive && samples++ < 40 * 120) {
+      driver.advance(1 / 120);
+      assert.ok(app.car.y > previous.y, 'returning keeps forward momentum');
+      assert.ok(Math.abs(app.car.x - previous.x) < .2, 'returning is a path, not a position assignment');
+      assert.ok(Math.abs(app.car.speed - previous.speed) < .1);
+      assert.equal(app.state.lastInput.brake, 0, 'the ramp overspeed response is return, not automatic braking');
+      assert.equal(app.state.collision, null, 'the return must stay clear of the outside rail');
+      previous = { ...app.car };
+    }
+    assert.equal(app.state.exitActive, null);
+    assert.equal(app.state.exitReturn, null);
+    assert.equal(app.state.exitStage, null);
+    assert.equal(app.state.laneTarget, 2);
+    assert.ok(Math.abs(app.car.x - 3.75) <= .15);
+    assert.ok(app.car.y > returnStart.y + 20);
+    assert.equal(app.state.controls.get('kKeyW'), 'throttle');
+    assert.equal(app.state.estop, false);
+    assert.equal(app.state.shoulderAlert, false);
+    driver.key('keyup', 'KeyW');
+    driver.key('keydown', 'ArrowRight');
+    assert.notEqual(app.state.exitActive?.id, selected, 'a missed exit cannot be reselected behind the car');
+  }
 });
 
-// The complete geometry is exercised above. These fixtures place a selected
-// exit just before its endpoint to isolate cruise handoff and interruption.
-function localRoadCruise() {
-  const driver = loadApp(), { app } = driver;
+test('new ramp overspeed also returns and cannot be overridden by AI, repeated right keys or reverse gear', () => {
+  const driver = enterManualExit(), { app, ui } = driver;
+  driver.key('keydown', 'KeyW');
+  advanceUntil(driver, () => app.state.exitStage === 'ramp', 60, .1);
+  app.car.speed = 14;
+  const before = { ...app.car };
+  driver.advance(1 / 120);
+  assert.equal(app.state.exitStage, 'returning');
+  assert.ok(Math.abs(app.car.x - before.x) < .2 && app.car.y > before.y);
+  assert.equal(app.state.lastInput.brake, 0);
+  const returning = app.state.exitReturn;
+  driver.key('keydown', 'KeyD');
+  ui('gear-reverse').onclick();
+  app.submitCommand('直行20米');
+  assert.equal(app.startPlan(), false);
+  ui('auto-start').onclick();
+  assert.equal(app.state.autodrive.active, false);
+  assert.equal(app.state.exitReturn, returning);
+  assert.equal(app.state.requestedGear, 'forward');
+  assert.equal(app.state.exitStage, 'returning');
+});
+
+test('the ramp limit boundary allows exactly 40 km/h and rejects a measurable excess', () => {
+  for (const [speed, stage] of [[40 / 3.6, 'ramp'], [40 / 3.6 + .03, 'returning']]) {
+    const driver = enterManualExit({ speed: 10 }), { app } = driver;
+    Object.assign(app.car, { x: 7.125, y: app.state.exitActive.splitStart - .02, heading: 0, steer: 0, speed });
+    app.state.laneChanging = false;
+    driver.advance(1 / 120);
+    assert.equal(app.state.exitStage, stage);
+    assert.equal(app.state.lastInput.brake, 0);
+  }
+});
+
+test('a manual left change cancels from the deceleration lane through a continuous return', () => {
+  const driver = enterManualExit(), { app, ui } = driver;
+  driver.key('keydown', 'KeyW');
+  advanceUntil(driver, () => Math.abs(app.car.x - 7.125) < .12, 25);
+  const before = { ...app.car };
+  assert.equal(ui('lane-left').onclick(), true);
+  assert.equal(app.state.exitStage, 'returning');
+  assert.equal(app.car.x, before.x);
+  assert.equal(app.car.y, before.y);
+  assert.equal(app.car.speed, before.speed);
+  driver.advance(.1);
+  assert.equal(app.state.lastInput.brake, 0);
+  assert.equal(app.state.controls.get('kKeyW'), 'throttle');
+  advanceUntil(driver, () => app.state.exitActive === null, 50, .1);
+  assert.ok(Math.abs(app.car.x - 3.75) < .15);
+  assert.ok(app.car.y > before.y + 100);
+  assert.equal(app.state.exitCompleted, false);
+  assert.equal(app.state.collision, null);
+});
+
+test('reset during an overspeed return removes the route and waits for a fresh driving input', () => {
+  const driver = enterManualExit({ speed: 15, target: 15 }), { app, ui } = driver;
+  driver.key('keydown', 'KeyW');
+  advanceUntil(driver, () => app.state.exitStage === 'returning', 40, .1);
+  ui('reset-session').onclick();
+  assert.equal(app.state.exitActive, null);
+  assert.equal(app.state.exitReturn, null);
+  assert.equal(app.state.exitStage, null);
+  assert.equal(app.state.skippedExit, null);
+  driver.key('keydown', 'KeyW', true);
+  driver.advance(1);
+  assert.equal(app.car.speed, 0);
+  assert.equal(app.car.x, 0);
+  assert.equal(app.car.y, 0);
+  assert.equal(app.state.lastInput.brake, 0);
+});
+
+test('an AI exit plan hands off without automatically entering or executing its later clauses', () => {
+  const driver = loadApp(), { app, ui } = driver;
   app.world.vehicles = [];
-  Object.assign(app.car, { x: 3.75, y: 900, speed: 40 / 3.6 });
+  const exit = app.road.getState(0).nextExit;
+  Object.assign(app.car, { x: 3.75, y: exit.entryStart - 100, speed: 10 });
   app.state.laneTarget = 2;
-  driver.setTarget(30);
-  assert.equal(app.requestExit(), true);
-  Object.assign(app.car, { x: 29, y: app.state.exitActive.rampEnd - 0.2, heading: 0, steer: 0 });
-  stageAndStart(driver, '从下一个出口驶离');
-  advanceUntil(driver, () => app.state.plan.status === 'completed', 2);
-  // Joining the ordinary road intentionally creates its own traffic world.
-  // Keep these controller tests isolated from independently tested following.
+  driver.setTarget(10);
+  stageAndStart(driver, '直行10米，然后从下一个出口驶离，再直行300米，最后停车');
+  advanceUntil(driver, () => app.state.plan.status === 'handoff', 10);
+  assert.equal(app.state.plan.phase, 1);
+  assert.equal(app.state.exitActive, null);
+  assert.equal(app.state.serviceBrake, 0, 'handoff must not silently slow the car for the ramp');
+  assert.match(ui('task-waiting').textContent + ui('ai-feedback').textContent, /手动|右变道/);
+  driver.advance(10);
+  assert.equal(app.state.plan.status, 'handoff');
+  assert.equal(app.state.plan.phase, 1, 'later drive and park clauses wait for an explicit new user action');
+  assert.equal(app.state.exitActive, null);
+  assert.equal(app.state.lastInput.brake, 0);
+});
+
+// Full entry and ramp geometry are exercised above. Place the already manual
+// route near its endpoint here to isolate ordinary-road controller behavior.
+function localRoadManual() {
+  const driver = enterManualExit(), { app } = driver;
+  app.state.exitStage = 'ramp';
+  app.state.laneChanging = false;
+  Object.assign(app.car, { x: 29, y: app.state.exitActive.rampEnd - .2, heading: 0, steer: 0 });
+  driver.key('keydown', 'KeyW');
+  advanceUntil(driver, () => app.state.exitCompleted, 2);
   app.world.vehicles = [];
+  // Controller fixtures use an empty road; timed entrances and late city
+  // arrivals are covered separately with explicit moving traffic below.
+  if (app.state.highwayTraffic) {
+    app.state.highwayTraffic.vehicles = [];
+    app.state.highwayTraffic.nextEntranceArrival = app.car.elapsedTime + 10000;
+  }
   assert.equal(app.readState().roadType, 'local');
-  assert.equal(app.state.exitCruise, true);
+  return driver;
+}
+
+function localRoadAutodrive() {
+  const driver = localRoadManual(), { app } = driver;
+  startAutomatic(driver);
+  assert.equal(app.state.autodrive.active, true);
+  assert.equal(app.state.exitCruise, false);
   assert.ok(app.car.speed > 0);
   return driver;
 }
 
-test('a final AI exit step hands off to continuous ordinary-road cruising for several kilometers', () => {
-  const driver = localRoadCruise(), { app } = driver;
+test('automatic driving after a manual exit continues on the ordinary road for several kilometers', () => {
+  const driver = localRoadAutodrive(), { app } = driver;
   const initialY = app.car.y, initialDistance = app.car.distance, exitId = app.state.exitActive.id;
   for (let minute = 0; minute < 5; minute++) {
     const previousY = app.car.y;
@@ -1436,8 +1569,8 @@ test('a final AI exit step hands off to continuous ordinary-road cruising for se
     assert.equal(app.readState().roadType, 'local');
     assert.equal(app.readState().roadLimitKmh, 50);
     assert.equal(app.state.exitActive.id, exitId, 'passing other highway events must not replace the selected local route');
-    assert.equal(app.state.plan.status, 'completed');
-    assert.equal(app.state.exitCruise, true);
+    assert.equal(app.state.autodrive.active, true);
+    assert.equal(app.state.exitCruise, false);
     assert.equal(app.state.lastInput.throttle, 1);
     assert.equal(app.state.lastInput.brake, 0);
     assert.equal(app.state.estop, false);
@@ -1447,7 +1580,7 @@ test('a final AI exit step hands off to continuous ordinary-road cruising for se
 });
 
 test('ordinary-road overspeed braking reduces speed physically to 50 km/h and then resumes cruise', () => {
-  const driver = localRoadCruise(), { app, ui } = driver;
+  const driver = localRoadAutodrive(), { app, ui } = driver;
   app.car.speed = 25;
   driver.advance(0.1);
   assert.ok(app.car.speed < 25 && app.car.speed > 24, 'the ordinary-road cap must not assign velocity directly');
@@ -1461,11 +1594,12 @@ test('ordinary-road overspeed braking reduces speed physically to 50 km/h and th
   assert.equal(app.state.autoLimitBraking, false);
   assert.equal(app.state.lastInput.brake, 0);
   assert.equal(app.state.lastInput.throttle, 1);
-  assert.equal(app.state.exitCruise, true);
+  assert.equal(app.state.autodrive.active, true);
+  assert.equal(app.state.exitCruise, false);
   assert.equal(app.state.estop, false);
 });
 
-test('manual shortcuts, requested braking and focus loss all cancel automatic exit cruise', () => {
+test('manual shortcuts, requested braking and focus loss cancel ordinary-road automatic driving', () => {
   const interruptions = [
     ['manual throttle', driver => driver.key('keydown', 'KeyW'), false],
     ['manual lane shortcut', driver => driver.key('keydown', 'KeyA'), false],
@@ -1475,9 +1609,11 @@ test('manual shortcuts, requested braking and focus loss all cancel automatic ex
     ['focus loss', driver => driver.dispatch('blur'), true]
   ];
   for (const [name, interrupt, braking] of interruptions) {
-    const driver = localRoadCruise(), { app } = driver;
+    const driver = localRoadAutodrive(), { app } = driver;
+    const localLane = app.state.laneTarget;
     interrupt(driver);
     assert.equal(app.state.exitCruise, false, name);
+    assert.equal(app.state.autodrive.active, false, name);
     driver.advance(0.1);
     assert.equal(app.state.lastInput.brake > 0, braking, name);
     if (name === 'manual throttle') {
@@ -1494,19 +1630,20 @@ test('manual shortcuts, requested braking and focus loss all cancel automatic ex
       assert.equal(app.state.lastInput.throttle, 0, name);
     } else {
       assert.equal(app.state.lastInput.throttle, 0);
-      assert.equal(app.state.laneTarget, 2, 'taking over does not steer into the opposing ordinary-road lane');
+      assert.equal(app.state.laneTarget, localLane, 'taking over does not steer into the opposing ordinary-road lane');
     }
     assert.equal(app.readState().roadType, 'local', name);
   }
 });
 
 test('the one-lane ordinary road rejects cross-direction lane changes and permits a new speed-drive-stop task', () => {
-  const driver = localRoadCruise(), { app, ui } = driver;
-  const positionX = app.car.x;
-  assert.equal(ui('lane-left').disabled, true);
+  const driver = localRoadAutodrive(), { app, ui } = driver;
+  const positionX = app.car.x, localLane = app.state.laneTarget;
+  assert.equal(app.state.entranceActive, null);
   assert.equal(ui('lane-right').disabled, true);
   for (const direction of ['left', 'right']) ui('lane-' + direction).onclick();
-  assert.equal(app.state.laneTarget, 2);
+  assert.equal(app.state.entranceActive, null, 'outside a marked entrance the left control does not cross the city center line');
+  assert.equal(app.state.laneTarget, localLane);
   assert.equal(app.state.laneChanging, false);
   driver.advance(1);
   assert.ok(Math.abs(app.car.x - positionX) < 0.02);
@@ -1521,7 +1658,7 @@ test('the one-lane ordinary road rejects cross-direction lane changes and permit
 });
 
 test('ordinary-road reverse tasks work after stopping and reset clears the cruise route', () => {
-  const driver = localRoadCruise(), { app, ui } = driver;
+  const driver = localRoadAutodrive(), { app, ui } = driver;
   // Leave enough ordinary road behind the car to keep this reverse maneuver
   // distinct from the separate protection at the former motorway ramp.
   driver.advance(20);
@@ -1545,14 +1682,244 @@ test('ordinary-road reverse tasks work after stopping and reset clears the cruis
   assert.equal(app.car.y, 0);
   assert.equal(app.car.speed, 0);
   assert.equal(app.state.requestedGear, 'forward');
-  const cruising = localRoadCruise();
-  assert.equal(cruising.app.state.exitCruise, true);
+  const cruising = localRoadAutodrive();
+  assert.equal(cruising.app.state.autodrive.active, true);
   cruising.ui('reset-session').onclick();
-  assert.equal(cruising.app.state.exitCruise, false, 'reset also clears a currently active cruise latch');
+  assert.equal(cruising.app.state.autodrive.active, false, 'reset also clears active automatic driving');
   assert.equal(cruising.app.state.exitActive, null);
   assert.equal(cruising.app.readState().roadType, 'highway');
   cruising.advance(1);
   assert.equal(cruising.app.car.speed, 0);
+});
+
+function cityEntranceFixture({ input = null, speed = 5, yOffset = 2 } = {}) {
+  const driver = localRoadManual(), { app, ui } = driver;
+  const event = app.road.getState(app.car.y).nextCityEntrance;
+  assert.ok(event, 'ordinary roads must expose upcoming highway entrances');
+  app.world.vehicles = [];
+  if (app.state.highwayTraffic) {
+    app.state.highwayTraffic.vehicles = [];
+    app.state.highwayTraffic.nextEntranceArrival = app.car.elapsedTime + 1000;
+  }
+  Object.assign(app.car, { x: 29, y: event.cityEntryStart + yOffset, heading: 0, steer: 0, speed });
+  driver.setTarget(5);
+  if (input === 'button') ui('lane-left').onclick();
+  else if (input) driver.key('keydown', input);
+  return { ...driver, event };
+}
+
+test('a city entrance accepts only a fresh manual left control and keeps its approach position continuous', () => {
+  for (const input of ['button', 'ArrowLeft', 'KeyA']) {
+    const driver = cityEntranceFixture(), { app, ui, event } = driver;
+    const before = { ...app.car };
+    app.render();
+    assert.equal(ui('lane-left').disabled, false);
+    if (input === 'button') ui('lane-left').onclick();
+    else driver.key('keydown', input);
+    assert.equal(app.state.entranceActive?.id, event.id, input);
+    assert.equal(app.state.entranceStage, 'joining');
+    assert.equal(app.readState().roadType, 'entrance');
+    assert.equal(app.car.x, before.x);
+    assert.equal(app.car.y, before.y);
+    assert.equal(app.car.speed, before.speed);
+    assert.equal(app.state.exitCompleted, true, 'keep the city route until the physical merge finishes');
+    const selected = app.state.entranceActive;
+    driver.key('keydown', 'ArrowLeft', true);
+    driver.key('keydown', 'KeyA', true);
+    assert.equal(app.state.entranceActive, selected);
+    assert.equal(app.state.estop, false);
+  }
+});
+
+test('city double-yellow markings reject crossing outside the entrance, above 20 km/h, in reverse or by AI', () => {
+  const cases = [
+    ['before opening', (driver) => { driver.app.car.y = driver.event.cityEntryStart - 1; }],
+    ['missed opening', (driver) => { driver.app.car.y = driver.event.cityEntryEnd + 1; }],
+    ['too fast', (driver) => { driver.app.car.speed = 20 / 3.6 + .2; }],
+    ['reverse', (driver) => { driver.app.car.gear = driver.app.state.requestedGear = 'reverse'; }],
+    ['not centered', (driver) => { driver.app.car.x = 28.4; }]
+  ];
+  for (const [name, setup] of cases) {
+    const driver = cityEntranceFixture(), { app, ui } = driver;
+    setup(driver);
+    const before = { x: app.car.x, y: app.car.y, speed: app.car.speed };
+    ui('lane-left').onclick();
+    assert.equal(app.state.entranceActive, null, name);
+    assert.equal(app.car.x, before.x, name);
+    assert.equal(app.car.y, before.y, name);
+    assert.equal(app.car.speed, before.speed, name);
+    assert.equal(app.readState().roadType, 'local', name);
+  }
+  const driver = cityEntranceFixture(), { app, ui, modelTools } = driver;
+  ui('lane-right').onclick();
+  assert.equal(app.state.entranceActive, null, 'the outside of the city lane is not a highway entrance');
+  assert.equal(modelTools.get('change_rover_simulation_lane').execute({ direction: 'left' }).accepted, false);
+  assert.equal(app.state.entranceActive, null, 'AI cannot replace manual entrance consent');
+  driver.key('keydown', 'ArrowLeft', true);
+  assert.equal(app.state.entranceActive, null, 'a key already held before the opening cannot commit the entrance');
+});
+
+test('a dangerous oncoming car blocks the city entrance until its real corridor clears', () => {
+  const driver = cityEntranceFixture(), { app, ui } = driver;
+  const oncoming = { ...adviceVehicle(1, app.car.y + 75, 12, 911), x: 25.5,
+    previousX: 25.5, direction: -1, heading: 180 };
+  app.world.vehicles = [oncoming];
+  assert.equal(ui('lane-left').onclick(), false);
+  assert.equal(app.state.entranceActive, null);
+  assert.match(ui('toast').textContent, /对向|来车|间隙|等待/);
+  app.world.vehicles = [];
+  assert.equal(ui('lane-left').onclick(), true);
+  assert.equal(app.state.entranceStage, 'joining');
+});
+
+test('a parked selected city entrance rechecks opposing traffic before a delayed throttle starts the turn', () => {
+  const driver = cityEntranceFixture({ speed: 0 }), { app, ui } = driver;
+  driver.key('keyup', 'KeyW');
+  const oncoming = { ...adviceVehicle(1, app.car.y + 180, 12, 912), x: 25.5,
+    previousX: 25.5, direction: -1, heading: 180, cruiseFactor: 12 / (50 / 3.6) };
+  app.world.vehicles = [oncoming];
+  const origin = { ...app.car };
+  assert.equal(ui('lane-left').onclick(), true, 'a future route can be selected while its current gap is safe');
+  driver.advance(10);
+  assert.equal(app.car.speed, 0);
+  assert.equal(app.car.x, origin.x);
+  assert.equal(app.car.y, origin.y);
+  assert.ok(oncoming.y - app.car.y > 58 && oncoming.y - app.car.y < 62);
+  driver.key('keydown', 'KeyW');
+  driver.advance(.5);
+  assert.equal(app.state.lastInput.throttle, 0, 'old route selection must not preserve a stale turning permission');
+  assert.ok(app.car.speed < .1);
+  assert.ok(Math.abs(app.car.x - origin.x) < .02 && app.car.y - origin.y < .2,
+    'any slight startup is physically braked within the original city lane');
+  assert.equal(app.state.collision, null);
+  driver.advance(8);
+  assert.equal(app.state.collision, null, 'the delayed turn cannot cross the approaching car');
+  assert.ok(app.car.x < origin.x && app.car.y > origin.y, 'held manual throttle may proceed after the opposing car has passed');
+});
+
+test('full 20 km/h city-entry targets never cut across close opposing traffic on dry or wet starts', () => {
+  for (const [wet, speed, frontDistance] of [[false, 0, 40], [true, 0, 40], [false, 5, 34], [true, 5, 32]]) {
+    const driver = cityEntranceFixture({ speed }), { app, ui } = driver;
+    driver.key('keyup', 'KeyW');
+    app.state.wet = wet;
+    driver.setTarget(20 / 3.6);
+    const oncoming = { ...adviceVehicle(1, app.car.y + frontDistance, 12, 913), x: 25.5,
+      previousX: 25.5, direction: -1, heading: 180, cruiseFactor: 12 / (50 / 3.6) };
+    app.world.vehicles = [oncoming];
+    const accepted = ui('lane-left').onclick();
+    driver.key('keydown', 'KeyW');
+    for (let tick = 0; tick < 200; tick++) {
+      driver.advance(.05);
+      assert.equal(app.state.collision, null,
+        `wet=${wet}, start=${speed} m/s, oncoming=${frontDistance} m: reject or yield instead of cutting across`);
+      if (!accepted) {
+        assert.equal(app.state.entranceActive, null);
+        assert.ok(Math.abs(app.car.x - 29) < .1, 'a rejected left gesture keeps the original city lane');
+      }
+    }
+  }
+});
+
+test('a real manual highway exit, city journey and new entrance returns to the same live highway world', () => {
+  const driver = enterManualExit({ speed: 10, target: 10 }), { app, ui } = driver;
+  driver.key('keydown', 'KeyW');
+  advanceUntil(driver, () => app.state.exitCompleted, 130, .1);
+  const cityWorld = app.world, highwayWorld = app.state.highwayTraffic;
+  assert.ok(highwayWorld && highwayWorld !== cityWorld);
+  assert.equal(cityWorld.roadType, 'local');
+  assert.equal(highwayWorld.roadType, 'highway');
+  const event = app.road.getState(app.car.y).nextCityEntrance;
+  app.world.vehicles = [];
+  highwayWorld.vehicles = [];
+  highwayWorld.nextEntranceArrival = app.car.elapsedTime + 1000;
+  driver.key('keyup', 'KeyW');
+  driver.key('keydown', 'KeyS');
+  advanceUntil(driver, () => app.car.speed <= 5, 8);
+  driver.key('keyup', 'KeyS');
+  driver.setTarget(5);
+  driver.key('keydown', 'KeyW');
+  const cityStart = { ...app.car };
+  advanceUntil(driver, () => app.car.y >= event.cityEntryStart + 1, 60, .05);
+  assert.ok(app.car.y > cityStart.y, 'drive through the ordinary road instead of placing the car at the entrance');
+  assert.equal(ui('lane-left').onclick(), true);
+  assert.equal(app.state.highwayTraffic, highwayWorld);
+  const sentinel = adviceVehicle(0, app.car.y + 300, 15, 9917);
+  highwayWorld.vehicles = [sentinel];
+  const sentinelStart = sentinel.y, entryY = app.car.y;
+  let previous = { ...app.car }, samples = 0;
+  while (app.state.entranceActive && samples++ < 150 * 60) {
+    driver.advance(1 / 60);
+    assert.ok(app.car.y >= previous.y && app.car.y - previous.y < .3);
+    assert.ok(Math.abs(app.car.x - previous.x) < .15, 'all entry and merge positions come from motion');
+    assert.ok(Math.abs(app.car.speed - previous.speed) < .2);
+    assert.equal(app.state.collision, null);
+    assert.equal(app.state.shoulderAlert, false);
+    previous = { ...app.car };
+  }
+  assert.equal(app.state.entranceActive, null);
+  assert.equal(app.state.entranceStage, null);
+  assert.equal(app.state.exitActive, null);
+  assert.equal(app.state.exitCompleted, false);
+  assert.equal(app.state.exitReturn, null);
+  assert.equal(app.readState().roadType, 'highway');
+  assert.equal(app.world, highwayWorld, 'the highway traffic was running before the merge, not spawned at completion');
+  assert.ok(app.world.vehicles.includes(sentinel));
+  assert.ok(sentinel.y > sentinelStart + 100);
+  assert.ok(app.car.y > entryY + 200 && Math.abs(app.car.x - 3.75) < .15);
+  assert.equal(app.state.laneTarget, 2);
+  assert.equal(app.state.laneChanging, false);
+  assert.equal(app.readState().roadLimitKmh, app.traffic.limitAt(app.car.y));
+  assert.equal(app.state.estop, false);
+  assert.equal(app.state.controls.get('kKeyW'), 'throttle');
+  driver.advance(.5);
+  assert.equal(app.state.lastInput.guardrails, true);
+});
+
+test('a blocked highway merge physically waits for a clear gap without acquiring automatic throttle', () => {
+  const driver = cityEntranceFixture({ input: 'button' }), { app } = driver;
+  const route = app.state.entranceActive;
+  driver.key('keydown', 'KeyW');
+  advanceUntil(driver, () => app.car.y > route.crossingEnd + 10, 35, .1);
+  app.state.highwayTraffic.vehicles = Array.from({ length: 28 }, (_, index) =>
+    ({ ...adviceVehicle(2, route.mergeStart - 60 + index * 10, 0, 922 + index), cruiseFactor: 0 }));
+  advanceUntil(driver, () => app.state.entranceStage === 'waiting', 80, .05);
+  assert.ok(app.car.y < route.mergeStart);
+  const waitAt = app.car.y, speed = app.car.speed;
+  driver.advance(.1);
+  assert.ok(app.car.speed <= speed && app.car.y >= waitAt, 'wait braking keeps physical motion');
+  advanceUntil(driver, () => app.car.speed === 0, 25, .05);
+  assert.ok(app.car.y > waitAt && app.car.y < route.mergeStart - 12);
+  assert.ok(app.car.lastBrakeDistance > 0, 'the merge protection stops through a real braking distance');
+  assert.equal(app.state.entranceStage, 'waiting');
+  driver.key('keyup', 'KeyW');
+  app.state.highwayTraffic.vehicles = [];
+  driver.advance(1);
+  assert.equal(app.state.lastInput.throttle, 0, 'an available gap does not press the user throttle');
+  driver.key('keydown', 'KeyW');
+  advanceUntil(driver, () => app.state.entranceActive === null, 100, .1);
+  assert.equal(app.readState().roadType, 'highway');
+  assert.equal(app.state.estop, false);
+});
+
+test('reset during a city entrance clears both route states and background traffic ownership', () => {
+  const driver = cityEntranceFixture({ input: 'KeyA' }), { app, ui } = driver;
+  driver.key('keydown', 'KeyW');
+  driver.advance(2);
+  assert.ok(app.state.entranceActive);
+  ui('reset-session').onclick();
+  assert.equal(app.state.entranceActive, null);
+  assert.equal(app.state.entranceStage, null);
+  assert.equal(app.state.highwayTraffic, null);
+  assert.equal(app.state.localTraffic, null);
+  assert.equal(app.state.exitActive, null);
+  assert.equal(app.state.exitCompleted, false);
+  assert.equal(app.car.x, 0);
+  assert.equal(app.car.y, 0);
+  assert.equal(app.car.speed, 0);
+  assert.equal(app.world.roadType, 'highway');
+  driver.key('keydown', 'KeyW', true);
+  driver.advance(1);
+  assert.equal(app.car.speed, 0);
 });
 
 test('Chinese digit sequences keep their complete distance and malformed numerals reject the whole command', () => {
@@ -1911,31 +2278,26 @@ test('automatic driving anticipates the next generated lower limit and crosses i
   assert.equal(app.state.estop, false);
 });
 
-test('the automatic exit route keeps driving after joining the ordinary road without a second cruise owner', () => {
-  const driver = loadApp(), { app } = driver;
+test('the automatic exit route hands control to the user instead of choosing the deceleration lane', () => {
+  const driver = loadApp(), { app, ui } = driver;
   app.world.vehicles = [];
-  Object.assign(app.car, { x: 3.75, y: 900 });
+  const exit = app.road.getState(0).nextExit;
+  Object.assign(app.car, { x: 3.75, y: exit.entryStart - 500 });
   app.state.laneTarget = 2;
   driver.setTarget(5);
   startAutomatic(driver, 'exit');
-  assert.equal(app.state.speedLimit, 5, 'the automatic exit plan also keeps the manual speed setting independent');
-  advanceUntil(driver, () => !!app.state.exitActive, 10);
-  assert.equal(app.readState().roadType, 'ramp');
-  advanceUntil(driver, () => app.state.exitCompleted, 130, 0.25);
-  assert.equal(app.readState().roadType, 'local');
-  assert.equal(app.state.autodrive.active, true);
-  assert.equal(app.state.exitCruise, false, 'autonomous mode must remain the sole continuous controller');
-  assert.equal(app.state.speedLimit, 5);
-  assert.ok(app.car.speed > 0);
-  app.world.vehicles = [];
-  const localY = app.car.y;
-  driver.advance(10);
-  assert.ok(app.car.y > localY + 100);
-  assert.ok(Math.abs(app.car.x - 29) < 0.1);
-  assert.ok(app.car.speed <= 50 / 3.6 + 0.01);
-  assert.equal(app.state.laneChanging, false);
+  advanceUntil(driver, () => app.state.plan.status === 'handoff', 30, .1);
+  assert.equal(app.state.speedLimit, 5, 'route assistance keeps the manual speed setting independent');
+  assert.equal(app.state.autodrive.active, false);
+  assert.equal(app.state.exitActive, null);
+  assert.equal(app.state.serviceBrake, 0);
+  assert.ok(app.car.speed > 0, 'handoff preserves actual momentum');
+  assert.match(ui('task-waiting').textContent + ui('ai-feedback').textContent, /手动|右变道/);
+  driver.advance(25);
+  assert.equal(app.state.exitActive, null, 'without a new right gesture the car stays on the main road');
+  assert.equal(app.state.exitCompleted, false);
+  assert.equal(app.state.lastInput.brake, 0);
   assert.equal(app.state.shoulderAlert, false);
-  assert.equal(app.state.estop, false);
 });
 
 test('an automatic exit uses its actual cruising speed to reserve room before a solid section', () => {
@@ -1960,13 +2322,14 @@ test('an automatic exit uses its actual cruising speed to reserve room before a 
   assert.equal(app.state.autodrive.active, true);
 });
 
-test('changing an active automatic route to the next exit keeps control and starts the selected route', () => {
+test('changing an active automatic route assists toward the exit but still requires manual commitment', () => {
   const driver = loadApp(), { app, document } = driver;
   app.world.vehicles = [];
-  Object.assign(app.car, { x: 3.75, y: 900 });
+  const exit = app.road.getState(0).nextExit;
+  Object.assign(app.car, { x: 3.75, y: exit.entryStart - 500 });
   app.state.laneTarget = 2;
   startAutomatic(driver);
-  driver.advance(0.5);
+  driver.advance(.5);
   const before = { x: app.car.x, y: app.car.y, speed: app.car.speed };
   document.querySelectorAll('[data-auto-route]').find(button => button.dataset.autoRoute === 'exit').onclick();
   assert.equal(app.state.autodrive.active, true);
@@ -1974,20 +2337,20 @@ test('changing an active automatic route to the next exit keeps control and star
   assert.equal(app.car.x, before.x);
   assert.equal(app.car.y, before.y);
   assert.equal(app.car.speed, before.speed);
-  advanceUntil(driver, () => !!app.state.exitActive, 5);
-  assert.equal(app.state.exitActive.id, 'exit-0');
-  assert.equal(app.state.autodrive.active, true);
-  assert.equal(app.state.exitCruise, false);
+  advanceUntil(driver, () => app.state.plan.status === 'handoff', 30, .1);
+  assert.equal(app.state.exitActive, null);
+  assert.equal(app.state.autodrive.active, false);
+  assert.equal(app.state.lastInput.brake, 0);
   assert.equal(app.state.estop, false);
 });
 
 test('automatic driving on an ordinary road never changes into the opposing lane', () => {
-  const driver = localRoadCruise(), { app, ui } = driver;
+  const driver = localRoadAutodrive(), { app, ui } = driver;
   startAutomatic(driver);
   assert.equal(app.state.exitCruise, false);
   driver.advance(5);
   assert.equal(app.readState().roadType, 'local');
-  assert.equal(ui('lane-left').disabled, true);
+  assert.equal(app.state.entranceActive, null, 'automatic city cruising does not commit a highway entrance');
   assert.equal(ui('lane-right').disabled, true);
   assert.equal(app.state.laneChanging, false);
   assert.equal(app.state.autodrive.decision.laneDirection, 0);
@@ -2112,16 +2475,15 @@ test('an entrance queue freezes on collision and restarting clears its vehicles 
   assert.equal(app.car.speed, 0);
 });
 
-test('selecting an exit hides highway entrance notices and does not spawn them on the local road', () => {
-  const driver = loadApp(), { app, ui } = driver;
-  app.world.vehicles = [];
-  Object.assign(app.car, { x:3.75, y:900, speed:20 });
-  app.state.laneTarget = 2;
-  startAutomatic(driver, 'exit');
-  advanceUntil(driver, () => !!app.state.exitActive, 5);
+test('a manual ramp hides highway notices and the city road shows a manual route back to the highway', () => {
+  const driver = enterManualExit(), { app, ui } = driver;
+  driver.key('keydown', 'KeyW');
+  advanceUntil(driver, () => app.state.exitStage === 'ramp', 60, .1);
   assert.equal(ui('entrance-preview').hidden, true);
-  advanceUntil(driver, () => app.state.exitCompleted, 120);
-  assert.equal(ui('entrance-preview').hidden, true);
+  advanceUntil(driver, () => app.state.exitCompleted, 120, .1);
+  assert.equal(ui('entrance-preview').hidden, false);
+  assert.match(ui('entrance-name').textContent, /返回高速/);
+  assert.match(ui('entrance-status').textContent, /左|入口/);
   driver.advance(30);
   assert.ok(app.car.y > app.road.getState(0).nextEntrance.start);
   assert.equal(app.readState().roadType, 'local');
@@ -2379,28 +2741,29 @@ test('exit traffic is selected from ordinary right-lane cars and the card follow
   assert.match(ui('exit-traffic-status').textContent,/部分右车道车辆/);
 });
 
-test('AI exit cruise follows a stopped leader around the curved ramp instead of overlooking its shifted x', () => {
-  const driver=loadApp(),{app}=driver,exit=driver.app.road.getState(900).nextExit;
-  const y=1250,x=app.road.centerForExit(exit,y),frontY=y+20;
-  const heading=Math.atan2(app.road.centerForExit(exit,y+1)-x,1)*180/Math.PI;
-  Object.assign(app.car,{x,y,heading,speed:10});
-  app.state.exitActive=exit;app.state.exitCruise=true;app.state.mode='ai';app.state.laneTarget=2;
-  const leader=adviceVehicle(2,frontY,0,999);
-  Object.assign(leader,{x:app.road.centerForExit(exit,frontY),exitRoute:{event:exit,status:'ramp',wet:false}});
-  app.world.vehicles=[leader];
-  driver.advance(.1);
-  assert.ok(app.state.lastInput.brake>0,'AI must brake for a same-ramp leader even beyond the current x corridor');
-  assert.ok(app.car.speed<10&&app.car.speed>0);
-  assert.equal(app.readState().nearestAhead.id,999);
-  driver.advance(5);
-  assert.equal(app.state.collision,null);
-  assert.ok(app.car.y<leader.y-6);
+test('AI tasks and full automatic driving cannot take over the manual deceleration lane or ramp', () => {
+  const driver = enterManualExit(), { app, ui } = driver;
+  for (const stage of ['deceleration', 'ramp']) {
+    assert.equal(app.state.exitStage, stage);
+    assert.equal(app.submitCommand('直行20米').status, 'ready');
+    assert.equal(app.startPlan(), false, stage + ' cannot automatically accelerate or brake into the exit');
+    ui('auto-start').onclick();
+    assert.equal(app.state.autodrive.active, false);
+    assert.equal(app.state.plan.status, 'ready');
+    assert.equal(app.state.serviceBrake, 0);
+    assert.equal(app.state.exitCruise, false);
+    if (stage === 'deceleration') {
+      driver.key('keydown', 'KeyW');
+      advanceUntil(driver, () => app.state.exitStage === 'ramp', 60, .1);
+    }
+  }
 });
 
 test('following exit traffic onto the ordinary road preserves nearby cars without a transition teleport', () => {
-  const driver=loadApp(),{app,ui}=driver,exit=driver.app.road.getState(900).nextExit;
+  const driver=enterManualExit(),{app,ui}=driver,exit=app.state.exitActive;
   Object.assign(app.car,{x:29,y:exit.rampEnd-.04,speed:10,heading:0});
-  app.state.exitActive=exit;app.state.exitCruise=true;app.state.mode='ai';app.state.laneTarget=2;
+  app.state.exitStage='ramp';
+  driver.key('keydown','KeyW');
   const leader=adviceVehicle(2,exit.rampEnd+35,12,999);
   Object.assign(leader,{x:29,exitRoute:{event:exit,status:'local',wet:false}});
   const follower=adviceVehicle(2,exit.rampEnd-40,9,998);
@@ -2412,10 +2775,47 @@ test('following exit traffic onto the ordinary road preserves nearby cars withou
   assert.equal(app.readState().roadType,'local');
   assert.equal(app.world.vehicles.find(vehicle=>vehicle.id===999),leader);
   assert.equal(app.world.vehicles.find(vehicle=>vehicle.id===998),follower);
+  assert.ok(app.state.highwayTraffic);
+  assert.ok(!app.state.highwayTraffic.vehicles.includes(leader));
+  assert.ok(!app.state.highwayTraffic.vehicles.includes(follower), 'each transferred NPC belongs to exactly one updating world');
+  const allCars = [...app.world.vehicles, ...app.state.highwayTraffic.vehicles];
+  assert.equal(new Set(allCars.map(vehicle=>vehicle.id)).size, allCars.length);
   assert.ok(leader.y>before&&leader.y<before+2);
   assert.equal(app.readState().nearestAhead.id,999);
   assert.equal(ui('exit-traffic-status').hidden,true);
   driver.advance(2);
   assert.ok(leader.y>before+10);
   assert.equal(app.state.collision,null);
+});
+
+
+test('a later highway exit arrival joins city following exactly once and stops behind a city queue', () => {
+  const driver = localRoadManual(), { app } = driver;
+  driver.key('keyup', 'KeyW');
+  app.car.speed = 0;
+  const exit = app.state.exitActive;
+  const leader = { ...adviceVehicle(0, app.car.y + 100, 0, 9101), x: 29,
+    previousX: 29, cruiseFactor: 0 };
+  const arriving = { ...adviceVehicle(2, app.car.y + 70, 12, 9102), x: 29,
+    previousX: 29, cruiseFactor: 1, exitRoute: { event: exit, status: 'local', wet: false } };
+  app.world.vehicles = [leader];
+  app.state.highwayTraffic.vehicles = [arriving];
+  const initialY = arriving.y;
+  driver.advance(.05);
+  assert.ok(app.world.vehicles.includes(arriving), 'late departures enter the same city following calculation');
+  assert.ok(!app.state.highwayTraffic.vehicles.includes(arriving));
+  assert.equal(app.world.vehicles.filter(vehicle => vehicle === arriving).length, 1);
+  assert.ok(arriving.y > initialY && arriving.y - initialY < 1, 'handoff keeps the existing physical pose');
+  const clearance = (leader.length + arriving.length) / 2 + app.traffic.constants.minGap;
+  for (let tick = 0; tick < 160; tick++) {
+    driver.advance(.05);
+    assert.ok(leader.y - arriving.y >= clearance - .01, 'two worlds must not allow their cars to pass through each other');
+    assert.equal(app.state.collision, null);
+  }
+  assert.ok(arriving.speed < .2);
+  const stoppedY = arriving.y;
+  app.world.vehicles = app.world.vehicles.filter(vehicle => vehicle !== leader);
+  driver.advance(3);
+  assert.ok(arriving.y > stoppedY + 1 && arriving.speed > 1, 'the transferred arrival resumes when the city queue clears');
+  assert.ok(!app.state.highwayTraffic.vehicles.includes(arriving));
 });

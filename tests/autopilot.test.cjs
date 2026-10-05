@@ -297,7 +297,7 @@ test('dry and wet autopilot follows a real entrance maneuver through completion 
 });
 
 test('an exit leader is followed around the curve before reaching the current x corridor', () => {
-  const exit=road.getState(1000).nextExit,y=exit.entryStart+160;
+  const exit=road.getState(1000).nextExit,y=exit.splitStart+160;
   const ego=car({x:road.centerForExit(exit,y),y,speed:40/3.6});
   const leader=vehicle({x:road.centerForExit(exit,y+42),y:y+42,speed:0,lane:2,
     exitRoute:{event:exit,status:'ramp'}});
@@ -340,7 +340,7 @@ test('same-exit following continues across the ordinary-road handoff', () => {
 });
 
 test('dry and wet ramp following physically parks behind a stopped curved-path leader without contact', () => {
-  const exit=road.getState(1000).nextExit,y=exit.entryStart+160;
+  const exit=road.getState(1000).nextExit,y=exit.splitStart+160;
   for(const wet of [false,true]) {
     const heading=Math.atan2(road.centerForExit(exit,y+1)-road.centerForExit(exit,y-1),2)*180/Math.PI;
     const ego=Object.assign(physics.createState(),car({x:road.centerForExit(exit,y),y,heading,speed:40/3.6}));
